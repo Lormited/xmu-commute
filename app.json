@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "拾课 · 交互原型 v2",
+    "slug": "xmu-expo-prototype",
+    "version": "0.2.0",
+    "scheme": "xmu-prototype",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "plugins": ["expo-router", "expo-status-bar", "expo-font"],
+    "web": { "bundler": "metro", "output": "single", "name": "拾课 · 移动交互原型 v2", "themeColor": "#eee2ee" },
+    "ios": { "supportsTablet": false, "bundleIdentifier": "local.xmu.prototype" },
+    "android": { "package": "local.xmu.prototype", "softwareKeyboardLayoutMode": "resize" }
+  }
+}
