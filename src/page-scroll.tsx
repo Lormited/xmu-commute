@@ -7,12 +7,13 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useDemo } from './demo-context';
 import { REFRESH_THRESHOLD, shouldRefresh } from './demo-data';
 
-export const PageScrollContext = createContext<{ tab: boolean; enabled: boolean; pull: SharedValue<number>; rotation: SharedValue<number> } | null>(null);
+export const PageScrollContext = createContext<{ tab: boolean; enabled: boolean; pull: SharedValue<number>; rotation: SharedValue<number>; refresh: () => void; refreshing: boolean } | null>(null);
 
 export function PageScroll({ children }: { children: ReactNode }) {
   const config = useContext(PageScrollContext)!;
   const insets = useSafeAreaInsets();
-  const { refresh, refreshing, reducedMotion } = useDemo();
+  const { reducedMotion } = useDemo();
+  const { refresh, refreshing } = config;
   const custom = config.enabled;
   const { pull, rotation } = config;
   const offset = useSharedValue(0);

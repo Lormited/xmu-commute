@@ -1,6 +1,3 @@
 node_modules/
 .expo/
-dist/
-expo-env.d.ts
-screenshots/
-preview-overview.jpg
+android/

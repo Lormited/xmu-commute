@@ -1,0 +1,85 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI: '1'
+      EXPO_NO_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: pnpm
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Check app and release debug settings
+        run: pnpm check
+
+      - name: Generate Android project
+        run: pnpm exec expo prebuild --platform android --no-install
+        env:
+          NODE_ENV: production
+
+      # Use the Expo template test keystore for this sideload build.
+      - name: Build standalone arm64-v8a APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon --max-workers=2
+        env:
+          NODE_ENV: production
+
+      - name: Verify APK
+        run: |
+          python3 - <<'PY'
+          from zipfile import ZipFile
+          with ZipFile('android/app/build/outputs/apk/release/app-release.apk') as apk:
+              names = apk.namelist()
+              abis = {name.split('/')[1] for name in names if name.startswith('lib/') and name.endswith('.so')}
+              assert abis == {'arm64-v8a'}, f'Unexpected ABIs: {abis}'
+              assert apk.getinfo('assets/index.android.bundle').file_size > 0, 'Missing bundled JavaScript'
+              dex = [apk.read(name) for name in names if name.endswith('.dex')]
+              assert dex, 'Missing app bytecode'
+              for classes in dex:
+                  assert b'expo/modules/devlauncher/' not in classes, 'Expo Dev Launcher must be absent'
+                  assert b'expo/modules/devmenu/DevMenuActivity;' not in classes, 'Expo Dev Menu must be absent'
+          PY
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          test "$(apkanalyzer manifest debuggable "$apk")" = false
+          apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          "$apksigner" verify "$apk"
+          cp "$apk" xmuc-v1.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: xmuc-v1
+          path: xmuc-v1.apk
+          if-no-files-found: error
+          retention-days: 14

@@ -2,14 +2,14 @@ import { useCallback } from 'react';
 import { Platform, StyleSheet, Text, View } from 'react-native';
 import { router, useFocusEffect } from 'expo-router';
 import { useDemo } from '@/demo-context';
-import { TERM, courseFor, groupSessions, periods, sessionsForWeek, weekDays, type Session } from '@/demo-data';
+import { groupSessions, type Session } from '@/demo-data';
 import { Icon, ResourceBlock, Screen, Tap, c, s } from '@/ui';
 import { conflictStyles, conflictStyleIcon } from '@/style-options';
 import { SwipePages } from '@/swipe-pages';
 
 const ROW = 68;
 export default function Schedule() {
-  const { state, dispatch } = useDemo();
+  const { state, dispatch, timetable } = useDemo();
   useFocusEffect(useCallback(() => {
     if (Platform.OS !== 'web') return;
     function key(event: KeyboardEvent) {
@@ -27,19 +27,20 @@ export default function Schedule() {
     onPress={() => router.push('/conflict-styles')}
     style={[s.iconButton, { backgroundColor: 'transparent' }]}
   ><Icon name={conflictStyleIcon} size={22} /></Tap>} titleProps={Platform.OS === 'web' ? undefined : {
-    accessibilityRole: 'adjustable', accessibilityLabel: '课表，第' + state.week + '周', accessibilityValue: { min: 1, max: TERM.weeks, now: state.week, text: '第' + state.week + '周' },
+    accessibilityRole: 'adjustable', accessibilityLabel: '课表，第' + state.week + '周', accessibilityValue: { min: timetable.minWeek, max: timetable.weeks, now: state.week, text: '第' + state.week + '周' },
     accessibilityActions: [{ name: 'increment', label: '下一周' }, { name: 'decrement', label: '上一周' }],
     onAccessibilityAction: event => dispatch({ type: 'week', week: state.week + (event.nativeEvent.actionName === 'increment' ? 1 : -1) }),
   }}>
     <ResourceBlock resource="jw" emptyTitle="本周没有课程" showEmptyState={false}>
-      <SwipePages index={state.week} min={1} max={TERM.weeks} onChange={week => dispatch({ type: 'week', week })}>{week => <WeekGrid week={week} />}</SwipePages>
+      <SwipePages index={state.week} min={timetable.minWeek} max={timetable.weeks} onChange={week => dispatch({ type: 'week', week })}>{week => <WeekGrid week={week} />}</SwipePages>
     </ResourceBlock>
   </Screen>;
 }
 function WeekGrid({ week }: { week: number }) {
-  const { state } = useDemo();
-  const days = weekDays(week).slice(0, state.showWeekends ? 7 : 5);
-  const groups = groupSessions(state.load === 'empty' ? [] : sessionsForWeek(week));
+  const { state, timetable } = useDemo();
+  const periods = timetable.periods;
+  const days = timetable.weekDays(week).slice(0, state.showWeekends ? 7 : 5);
+  const groups = groupSessions(timetable.sessionsForWeek(week));
   return <View style={{ marginRight: 8 }}>
         <View style={t.dayHeader}>
           <View style={{ width: 36 }} />
@@ -59,7 +60,7 @@ function WeekGrid({ week }: { week: number }) {
             <View pointerEvents="none" style={t.verticalLine} />
             {groups.filter(group => group.day === day).map(group => {
               const first = group.sessions[0];
-              const course = courseFor(first.courseId, state.longText)!;
+              const course = timetable.courseFor(first.courseId, first)!;
               const count = group.sessions.length;
               const depth = Math.min(count - 1, 2);
               return <Tap key={first.id} label={count > 1 ? '周' + days[day].label + '，第' + (group.start + 1) + '至' + group.end + '节，' + count + '门课程重叠，查看全部' : course.title + '，周' + days[day].label + '，第' + (first.start + 1) + '至' + (first.start + first.length) + '节'}
@@ -68,7 +69,7 @@ function WeekGrid({ week }: { week: number }) {
                   : { pathname: '/course', params: { id: course.id, session: first.id, week } })}
                 style={{ position: 'absolute', top: group.start * ROW + 3, height: (group.end - group.start) * ROW - 6, left: 2, right: 2 }}>
                 {count > 1 && state.conflictStyle !== 'stack' ? <ConflictCourses sessions={group.sessions} /> : <>
-                  {group.sessions.slice(1, 3).reverse().map((item, index, layers) => <View key={item.id} pointerEvents="none" style={[t.course, { backgroundColor: courseFor(item.courseId)!.tint, top: (layers.length - index) * 6, left: (layers.length - index) * 5 }]} />)}
+                  {group.sessions.slice(1, 3).reverse().map((item, index, layers) => <View key={item.id} pointerEvents="none" style={[t.course, { backgroundColor: timetable.courseFor(item.courseId, item)!.tint, top: (layers.length - index) * 6, left: (layers.length - index) * 5 }]} />)}
                   <View pointerEvents="none" style={[t.course, { backgroundColor: course.tint, right: depth * 5, bottom: depth * 6 }]}>
                     <SessionLabel session={first} />
                   </View>
@@ -80,9 +81,10 @@ function WeekGrid({ week }: { week: number }) {
       </View>;
 }
 function ConflictCourses({ sessions }: { sessions: Session[] }) {
+  const { timetable } = useDemo();
   return <View pointerEvents="none" style={[t.course, t.fold]}>
     {sessions.map((session, index) => {
-      const course = courseFor(session.courseId)!;
+      const course = timetable.courseFor(session.courseId, session)!;
       return <View key={session.id} style={[t.conflictPart, t.foldPart, { backgroundColor: course.tint, marginTop: index ? -8 : 0, marginLeft: index % 2 ? 7 : 0, marginRight: index % 2 ? 0 : 7, zIndex: index }]}>
         <SessionLabel session={session} compact />
       </View>;
@@ -90,8 +92,8 @@ function ConflictCourses({ sessions }: { sessions: Session[] }) {
   </View>;
 }
 function SessionLabel({ session, compact = false }: { session: Session; compact?: boolean }) {
-  const { state } = useDemo();
-  const course = courseFor(session.courseId, state.longText)!;
+  const { state, timetable } = useDemo();
+  const course = timetable.courseFor(session.courseId, session)!;
   return <><Text style={[t.courseName, compact && { fontSize: 11, lineHeight: 14 }]} numberOfLines={3}>{course.title}</Text>
     {!(compact && state.showWeekends) && <Text style={[t.room, compact && { fontSize: 9, lineHeight: 12 }]} numberOfLines={compact ? 1 : 2}>{(session.room ?? course.room).replace('教学楼 ', '').replace('二号楼 ', '2-')}</Text>}</>;
 }

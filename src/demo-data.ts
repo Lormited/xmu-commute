@@ -22,7 +22,7 @@ export const periods = [
   ['14:30', '15:15'], ['15:25', '16:10'], ['16:30', '17:15'], ['17:25', '18:10'],
   ['19:10', '19:55'], ['20:05', '20:50'], ['21:00', '21:45'],
 ];
-export type Session = { id: string; courseId: string; day: number; start: number; length: number; note?: string; room?: string };
+export type Session = { id: string; courseId: string; day: number; start: number; length: number; room?: string; teacher?: string; time?: string; planId?: string; weeks?: string };
 export function sessionsForWeek(week: number): Session[] {
   if (!Number.isInteger(week) || week < 1 || week > TERM.weeks) return [];
   const list: Session[] = [
@@ -41,10 +41,6 @@ export function sessionsForWeek(week: number): Session[] {
       ? { id: 'math-fri', courseId: 'math', day: 4, start: 2, length: 2 }
       : { id: 'circuits-fri', courseId: 'circuits', day: 4, start: 2, length: 2 },
   ];
-  if (week === 8) {
-    const index = list.findIndex(item => item.id === 'literature-tue');
-    list[index] = { ...list[index], day: 3, start: 0, room: '嘉庚五号楼 208', note: '本周调课：原周二 14:30—16:10，嘉庚五号楼 106' };
-  }
   return list;
 }
 export function pageAtOffset(offset: number, width: number, min: number, max: number, origin = min) {
@@ -86,7 +82,7 @@ export function courseFor(id: string, longText = false): Course | undefined {
     : course;
 }
 export function sessionTime(session: Session) {
-  return periods[session.start][0] + ' — ' + periods[session.start + session.length - 1][1];
+  return session.time ?? (periods[session.start][0] + ' — ' + periods[session.start + session.length - 1][1]);
 }
 export function weekDays(week: number) {
   return Array.from({ length: 7 }, (_, day) => {
@@ -115,24 +111,27 @@ export function todoFixtures(longText: boolean): Todo[] {
   ] : todos;
 }
 export type Method = 'number' | 'qr' | 'radar';
-export const methodLabel: Record<Method, string> = { number: '数字码签到', qr: '二维码签到', radar: '雷达签到' };
+export const methodLabel: Record<Method, string> = { number: '数字签到', qr: '二维码签到', radar: '雷达签到' };
 export type AttendanceResult = 'success' | 'ended' | 'failed';
-export type Rollcall = { id: string; courseId: string; method: Method; time: string; outcome: AttendanceResult };
+export type Rollcall = { id: string; courseId: string; method: Method; time: string; title?: string; outcome?: AttendanceResult };
 export function cleanCode(input: string) { return input.replace(/\D/g, '').slice(0, 4); }
 export function codeResult(code: string, outcome: AttendanceResult): AttendanceResult | 'incomplete' {
   if (!/^\d{4}$/.test(code)) return 'incomplete';
   return code === DEMO_CODE ? outcome : 'failed';
 }
-export type HistoryItem = { id: string; course: string; date: string; time: string; type: string; status: 'success' | 'absent' };
+export type HistoryItem = { id: string; course: string; date: string; time: string; type: string; status: 'success' | 'absent'; detail?: string | null; at?: number };
 export const historyFixtures: HistoryItem[] = [
   { id: 'past-1', course: '高等数学', date: '2026-10-23', time: '10:10', type: '教师点名', status: 'success' },
-  { id: 'past-2', course: '大学英语', date: '2026-10-22', time: '16:30', type: '数字码签到', status: 'success' },
+  { id: 'past-2', course: '大学英语', date: '2026-10-22', time: '16:30', type: methodLabel.number, status: 'success' },
   { id: 'past-3', course: '设计思维与方法', date: '2026-10-19', time: '14:30', type: '二维码签到', status: 'absent' },
   { id: 'past-4', course: '高等数学', date: '2026-10-16', time: '10:10', type: '教师点名', status: 'absent' },
 ];
 export function historyLabel(status: HistoryItem['status']) {
-  return status === 'success' ? '成功' : '缺勤';
+  return status === 'success' ? '已签到' : '缺勤';
 }
-export function visibleHistory(items: HistoryItem[], filter: 'today' | 'all') {
-  return items.filter(item => filter === 'all' || item.date === DEMO_DAY).sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+export function historyDate(date = new Date()) {
+  return new Date(date.getTime() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+export function visibleHistory(items: HistoryItem[], filter: 'today' | 'all', day = historyDate()) {
+  return items.filter(item => filter === 'all' || item.date === day).sort((a, b) => a.at != null && b.at != null ? b.at - a.at : (b.date + b.time).localeCompare(a.date + a.time));
 }

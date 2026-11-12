@@ -1,11 +1,11 @@
 import { StyleSheet, Text, View } from 'react-native';
 import { useDemo } from './demo-context';
-import { courseFor, sessionTime, type Session } from './demo-data';
+import { sessionTime, type Session } from './demo-data';
 import { Glass, Icon, c } from './ui';
 
 export function TodayCourseCard({ session, width }: { session: Session; width?: number }) {
-  const { state } = useDemo();
-  const course = courseFor(session.courseId, state.longText)!;
+  const { state, timetable } = useDemo();
+  const course = timetable.courseFor(session.courseId, session)!;
   return <Glass style={[k.card, { width, minHeight: state.longText ? 246 : 218 }]}>
       <View style={k.header}>
         <View accessible={false} accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={[k.courseIcon, { backgroundColor: course.tint }]}><Icon name="school-outline" size={22} /></View>
@@ -21,7 +21,7 @@ export function TodayCourseCard({ session, width }: { session: Session; width?: 
 const k = StyleSheet.create({
   card: { padding: 22, gap: 20 },
   meta: { fontSize: 13, lineHeight: 20, color: c.muted },
-  time: { flexShrink: 0, textAlign: 'right', fontVariant: ['tabular-nums'] },
+  time: { flexShrink: 1, textAlign: 'right', fontVariant: ['tabular-nums'] },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
   courseIcon: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
   information: { flex: 1, justifyContent: 'flex-end', gap: 5 },

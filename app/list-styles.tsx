@@ -10,6 +10,6 @@ export default function ListStyles() {
   return <SheetScreen title="作业样式" height={610}>
     {(Object.keys(listStyles) as (keyof typeof listStyles)[]).map(value => <Choice key={value} title={listStyles[value]} selected={state.listStyle === value} onPress={() => dispatch({ type: 'list-style', value })} />)}
     <Text style={[s.sectionTitle, { marginTop: 16, marginBottom: 4 }]}>预览</Text>
-    <RowGroup>{examples.map((todo, index) => <TodoRow preview key={todo.id} todo={todo} last={index === examples.length - 1} />)}</RowGroup>
+    <RowGroup>{examples.map((todo, index) => <TodoRow key={todo.id} todo={todo} last={index === examples.length - 1} />)}</RowGroup>
   </SheetScreen>;
 }

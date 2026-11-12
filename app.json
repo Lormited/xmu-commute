@@ -1,14 +1,19 @@
 {
   "expo": {
-    "name": "拾课 · 交互原型 v2",
-    "slug": "xmu-expo-prototype",
+    "name": "厦课",
+    "slug": "xmuc",
     "version": "0.2.0",
-    "scheme": "xmu-prototype",
+    "scheme": "xmuc",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
-    "plugins": ["expo-router", "expo-status-bar", "expo-font"],
-    "web": { "bundler": "metro", "output": "single", "name": "拾课 · 移动交互原型 v2", "themeColor": "#eee2ee" },
+    "plugins": [
+      "expo-router", "expo-status-bar", "expo-font",
+      ["expo-camera", { "cameraPermission": "允许厦课使用相机扫描签到二维码", "microphonePermission": false, "recordAudioAndroid": false, "barcodeScannerEnabled": true }],
+      ["expo-location", { "locationWhenInUsePermission": "允许厦课获取当前位置完成定位签到", "locationAlwaysAndWhenInUsePermission": false, "locationAlwaysPermission": false, "motionUsagePermission": false, "locationFullAccuracyPermission": false }],
+      "expo-notifications", "./plugins/with-background-trial.cjs"
+    ],
+    "web": { "bundler": "metro", "output": "single", "name": "厦课 · XMU Commute", "themeColor": "#eee2ee" },
     "ios": { "supportsTablet": false, "bundleIdentifier": "local.xmu.prototype" },
-    "android": { "package": "local.xmu.prototype", "softwareKeyboardLayoutMode": "resize" }
+    "android": { "package": "local.xmu.prototype", "softwareKeyboardLayoutMode": "resize", "allowBackup": false }
   }
 }

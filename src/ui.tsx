@@ -34,8 +34,15 @@ function Page({ children, tab = false, resource, title, back = false, headerActi
   children: ReactNode; tab?: boolean; resource?: Resource; title: string; back?: boolean; headerAction?: ReactNode; titleProps?: TextProps; scroll?: boolean; headerGap?: number;
 }) {
   const insets = useSafeAreaInsets();
-  const { state, refresh, refreshing, syncResult, reducedMotion } = useDemo();
+  const demo = useDemo();
+  const { state, reducedMotion, real, data } = demo;
+  const history = real && resource === 'history';
+  const refresh = history ? demo.refreshHistory : demo.refresh;
+  const refreshing = history ? data.historyRefreshing : demo.refreshing;
+  const message = history ? data.historyMessage : data.message;
+  const syncResult = history ? (message ? 'offline' : null) : demo.syncResult;
   const enabled = Boolean(tab || resource) && state.loggedIn;
+  const signingIn = real && data.loggingIn;
   const pull = useSharedValue(0);
   const rotation = useSharedValue(0);
   const result = useSharedValue(0);
@@ -52,13 +59,13 @@ function Page({ children, tab = false, resource, title, back = false, headerActi
     <View style={[s.between, { marginHorizontal: back ? 18 : 24, marginTop: Math.max(insets.top, 12), marginBottom: headerGap, minHeight: 48, gap: 8 }]}>
       <View style={[s.inline, { flex: 1, gap: 8 }]}>{back && <Tap label="返回" onPress={goBack} style={s.iconButton}><Icon name="chevron-back" size={22} /></Tap>}<Text accessibilityRole="header" {...titleProps} style={[s.headerTitle, { flexShrink: 1 }]}>{title}</Text></View>
       {headerAction}
-      {enabled && <Tap label={refreshing ? '正在同步所有学习数据' : syncResult === 'success' ? '同步成功，再次同步' : syncResult === 'offline' ? '无网络，保留现有数据，重新同步' : '同步所有学习数据'} accessibilityState={{ busy: refreshing }} onPress={refresh} style={[s.iconButton, { backgroundColor: 'transparent' }]}>
+      {enabled && <Tap label={history ? (refreshing ? '正在刷新历史签到' : '刷新历史签到') : refreshing ? '正在同步所有学习数据' : syncResult === 'success' ? '同步成功，再次同步' : syncResult === 'offline' ? '无网络，保留现有数据，重新同步' : '同步所有学习数据'} accessibilityState={{ busy: refreshing }} disabled={signingIn} onPress={refresh} style={[s.iconButton, { backgroundColor: 'transparent' }]}>
         <Animated.View style={iconStyle}><Icon name="sync-outline" size={23} /></Animated.View>
         <Animated.View style={resultStyle}>{syncResult === 'offline' ? <Icon name="cloud-offline-outline" size={23} color={c.amber} /> : <DrawnCheck active={syncResult === 'success'} size={25} />}</Animated.View>
       </Tap>}
     </View>
-    <Text accessibilityLiveRegion="polite" style={s.srStatus}>{refreshing ? '同步中' : syncResult === 'success' ? '已更新' : syncResult === 'offline' ? '无网络，保留现有数据' : ''}</Text>
-    <PageScrollContext.Provider value={{ tab, enabled, pull, rotation }}>{scroll ? <PageScroll>{children}</PageScroll> : <View style={{ flex: 1 }}>{children}</View>}</PageScrollContext.Provider>
+    <Text accessibilityLiveRegion="polite" style={[s.small, signingIn || (real && message) ? { marginHorizontal: 24, marginBottom: 12, color: signingIn ? c.secondary : c.amber } : s.srStatus]}>{signingIn ? '正在登录' : real && message ? message : refreshing ? '同步中' : syncResult === 'success' ? '已更新' : syncResult === 'offline' ? '无网络，保留现有数据' : ''}</Text>
+    <PageScrollContext.Provider value={{ tab, enabled, pull, rotation, refresh, refreshing }}>{scroll ? <PageScroll>{children}</PageScroll> : <View style={{ flex: 1 }}>{children}</View>}</PageScrollContext.Provider>
   </View>;
 }
 export function Screen(props: { children: ReactNode; tab?: boolean; resource?: Resource; title: string; headerAction?: ReactNode; titleProps?: TextProps; back?: boolean; scroll?: boolean; headerGap?: number }) {
@@ -96,10 +103,10 @@ export function Note({ children, tone = 'neutral', action, onPress }: { children
   return <View style={[s.note, { backgroundColor: tone === 'warning' ? '#faf3e8' : tone === 'success' ? '#edf4ef' : '#f5eff8' }]}><View style={[s.inline, { alignItems: 'flex-start', gap: 9 }]}><Icon name={tone === 'success' ? 'checkmark-circle-outline' : 'information-circle-outline'} color={color} size={18} /><Text selectable style={{ flex: 1, fontSize: 13, lineHeight: 21, color: c.secondary }}>{children}</Text></View>{action && onPress && <Tap onPress={onPress} label={action} style={{ minHeight: 44, justifyContent: 'center', alignSelf: 'flex-start', paddingHorizontal: 27 }}><Text style={s.actionText}>{action} →</Text></Tap>}</View>;
 }
 export function ResourceBlock({ resource, children, emptyTitle, emptyDescription, showEmptyState = true }: { resource: Resource; children: ReactNode; emptyTitle: string; emptyDescription?: string; showEmptyState?: boolean }) {
-  const { state, refresh, refreshing } = useDemo();
-  const status = state.load;
-  if (!state.loggedIn) return <StateCard icon="lock-closed-outline" title="登录后查看学习数据" action="学校统一登录" onPress={() => router.push('/login')} />;
-  if (status === 'loading') return <Glass style={{ marginHorizontal: 24, padding: 24, gap: 18 }}><View style={s.inline}><ActivityIndicator color={c.accent} /><Text accessibilityLiveRegion="polite" style={s.body}>正在加载</Text></View>{[1, 0.75, 0.45].map((size, i) => <View key={i} style={{ height: 14, width: (size * 100 + '%') as '100%', borderRadius: 7, backgroundColor: '#e9e1ed' }} />)}<Button secondary label="完成加载演示" onPress={refresh} busy={refreshing} /></Glass>;
+  const { state, refresh, refreshing, real, data, login } = useDemo();
+  const status = real ? (resource === 'lnt' && data.todos.length) || (resource === 'courses' && data.courses.length) || (resource === 'jw' && data.schedule?.rows.length) || (resource === 'history' && data.history.length) ? 'ready' : resource === 'history' && data.historyRefreshing ? 'loading' : 'empty' : state.load;
+  if (!state.loggedIn) return <StateCard icon="lock-closed-outline" title="登录后查看学习数据" action="学校统一登录" busy={real && data.loggingIn} onPress={login} />;
+  if (status === 'loading') return <Glass style={{ marginHorizontal: 24, padding: 24, gap: 18 }}><View style={s.inline}><ActivityIndicator color={c.accent} /><Text accessibilityLiveRegion="polite" style={s.body}>正在加载</Text></View>{[1, 0.75, 0.45].map((size, i) => <View key={i} style={{ height: 14, width: (size * 100 + '%') as '100%', borderRadius: 7, backgroundColor: '#e9e1ed' }} />)}{!real && <Button secondary label="完成加载演示" onPress={refresh} busy={refreshing} />}</Glass>;
   if (status === 'empty' && showEmptyState) return <StateCard icon={resource === 'jw' ? 'sunny-outline' : 'file-tray-outline'} title={emptyTitle} description={emptyDescription} />;
   return <>{children}</>;
 }
@@ -114,15 +121,15 @@ function useRowStyle() {
   const { state } = useDemo();
   return { variant: state.listStyle, rowStyle: state.listStyle === 'soft' ? s.softRow : undefined };
 }
-export function TodoRow({ todo, last = false, preview = false, flushTop = false }: { todo: Todo; last?: boolean; preview?: boolean; flushTop?: boolean }) {
+export function TodoRow({ todo, last = false, flushTop = false }: { todo: Todo; last?: boolean; flushTop?: boolean }) {
   const { variant, rowStyle } = useRowStyle();
   const style = [s.todoRow, rowStyle, flushTop && variant === 'space' && { paddingTop: 0, minHeight: 61 }];
   const content = <>
     <View style={s.todoIcon}><Icon name="document-text-outline" size={21} color="#8b759f" /></View>
-    <View style={{ flex: 1, minWidth: 0, gap: 5 }}><Text style={s.todoTitle} numberOfLines={1}>{todo.title}</Text><Text style={s.todoMeta} numberOfLines={1}>{todo.course} · {todo.deadline ?? '未设截止时间'}</Text></View><Icon name="chevron-forward" size={15} color="#b9b2c1" />
+    <View style={{ flex: 1, minWidth: 0, gap: 5 }}><Text style={s.todoTitle} numberOfLines={1}>{todo.title}</Text><Text style={s.todoMeta} numberOfLines={1}>{todo.course} · {todo.deadline ?? '未设截止时间'}</Text></View>
     {variant === 'group' && !last && <View style={s.insetRule} />}
   </>;
-  return preview ? <View style={style}>{content}</View> : <Tap onPress={() => router.push({ pathname: '/todo', params: { id: todo.id } })} label={'查看作业：' + todo.title + '，' + todo.course + '，' + (todo.deadline ?? '未设置截止时间')} style={style}>{content}</Tap>;
+  return <View accessible accessibilityLabel={todo.title + '，' + todo.course + '，' + (todo.deadline ?? '未设置截止时间')} style={style}>{content}</View>;
 }
 export function SettingRow({ icon, title, value, onPress, danger = false, trailing, last = false }: { icon: IconName; title: string; value?: string; onPress?: () => void; danger?: boolean; trailing?: ReactNode; last?: boolean }) {
   const { variant, rowStyle } = useRowStyle();

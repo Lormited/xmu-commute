@@ -9,21 +9,24 @@ function openCourse(id: string, week: number) {
   router.push({ pathname: '/course', params: { id, week, session: session?.id } });
 }
 export function CourseList({ preview = false }: { preview?: boolean }) {
-  const { state } = useDemo();
+  const { state, real, data, timetable } = useDemo();
   const grid = state.courseStyle === 'grid';
-  const items = preview ? courses.slice(0, 2) : courses;
-  return <View style={[{ marginHorizontal: preview ? 0 : 24 }, grid && k.grid]}>{items.map(item => {
-    const course = courseFor(item.id, state.longText)!;
+  const items = real && !preview ? data.courses.map(course => ({ id: String(course.id), title: course.name, subtitle: timetable.courseFor(String(course.id))?.teacher ?? '' }))
+    : (preview ? courses.slice(0, 2) : courses).map(course => {
+      const item = courseFor(course.id, state.longText)!;
+      return { id: item.id, title: item.title, subtitle: item.teacher };
+    });
+  return <View style={[{ marginHorizontal: preview ? 0 : 24 }, grid && k.grid]}>{items.map(course => {
     const style = grid ? k.card : k.row;
     const content = <>
       <View style={{ flex: 1, minWidth: 0, gap: grid ? 16 : 7, justifyContent: 'space-between' }}>
         <Text style={[k.title, grid && k.gridTitle]} numberOfLines={grid ? 3 : 2}>{course.title}</Text>
-        <Text style={k.teacher} numberOfLines={1}>{course.teacher}</Text>
+        <Text style={k.teacher} numberOfLines={1}>{course.subtitle}</Text>
       </View>
       {!grid && <Icon name="chevron-forward" size={14} />}
     </>;
     return preview ? <View key={course.id} style={style}>{content}</View>
-      : <Tap key={course.id} label={'查看课程：' + course.title} onPress={() => openCourse(course.id, state.week)} style={style}>{content}</Tap>;
+      : <Tap key={course.id} label={'查看课程：' + course.title} onPress={() => real ? router.push({ pathname: '/course', params: { id: course.id } }) : openCourse(course.id, state.week)} style={style}>{content}</Tap>;
   })}</View>;
 }
 const k = StyleSheet.create({
