@@ -1,4 +1,4 @@
-import { Text, View } from 'react-native';
+import { View } from 'react-native';
 import { router } from 'expo-router';
 import { useDemo } from './demo-context';
 import { SwipePages } from './swipe-pages';
@@ -7,7 +7,7 @@ import { courseStyles, courseStyleIcon, listStyles, listStyleIcon } from './styl
 import { Icon, ResourceBlock, RowGroup, Screen, Segments, Tap, TodoRow, s } from './ui';
 
 export function LearningScreen() {
-  const { state, dispatch, todos, real, data } = useDemo();
+  const { state, dispatch, todos } = useDemo();
   const page = state.learningPage;
   const setPage = (value: number) => dispatch({ type: 'learning-page', value: value === 1 ? 1 : 0 });
   return <Screen tab scroll={false} resource="lnt" title="学习" headerAction={<Tap
@@ -15,7 +15,6 @@ export function LearningScreen() {
     onPress={() => router.push(page === 0 ? '/list-styles' : '/course-styles')}
     style={[s.iconButton, { backgroundColor: 'transparent' }]}
   ><Icon name={page === 0 ? listStyleIcon : courseStyleIcon} size={22} /></Tap>}>
-    {real && state.loggedIn && data.term && <Text style={[s.small, { marginHorizontal: 24, marginBottom: 12 }]}>{data.term.name} · 第 {data.term.currentWeek} 周</Text>}
     <View style={{ marginHorizontal: 24, marginBottom: 18 }}><Segments labels={['作业', '课程']} index={page} onChange={setPage} /></View>
     <SwipePages index={page} max={1} onChange={setPage}>{index => index === 0
       ? <ResourceBlock resource="lnt" emptyTitle="暂无作业"><View style={{ marginHorizontal: 24 }}><RowGroup>{todos.map((todo, i) => <TodoRow key={todo.id} todo={todo} last={i === todos.length - 1} />)}</RowGroup></View></ResourceBlock>

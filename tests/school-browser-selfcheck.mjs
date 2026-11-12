@@ -875,12 +875,12 @@ test('learning tabs use independent school collections, preserve switching, and 
     const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
     let context = app.render(), page = app.learningPage();
     assert.equal(context.data.term.currentWeek, 8);
-    assert.match(JSON.stringify(page), /测试学期/);
-    assert.match(JSON.stringify(page), /周/);
+    assert.doesNotMatch(JSON.stringify(page), /测试学期|第 \d+ 周/);
     const segments = app.find(page, props => props?.labels?.[0] === '作业');
     segments.props.onChange(1);
     context = app.render(); page = app.learningPage();
     assert.equal(context.state.learningPage, 1);
+    assert.doesNotMatch(JSON.stringify(page), /测试学期|第 \d+ 周/);
     let pager = app.find(page, props => typeof props?.children === 'function');
     assert.equal(pager.props.index, 1);
     const courseBlock = pager.props.children(1), todoBlock = pager.props.children(0);
