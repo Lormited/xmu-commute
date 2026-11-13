@@ -11,7 +11,7 @@ const row = { WID: 'one', BJDM: '001-A', KCMC: '教务课程一', JASMC: '学校
 const term = { jwTermCode: '20261', lntTermCode: '2026-1', name: '学校当前学期', currentWeek: 8, weeks: Array.from({ length: 18 }, (_, i) => i + 1) };
 const courses = [{ id: 3, course_code: '001-A', name: 'LNT 课程一' }, { id: 4, course_code: '001-A ', name: '同名但不同教学班' }];
 const at = new Date(2026, 9, 26, 12).getTime();
-const makeData = (rows = [row], sections = periods) => ({ term, courses, coursesAt: at, schedule: scheduleModule.scheduleFrom({ success: true, pkjgList: rows }, { data: sections }, '20261') });
+const makeData = (rows = [row], sections = periods) => ({ courses, scheduleAt: at, schedule: { ...scheduleModule.scheduleFrom({ success: true, pkjgList: rows }, { data: sections }, '20261'), ...term } });
 test('page data selects actual teaching weeks, exact class ids, school times and row-specific details', () => {
   const data = makeData([row, { ...row, WID: 'two', BJDM: '001-A ', KCMC: '课程二', JSXM: '李老师', JASMC: '学校教室 202', ZCMC: '1-16周，双周' },
     { ...row, WID: 'unlinked', BJDM: '001-a', KCMC: '未关联课程', XQ: 7, ZCMC: '1-15周，单周' }]);

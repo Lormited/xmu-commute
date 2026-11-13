@@ -49,21 +49,21 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     sessionsForWeek: week => preview.load === 'empty' ? [] : sessionsForWeek(week),
     courseFor: id => courseFor(id, preview.longText), weekDays,
   };
-  const schoolWeek = selectedWeek && selectedWeek.term === data.term?.jwTermCode ? selectedWeek.week : timetable.currentWeek;
+  const schoolWeek = selectedWeek && selectedWeek.term === data.schedule?.jwTermCode ? selectedWeek.week : timetable.currentWeek;
   const base: DemoState = real ? { ...preview, week: Math.max(timetable.minWeek, Math.min(timetable.weeks, schoolWeek)), loggedIn: data.authenticated || !!data.account, load: data.todos.length || data.rollcalls.length ? 'ready' : 'empty', history: data.history.map(historyView), refreshSchedule: data.refreshSchedule, rollcalls: data.rollcalls, attendance: data.attendance, pendingAttendance: data.pendingAttendance } : preview;
   const state: DemoState = trialData.rollcalls.length ? { ...base, rollcalls: [...base.rollcalls, ...trialData.rollcalls],
     attendance: { ...base.attendance, ...trialData.attendance }, pendingAttendance: { ...base.pendingAttendance, ...trialData.pendingAttendance } } : base;
   const dispatch = useCallback<Dispatch<DemoEvent>>(event => {
     if (event.type === 'attendance-dismissed') trial.attendanceDismissed(event);
     if (real && event.type === 'week') {
-      if (data.term) setSelectedWeek({ term: data.term.jwTermCode, week: Math.max(timetable.minWeek, Math.min(timetable.weeks, event.week)) });
+      if (data.schedule) setSelectedWeek({ term: data.schedule.jwTermCode, week: Math.max(timetable.minWeek, Math.min(timetable.weeks, event.week)) });
       return;
     }
     if (real && event.type === 'refresh-schedule') { void learning.setRefreshSchedule(event.enabled); return; }
     if (real && event.type === 'attendance-dismissed') { learning.attendanceDismissed(event); return; }
     if (real && ['scenario', 'reset', 'login', 'logout', 'refresh', 'start-rollcall', 'attendance', 'attendance-result', 'attendance-dismissed', 'permission', 'reminders'].includes(event.type)) return;
     previewDispatch(event);
-  }, [real, learning, trial, data.term, timetable.minWeek, timetable.weeks]);
+  }, [real, learning, trial, data.schedule, timetable.minWeek, timetable.weeks]);
   const [refreshing, setRefreshing] = useState(false);
   const [syncResult, setSyncResult] = useState<Demo['syncResult']>(null);
   const [reducedMotion, setReducedMotion] = useState(false);

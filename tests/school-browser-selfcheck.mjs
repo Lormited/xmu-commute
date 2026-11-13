@@ -26,7 +26,7 @@ const academicPage = 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/*default/index.do'
 const academicTerms = { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '测试学期' }] } } };
 const profile = { id: 42, user_no: '001234', name: '测试同学' };
 const todo = { id: 7, course_id: 3, course_name: '课程', title: '学校返回的作业', type: 'homework', end_time: null, is_locked: false };
-const course = { id: 3, course_code: '001-A', name: '学校课程', semester: { code: '2026-1' } };
+const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9, semester: { id: 9, code: '2026-1' } };
 const academicWeeks = { success: true, currentZc: '8', zcList: Array.from({ length: 18 }, (_, i) => ({ ZC: i + 1 })) };
 const authorization = IDENTITY + '/auth?' + new URLSearchParams({ redirect_uri: CALLBACK, state: 'test-state' });
 // RNCWebViewClient.createWebViewEvent: direct Android requests omit a frame flag.
@@ -68,7 +68,8 @@ function fixture(files = new Map()) {
     if (url.includes('queryXspkjg.do')) return response(url, { success: true, pkjgList: [] });
     if (url.includes('queryXsskjc.do')) return response(url, { success: true, data: [] });
     if (url.includes('getZcxx.do')) return response(url, academicWeeks);
-    if (url.includes('/my-courses')) return response(url, { courses: [course] });
+    if (url.endsWith('/api/semesters')) return response(url, { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] });
+    if (url.includes('/my-courses')) return response(url, { courses: [course], pages: 1, total: 1 });
     if (url.endsWith('/profile')) return response(url, profile);
     if (url.includes('/todos')) return response(url, { todo_list: [todo] });
     if (url.endsWith('/radar/rollcalls')) return response(url, { rollcalls: [] });
@@ -124,6 +125,46 @@ async function initialize(f) {
   await tick();
 }
 
+test('LNT courses use the selected semester and collect every page before returning', async () => {
+  const f = fixture();
+  f.handler = async (url, options) => {
+    if (!url.endsWith('/api/my-courses')) return;
+    assert.equal(options.method, 'POST');
+    const body = JSON.parse(options.body);
+    assert.deepEqual(body.conditions.semester_id, [9]);
+    assert.equal(body.page_size, 100);
+    assert.equal(body.fields, 'id,course_code,name,semester_id,semester');
+    return response(url, { courses: [{ ...course, id: body.page }], pages: 2, total: 2 });
+  };
+  for (const semesterId of [undefined, 0, -1, '9', 1.5]) {
+    await assert.rejects(f.schoolDevice.read('courses', { semesterId }), { code: 'INVALID_SEMESTER' });
+  }
+  const result = await f.schoolDevice.read('courses', { semesterId: 9 });
+  assert.deepEqual(Array.from(result.courses, item => item.id), [1, 2]);
+  assert.deepEqual(f.calls.map(call => JSON.parse(call.options.body).page), [1, 2]);
+});
+
+test('invalid or failed later course pages retain the entire saved learning batch', async () => {
+  const f = fixture(), login = f.learning.login(); await authorize(f); await initialize(f);
+  assert.equal(await login, true);
+  const before = f.learning.getSnapshot(), saved = f.files.get('school-learning.json');
+  for (const failure of ['network', 'shape', 'changed-pages', 'missing-course', 'oversized-page']) {
+    f.handler = async (url, options) => {
+      if (!url.endsWith('/api/my-courses')) return;
+      const { page } = JSON.parse(options.body);
+      if (failure === 'oversized-page') return response(url, { courses: Array.from({ length: 101 }, (_, index) => ({ ...course, id: index + 1 })), pages: 1, total: 101 });
+      if (page === 1) return response(url, { courses: [course], pages: 2, total: 2 });
+      if (failure === 'network') throw Error('NETWORK');
+      return response(url, failure === 'shape' ? {} : { courses: failure === 'missing-course' ? [] : [{ ...course, id: 4 }], pages: failure === 'changed-pages' ? 1 : 2, total: 2 });
+    };
+    assert.equal(await f.learning.refresh(), false, failure);
+    assert.equal(f.files.get('school-learning.json'), saved);
+    for (const key of ['account', 'term', 'courses', 'coursesAt', 'todos', 'todosAt', 'rollcalls', 'schedule', 'scheduleAt', 'history', 'historyAt']) {
+      assert.strictEqual(f.learning.getSnapshot()[key], before[key], failure + ':' + key);
+    }
+  }
+});
+
 test('two-site login uses PKCE, waits for authentication and cookie saving, then reads and saves todos', async () => {
   const f = fixture(), gate = deferred(); let authorized = 0;
   f.handler = async url => { if (url.includes('/api/login')) { await gate.promise; return response(url, ''); } };
@@ -141,6 +182,7 @@ test('two-site login uses PKCE, waits for authentication and cookie saving, then
   const loginCall = f.calls.find(call => call.url.includes('/api/login'));
   assert.deepEqual(JSON.parse(loginCall.options.body), { access_token: 'one-use-access-token', org_id: 1 });
   gate.resolve(); assert.equal(await login, true);
+  assert.equal(f.calls.filter(call => call.url.includes('kfdxnxqcx')).length, 1, 'the first timetable consumes the verified academic term response');
   assert.equal(authorized, 1);
   assert.equal(f.schoolBrowser.getSnapshot(), null);
   assert.deepEqual(f.cookieCalls, ['flush'], 'login persists API cookies without deleting them');
@@ -181,7 +223,7 @@ test('failed authentication, invalid token, and academic probe errors cannot rep
 });
 test('academic probe accepts the school envelope and rejects invalid session responses', async () => {
   for (const [body, valid] of [
-    [academicTerms, true], [{ datas: { kfdxnxqcx: { rows: [] } } }, true],
+    [academicTerms, true],
     [[], false], [null, false], [{}, false], [{ datas: { kfdxnxqcx: { rows: {} } } }, false],
     [{ ...academicTerms, success: false }, false],
   ]) {
@@ -885,9 +927,9 @@ test('course and week requests use the existing session and reject invalid term 
     await assert.rejects(f.schoolDevice.read('jwWeek', jwTermCode === undefined ? undefined : { jwTermCode }), { code: 'INVALID_TERM' });
   }
   assert.equal(f.calls.length, 0);
-  assert.deepEqual(await f.schoolDevice.read('courses'), { courses: [course] });
+  assert.deepEqual(JSON.parse(JSON.stringify(await f.schoolDevice.read('courses', { semesterId: 9 }))), { courses: [course] });
   assert.deepEqual(await f.schoolDevice.read('jwWeek', { jwTermCode: '20261' }), academicWeeks);
-  assert.equal(f.calls[0].url, 'https://lnt.xmu.edu.cn/api/my-courses?per_page=1000');
+  assert.equal(f.calls[0].url, 'https://lnt.xmu.edu.cn/api/my-courses');
   assert.equal(f.calls[1].url, 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/wdkcb/getZcxx.do?XNXQDM=20261');
   assert.equal(f.calls.every(call => call.options.credentials === 'include'), true);
   assert.equal(f.schoolBrowser.getSnapshot(), null);
@@ -896,11 +938,11 @@ test('course and week requests use the existing session and reject invalid term 
 test('learning tabs use independent school collections, preserve switching, and open real course details', async () => {
   for (const hasCourses of [true, false]) {
     const f = fixture(), app = pages(f); app.render();
-    f.handler = async url => url.includes('/my-courses') ? response(url, { courses: hasCourses ? [course] : [] })
+    f.handler = async url => url.includes('/my-courses') ? response(url, { courses: hasCourses ? [course] : [], pages: hasCourses ? 1 : 0, total: hasCourses ? 1 : 0 })
       : url.includes('/todos') ? response(url, { todo_list: hasCourses ? [] : [todo] }) : undefined;
     const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
     let context = app.render(), page = app.learningPage();
-    assert.equal(context.data.term.currentWeek, 8);
+    assert.equal(context.data.schedule.currentWeek, 8);
     assert.doesNotMatch(JSON.stringify(page), /测试学期|第 \d+ 周/);
     const segments = app.find(page, props => props?.labels?.[0] === '作业');
     segments.props.onChange(1);
@@ -1111,9 +1153,8 @@ test('settings timetable switch controls the real saved preference and preview s
 });
 
 
-const ordinaryPaths = ['/api/my-courses', '/api/profile', '/api/radar/rollcalls', '/api/todos',
-  '/gsapp/sys/wdkbapp/modules/xskcb/kfdxnxqcx.do', '/gsapp/sys/wdkbapp/wdkcb/getZcxx.do'];
-const timetablePaths = ['/gsapp/sys/wdkbapp/wdkcb/queryXspkjg.do', '/gsapp/sys/wdkbapp/wdkcb/queryXsskjc.do'];
+const ordinaryPaths = ['/api/my-courses', '/api/semesters', '/api/profile', '/api/radar/rollcalls', '/api/todos'];
+const timetablePaths = ['/gsapp/sys/wdkbapp/modules/xskcb/kfdxnxqcx.do', '/gsapp/sys/wdkbapp/wdkcb/getZcxx.do', '/gsapp/sys/wdkbapp/wdkcb/queryXspkjg.do', '/gsapp/sys/wdkbapp/wdkcb/queryXsskjc.do'];
 test('every ordinary page header and pull callback uses the same setting-controlled batch and school todo previews', async () => {
   for (const enabled of [false, true]) {
     const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [todo], todosAt: 1000, refreshSchedule: enabled });
@@ -1144,7 +1185,7 @@ test('provider startup shows cache and makes exactly one ordinary refresh using 
   for (const enabled of [false, true]) {
     const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: [todo], todosAt: 1000, refreshSchedule: enabled });
     const f = fixture(new Map([['school-learning.json', raw]])), gate = deferred(), app = pages(f);
-    f.handler = async url => { if (url.includes('/my-courses')) { await gate.promise; return response(url, { courses: [{ ...course, name: '启动刷新课程' }] }); } };
+    f.handler = async url => { if (url.includes('/my-courses')) { await gate.promise; return response(url, { courses: [{ ...course, name: '启动刷新课程' }], pages: 1, total: 1 }); } };
     app.render(); app.runStartupEffects(); await tick();
     const cached = app.render();
     assert.equal(cached.data.account.name, '缓存账号');

@@ -1,5 +1,5 @@
 import { courses as courseColors, sessionTime, type Course, type Session } from './demo-data.ts';
-import type { LearningSnapshot, SchoolDevice, SchoolTerm } from './learning.ts';
+import type { LearningSnapshot, SchoolDevice } from './learning.ts';
 
 export function currentCourseIndex(sessions: Session[], now = new Date()) {
   const time = now.toTimeString().slice(0, 5);
@@ -10,7 +10,8 @@ export function currentCourseIndex(sessions: Session[], now = new Date()) {
 export type SchoolPeriod = { DM: number; MC: string; KSSJ: string; JSSJ: string; JCFADM: string };
 export type SchoolScheduleRow = { WID: string; BJDM: string; KCMC: string; JASMC: string; JSXM: string;
   XQ: number; KSJCDM: number; JSJCDM: number; KSSJ: string; JSSJ: string; ZCMC: string; JCFADM: string };
-export type SchoolSchedule = { jwTermCode: string; rows: SchoolScheduleRow[]; periods: SchoolPeriod[] };
+export type ScheduleTerm = { jwTermCode: string; name: string; currentWeek: number; weeks: number[] };
+export type SchoolSchedule = ScheduleTerm & { weekAt: number; rows: SchoolScheduleRow[]; periods: SchoolPeriod[] };
 function number(value: unknown) {
   const parsed = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
   if (!Number.isSafeInteger(parsed) || (parsed as number) < 1) throw Error('INVALID_SCHEDULE');
@@ -26,7 +27,7 @@ function time(value: unknown) {
   if (!/^([01]\d|2[0-3])[0-5]\d$/.test(raw)) throw Error('INVALID_SCHEDULE');
   return raw.slice(0, 2) + ':' + raw.slice(2);
 }
-export function scheduleFrom(rowsValue: unknown, periodsValue: unknown, jwTermCode: string): SchoolSchedule {
+export function scheduleFrom(rowsValue: unknown, periodsValue: unknown, jwTermCode: string) {
   const response = rowsValue as { success?: boolean; pkjgList?: unknown } | null;
   const periodResponse = periodsValue as { success?: boolean; data?: unknown } | null;
   if (response?.success !== true || !Array.isArray(response.pkjgList)
@@ -43,10 +44,38 @@ export function scheduleFrom(rowsValue: unknown, periodsValue: unknown, jwTermCo
     || !periods.some(period => period.JCFADM === row.JCFADM && period.DM === row.JSJCDM))) throw Error('INVALID_SCHEDULE');
   return { jwTermCode, rows, periods };
 }
-export async function readSchedule(device: SchoolDevice, term: SchoolTerm, studentNumber: string) {
-  const params = { jwTermCode: term.jwTermCode, studentNumber };
-  const [rows, periods] = await Promise.all([device.read('jwSchedule', params), device.read('jwPeriods', params)]);
-  return scheduleFrom(rows, periods, term.jwTermCode);
+function termsFrom(value: unknown): Pick<ScheduleTerm, 'jwTermCode' | 'name'>[] {
+  const response = value as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
+  const rows = response?.datas?.kfdxnxqcx?.rows;
+  if (response?.success === false || !Array.isArray(rows)) throw Error('INVALID_TERMS');
+  return rows.map(row => {
+    const code = row?.XNXQDM ?? row?.DM, name = row?.XNXQDM_DISPLAY ?? row?.MC;
+    if (typeof code !== 'string' || !/^\d{4}[123]$/.test(code) || typeof name !== 'string') throw Error('INVALID_TERMS');
+    return { jwTermCode: code, name };
+  }).sort((a, b) => b.jwTermCode.localeCompare(a.jwTermCode));
+}
+function weekNumber(value: unknown): number {
+  const number = typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : value;
+  if (!Number.isSafeInteger(number)) throw Error('INVALID_WEEKS');
+  return number as number;
+}
+function weeksFrom(value: unknown): Pick<ScheduleTerm, 'currentWeek' | 'weeks'> {
+  const response = value as { success?: boolean; currentZc?: unknown; zcList?: { ZC?: unknown }[] } | null;
+  if (response?.success !== true || !Array.isArray(response.zcList) || !Object.hasOwn(response, 'currentZc')) throw Error('INVALID_WEEKS');
+  const weeks = [...new Set(response.zcList.map(row => weekNumber(row?.ZC)))].sort((a, b) => a - b);
+  if (weeks.some(week => week < 1)) throw Error('INVALID_WEEKS');
+  return { currentWeek: response.currentZc == null || response.currentZc === '' ? 0 : weekNumber(response.currentZc), weeks };
+}
+export async function readSchedule(device: SchoolDevice, studentNumber: string, now = Date.now): Promise<SchoolSchedule> {
+  for (const candidate of termsFrom(await device.read('jwTerms'))) {
+    const week = weeksFrom(await device.read('jwWeek', { jwTermCode: candidate.jwTermCode }));
+    if (!week.weeks.includes(week.currentWeek)) continue;
+    const weekAt = now();
+    const params = { jwTermCode: candidate.jwTermCode, studentNumber };
+    const [rows, periods] = await Promise.all([device.read('jwSchedule', params), device.read('jwPeriods', params)]);
+    return { ...scheduleFrom(rows, periods, candidate.jwTermCode), ...candidate, ...week, weekAt };
+  }
+  throw Error('NO_CURRENT_TERM');
 }
 
 function teachingWeeks(value: string) {
@@ -66,9 +95,9 @@ function monday(date: Date) {
   result.setDate(result.getDate() - (result.getDay() + 6) % 7);
   return result;
 }
-export function schoolScheduleView(data: Pick<LearningSnapshot, 'term' | 'courses' | 'coursesAt' | 'schedule'>, now = new Date()) {
-  const term = data.term;
-  const schedule = data.schedule?.jwTermCode === term?.jwTermCode ? data.schedule : null;
+export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'scheduleAt' | 'schedule'>, now = new Date()) {
+  const schedule = data.schedule;
+  const term = schedule;
   const grouped = new Map<string, SchoolScheduleRow[]>();
   for (const row of schedule?.rows ?? []) {
     const ranges = teachingWeeks(row.ZCMC);
@@ -82,7 +111,7 @@ export function schoolScheduleView(data: Pick<LearningSnapshot, 'term' | 'course
     JASMC: [...new Set(group.map(row => row.JASMC).filter(Boolean))].join('、'),
     JSXM: [...new Set(group.map(row => row.JSXM).filter(Boolean))].join('、'),
   }));
-  const anchor = monday(new Date(data.coursesAt ?? now.getTime()));
+  const anchor = monday(new Date(schedule?.weekAt ?? data.scheduleAt ?? now.getTime()));
   const currentWeek = (term?.currentWeek ?? 1) + Math.round((monday(now).getTime() - anchor.getTime()) / 604800000);
   const courseId = (row: SchoolScheduleRow) => String(data.courses.find(course => course.course_code === row.BJDM)?.id ?? 'jw:' + row.BJDM);
   const sections = schedule?.periods.filter(period => !rows.length || rows.some(row => row.JCFADM === period.JCFADM)) ?? [];

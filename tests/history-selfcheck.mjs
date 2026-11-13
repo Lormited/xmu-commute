@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { createLearning, historyView } from '../src/learning.ts';
 import { visibleHistory } from '../src/demo-data.ts';
 
-const course = { id: 3, course_code: '001-A', name: '学校课程', semester: { code: '2026-1' } };
+const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9, semester: { id: 9, code: '2026-1' } };
 const otherCourse = { ...course, id: 4, name: '另一课程' };
 const term = { jwTermCode: '20261', lntTermCode: '2026-1', name: '秋季学期', currentWeek: 8, weeks: [8] };
 const record = { rollcall_id: 11, student_rollcall_id: 111, rollcall_time: '2026-11-08T08:00:00+08:00', title: '课堂签到', student_status: 'on_call', status: 'on_call_fine', student_status_detail: null, is_number: true, is_radar: false, type: 'manual', rollcall_status: 'closed', is_expired: true };
@@ -20,6 +20,7 @@ function fixture(raw = JSON.stringify(saved)) {
       calls.push([action, params]);
       if (action === 'history') return { rollcalls: params.courseId === 3 ? [record] : [{ ...record, rollcall_id: 12, student_rollcall_id: 112, rollcall_time: '2026-11-08T01:00:00Z', student_status: 'absent', status: 'absent', student_status_detail: '未到课堂', is_number: false, type: 'qr_rollcall' }] };
       return { profile: { id: 42, user_no: '001234', name: '测试同学' }, todos: { todo_list: [] }, rollcalls: { rollcalls: [] }, courses: { courses: [course, otherCourse] },
+        lntTerms: { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] },
         jwTerms: { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '秋季学期' }] } } }, jwWeek: { success: true, currentZc: 8, zcList: [{ ZC: 8 }] },
         jwSchedule: { success: true, pkjgList: [scheduleRow] }, jwPeriods: { data: schedulePeriods } }[action];
     },
@@ -294,8 +295,8 @@ test('history is discarded when the school changes account or term and an empty 
     const read = f.device.read;
     f.device.read = async (action, params) => {
       if (changed === 'account' && action === 'profile') return { id: 99 };
-      if (changed === 'term' && action === 'jwTerms') return { datas: { kfdxnxqcx: { rows: [{ DM: '20262', MC: '春季学期' }] } } };
-      if (changed === 'term' && action === 'courses') return { courses: [{ ...course, semester: { code: '2026-2' } }] };
+      if (changed === 'term' && action === 'lntTerms') return { semesters: [{ id: 10, name: 'LNT 春季', is_active: true }] };
+      if (changed === 'term' && action === 'courses') return { courses: [{ ...course, semester_id: 10 }] };
       if (changed === 'empty' && action === 'history') return { rollcalls: [] };
       return read(action, params);
     };
@@ -323,7 +324,7 @@ test('ordinary and history refresh preserve both collections in either order and
     const before = f.learning.getSnapshot(); f.calls.length = 0;
     const first = f.learning[order[0]](), second = f.learning[order[1]]();
     assert.equal(await first, true); assert.equal(await second, true);
-    const ordinary = ['profile', 'todos', 'rollcalls', 'jwTerms', 'jwWeek', 'courses'], history = ['history', 'history'];
+    const ordinary = ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses'], history = ['history', 'history'];
     assert.deepEqual(f.calls.map(([action]) => action), order[0] === 'refreshHistory' ? [...history, ...ordinary] : [...ordinary, ...history]);
     const stored = JSON.parse(f.stored()); assert.equal(stored.history.length, 2);
     assert.deepEqual(stored.schedule, before.schedule); assert.equal(stored.scheduleAt, before.scheduleAt);
@@ -360,7 +361,7 @@ test('both ordinary/history orders preserve all collections, accepted receipts a
     const before = f.learning.getSnapshot(); f.calls.length = 0;
     const first = f.learning[order[0]](), second = f.learning[order[1]]();
     assert.equal(await first, true); assert.equal(await second, true);
-    const ordinary = ['profile', 'todos', 'rollcalls', 'jwTerms', 'jwWeek', 'courses', ...(enabled ? ['jwSchedule', 'jwPeriods'] : [])];
+    const ordinary = ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwTerms', 'jwWeek', 'jwSchedule', 'jwPeriods'] : [])];
     const history = ['history', 'history'];
     assert.deepEqual(f.calls.map(([action]) => action), order[0] === 'refreshHistory' ? [...history, ...ordinary] : [...ordinary, ...history]);
     const stored = JSON.parse(f.stored());
@@ -401,7 +402,7 @@ test('every failed ordinary request or save keeps the complete combined cache an
     const setup = await combinedFixture(enabled);
     await setup.learning.submitNumber('81', '0007'); await tick();
     const saved = setup.stored();
-    for (const failure of ['profile', 'todos', 'rollcalls', 'jwTerms', 'jwWeek', 'courses', ...(enabled ? ['jwSchedule', 'jwPeriods'] : []), 'save']) {
+    for (const failure of ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwTerms', 'jwWeek', 'jwSchedule', 'jwPeriods'] : []), 'save']) {
       const f = fixture(saved); await f.learning.restore();
       const before = f.learning.getSnapshot(), seen = [], read = f.device.read;
       f.learning.subscribe(() => seen.push(f.learning.getSnapshot()));

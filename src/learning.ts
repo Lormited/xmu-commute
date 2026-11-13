@@ -10,9 +10,9 @@ export type SchoolTodo = {
   title: string; type: string; end_time: string | null; is_locked: boolean;
   [key: string]: unknown;
 };
-export type SchoolTerm = { jwTermCode: string; lntTermCode: string; name: string; currentWeek: number; weeks: number[] };
+export type SchoolTerm = { id: number | null; name: string };
 export type SchoolCourse = {
-  id: number; course_code: string; name: string; semester?: { code: string; [key: string]: unknown } | null;
+  id: number; course_code: string; name: string; semester_id?: number; semester?: { id?: number; code?: string; [key: string]: unknown } | null;
   [key: string]: unknown;
 };
 export type SchoolHistory = {
@@ -33,7 +33,7 @@ export type SchoolDevice = {
   save(value: string): Promise<void>;
   clear(): Promise<void>;
   authenticate(onAuthorized?: () => void): Promise<void>;
-  read(action: 'profile' | 'todos' | 'rollcalls' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule' | 'jwPeriods', params?: { jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }): Promise<unknown>;
+  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule' | 'jwPeriods', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }): Promise<unknown>;
   answerNumber(rollcallId: string, numberCode: string): Promise<AttendanceReceipt>;
   submitLocation(rollcallId: string, position: Position): Promise<AttendanceReceipt>;
   submitQr(rollcallId: string, data: unknown): Promise<AttendanceReceipt>;
@@ -73,34 +73,26 @@ function todosFrom(value: unknown): SchoolTodo[] {
     && typeof item.is_locked === 'boolean')) throw Error('INVALID_TODOS');
   return [...list].sort((a, b) => (a.end_time ? Date.parse(a.end_time) : Infinity) - (b.end_time ? Date.parse(b.end_time) : Infinity));
 }
-function termsFrom(value: unknown): Omit<SchoolTerm, 'currentWeek' | 'weeks'>[] {
-  const response = value as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
-  const rows = response?.datas?.kfdxnxqcx?.rows;
-  if (response?.success === false || !Array.isArray(rows)) throw Error('INVALID_TERMS');
-  return rows.map(row => {
-    const code = row?.XNXQDM ?? row?.DM, name = row?.XNXQDM_DISPLAY ?? row?.MC;
-    if (typeof code !== 'string' || !/^\d{4}[123]$/.test(code) || typeof name !== 'string') throw Error('INVALID_TERMS');
-    return { jwTermCode: code, lntTermCode: code.slice(0, 4) + '-' + code.slice(4), name };
-  }).sort((a, b) => b.jwTermCode.localeCompare(a.jwTermCode));
-}
-function weekNumber(value: unknown): number {
-  const number = typeof value === 'string' && /^-?\d+$/.test(value) ? Number(value) : value;
-  if (!Number.isSafeInteger(number)) throw Error('INVALID_WEEKS');
-  return number as number;
-}
-function weeksFrom(value: unknown): { currentWeek: number; weeks: number[] } {
-  const response = value as { success?: boolean; currentZc?: unknown; zcList?: { ZC?: unknown }[] } | null;
-  if (response?.success !== true || !Array.isArray(response.zcList) || !Object.hasOwn(response, 'currentZc')) throw Error('INVALID_WEEKS');
-  const weeks = [...new Set(response.zcList.map(row => weekNumber(row?.ZC)))].sort((a, b) => a - b);
-  if (weeks.some(week => week < 1)) throw Error('INVALID_WEEKS');
-  return { currentWeek: response.currentZc == null || response.currentZc === '' ? 0 : weekNumber(response.currentZc), weeks };
+function lntTermFrom(value: unknown): SchoolTerm {
+  const response = value as { success?: unknown; semesters?: unknown } | null;
+  const list = response?.semesters;
+  if (response?.success === false || !Array.isArray(list) || !list.every(item => item && typeof item.is_active === 'boolean')) throw Error('INVALID_LNT_TERM');
+  const active = list.filter(item => item.is_active);
+  const term = active[0];
+  if (active.length !== 1 || !Number.isSafeInteger(term.id) || term.id <= 0
+    || typeof term.name !== 'string' || !term.name.trim()) throw Error('INVALID_LNT_TERM');
+  return { id: term.id, name: term.name };
 }
 function coursesFrom(value: unknown, term: SchoolTerm): SchoolCourse[] {
   const list = (value as { courses?: unknown } | null)?.courses;
   if ((value as { success?: unknown } | null)?.success === false || !Array.isArray(list) || !list.every(item => item && Number.isSafeInteger(item.id)
     && typeof item.course_code === 'string' && typeof item.name === 'string'
-    && (item.semester == null || (typeof item.semester === 'object' && !Array.isArray(item.semester) && typeof item.semester.code === 'string')))) throw Error('INVALID_COURSES');
-  return list.filter(item => item.semester?.code === term.lntTermCode);
+    && (term.id === null || Number.isSafeInteger(item.semester_id) && item.semester_id > 0)
+    && (item.semester == null || (typeof item.semester === 'object' && !Array.isArray(item.semester)
+      && (item.semester.id === undefined || Number.isSafeInteger(item.semester.id))
+      && (item.semester.code === undefined || typeof item.semester.code === 'string'))))) throw Error('INVALID_COURSES');
+  if (new Set(list.map(item => item.id)).size !== list.length) throw Error('INVALID_COURSES');
+  return term.id === null ? list : list.filter(item => item.semester_id === term.id);
 }
 function historyFrom(value: unknown, course: SchoolCourse): SchoolHistory[] {
   const list = (value as { rollcalls?: unknown } | null)?.rollcalls;
@@ -139,20 +131,35 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
   let term: SchoolTerm | null = null, courses: SchoolCourse[] = [], coursesAt: number | null = null;
   // T01 caches remain readable until the first complete course refresh.
   if (data.term !== undefined || data.courses !== undefined || data.coursesAt !== undefined) {
-    const saved = data.term;
-    if (!saved || typeof saved.jwTermCode !== 'string' || !/^\d{4}[123]$/.test(saved.jwTermCode)
-      || saved.lntTermCode !== saved.jwTermCode.slice(0, 4) + '-' + saved.jwTermCode.slice(4) || typeof saved.name !== 'string'
-      || !Number.isSafeInteger(saved.currentWeek) || !Array.isArray(saved.weeks) || !saved.weeks.every(week => Number.isSafeInteger(week) && week > 0)
-      || !saved.weeks.includes(saved.currentWeek) || !Number.isFinite(data.coursesAt)) throw Error('INVALID_CACHE');
-    term = saved;
+    const saved = data.term as SchoolTerm & Partial<SchoolSchedule> & { lntTermCode?: string };
+    if (!saved || typeof saved.name !== 'string' || !Number.isFinite(data.coursesAt)) throw Error('INVALID_CACHE');
+    if (saved.jwTermCode !== undefined) {
+      if (!/^\d{4}[123]$/.test(saved.jwTermCode) || saved.lntTermCode !== saved.jwTermCode.slice(0, 4) + '-' + saved.jwTermCode.slice(4)
+        || !Number.isSafeInteger(saved.currentWeek) || !Array.isArray(saved.weeks) || !saved.weeks.every(week => Number.isSafeInteger(week) && week > 0)
+        || !saved.weeks.includes(saved.currentWeek!)) throw Error('INVALID_CACHE');
+      if (!Array.isArray(data.courses) || !data.courses.every(course => course.semester?.code === saved.lntTermCode)) throw Error('INVALID_CACHE');
+      const semesterId = data.courses[0]?.semester_id;
+      const knownId = Number.isSafeInteger(semesterId) && semesterId! > 0 && data.courses.every(course => course.semester_id === semesterId);
+      term = { id: knownId ? semesterId! : null, name: saved.name };
+    } else {
+      if (!(saved.id === null || Number.isSafeInteger(saved.id) && saved.id > 0)) throw Error('INVALID_CACHE');
+      term = { id: saved.id, name: saved.name };
+    }
     courses = coursesFrom({ courses: data.courses }, term);
     if (courses.length !== data.courses.length) throw Error('INVALID_CACHE');
     coursesAt = data.coursesAt;
   }
   let schedule: SchoolSchedule | null = null, scheduleAt: number | null = null;
   if (data.schedule != null) {
-    if (!term || data.schedule.jwTermCode !== term.jwTermCode || !Number.isFinite(data.scheduleAt)) throw Error('INVALID_CACHE');
-    schedule = scheduleFrom({ success: true, pkjgList: data.schedule.rows }, { data: data.schedule.periods }, term.jwTermCode);
+    const legacy = data.term as unknown as Partial<SchoolSchedule> | null;
+    const metadata = legacy?.jwTermCode ? legacy : data.schedule;
+    const weekAt = legacy?.jwTermCode ? data.coursesAt : data.schedule.weekAt;
+    if (typeof metadata.jwTermCode !== 'string' || !/^\d{4}[123]$/.test(metadata.jwTermCode) || typeof metadata.name !== 'string'
+      || !Number.isSafeInteger(metadata.currentWeek) || !Array.isArray(metadata.weeks) || !metadata.weeks.every(week => Number.isSafeInteger(week) && week > 0)
+      || !metadata.weeks.includes(metadata.currentWeek!) || data.schedule.jwTermCode !== metadata.jwTermCode
+      || !Number.isFinite(weekAt) || !Number.isFinite(data.scheduleAt)) throw Error('INVALID_CACHE');
+    schedule = { ...scheduleFrom({ success: true, pkjgList: data.schedule.rows }, { data: data.schedule.periods }, metadata.jwTermCode),
+      name: metadata.name, currentWeek: metadata.currentWeek!, weeks: metadata.weeks, weekAt: weekAt! };
     scheduleAt = data.scheduleAt;
   }
   let history: SchoolHistory[] = [], historyAt: number | null = null;
@@ -257,26 +264,18 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         if (!current(version)) return false;
         const sameAccount = state.account && (account.lntId !== null ? account.lntId === state.account.lntId
           : !!account.studentNumber && account.studentNumber === state.account.studentNumber);
-        failure = '教务学期读取失败，已保留原数据';
-        const terms = termsFrom(await device.read('jwTerms'));
+        failure = 'LNT 当前学期读取失败，已保留原数据';
+        const term = lntTermFrom(await device.read('lntTerms'));
         if (!current(version)) return false;
-        let term: SchoolTerm | null = null;
-        for (const candidate of terms) {
-          failure = '教务当前周读取失败，已保留原数据';
-          const week = weeksFrom(await device.read('jwWeek', { jwTermCode: candidate.jwTermCode }));
-          if (!current(version)) return false;
-          if (week.weeks.includes(week.currentWeek)) { term = { ...candidate, ...week }; break; }
-        }
-        if (!term) { failure = '未能确定学校当前授课学期，已保留原数据'; throw Error('NO_CURRENT_TERM'); }
         failure = 'LNT 课程更新失败，已保留原数据';
-        const courses = coursesFrom(await device.read('courses'), term);
+        const courses = coursesFrom(await device.read('courses', { semesterId: term.id! }), term);
         if (!current(version)) return false;
         failure = '教务课表更新失败，已保留原数据';
-        const cachedSchedule = state.schedule?.jwTermCode === term.jwTermCode
-          && state.account?.studentNumber === account.studentNumber && state.account?.lntId === account.lntId ? state.schedule : null;
-        const schedule = includeSchedule ? await readSchedule(device, term, account.studentNumber) : cachedSchedule;
+        const cachedSchedule = state.account?.studentNumber === account.studentNumber && state.account?.lntId === account.lntId ? state.schedule : null;
+        const schedule = includeSchedule ? await readSchedule(device, account.studentNumber, now) : cachedSchedule;
         if (!current(version)) return false;
-        const keepHistory = state.account?.lntId === account.lntId && state.term?.lntTermCode === term.lntTermCode;
+        const keepHistory = state.account?.lntId === account.lntId && (state.term?.id === term.id
+          || state.term?.id === null && courses.some(course => state.courses.some(previous => previous.id === course.id)));
         if (login) failure = '历史签到读取失败，已保留原数据';
         const history = login ? await readHistory(courses, account.lntId)
           : keepHistory ? state.history.filter(item => courses.some(course => course.id === item.course_id)) : [];

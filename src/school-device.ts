@@ -14,7 +14,8 @@ const logoutMarker = () => new File(Paths.document, 'school-logout');
 const endpoints = {
   profile: 'https://lnt.xmu.edu.cn/api/profile',
   todos: 'https://lnt.xmu.edu.cn/api/todos?no-intercept=true',
-  courses: 'https://lnt.xmu.edu.cn/api/my-courses?per_page=1000',
+  lntTerms: 'https://lnt.xmu.edu.cn/api/semesters',
+  courses: 'https://lnt.xmu.edu.cn/api/my-courses',
   rollcalls: 'https://lnt.xmu.edu.cn/api/radar/rollcalls',
   jwTerms: 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/modules/xskcb/kfdxnxqcx.do',
 };
@@ -22,6 +23,7 @@ let generation = 0;
 let authenticating: Promise<void> | null = null;
 let clearing: Promise<void> | null = null;
 let mustClear = false;
+let verifiedTerms: unknown = null;
 const requests = new Map<AbortController, Promise<unknown>>();
 export const schoolBrowser = createSchoolBrowser(() => {
   generation++;
@@ -55,6 +57,33 @@ function request(url: string, version: number, init: RequestInit = {}) {
   return task;
 }
 async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], version = generation): Promise<unknown> {
+  check(version);
+  if (action === 'jwTerms' && verifiedTerms !== null) {
+    const terms = verifiedTerms; verifiedTerms = null;
+    return terms;
+  }
+  if (action === 'courses') {
+    if (!Number.isSafeInteger(params?.semesterId) || params!.semesterId! <= 0) throw fail('INVALID_SEMESTER');
+    const courses: unknown[] = [];
+    let pages = 1, total = 0;
+    for (let page = 1; page <= pages; page++) {
+      const response = await request(endpoints.courses, version, {
+        method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page, page_size: 100, fields: 'id,course_code,name,semester_id,semester', conditions: { semester_id: [params!.semesterId] } }),
+      });
+      const result = jsonResponse(response) as { success?: unknown; courses?: unknown; pages?: unknown; total?: unknown } | null;
+      if (result?.success === false || !Array.isArray(result?.courses) || !Number.isSafeInteger(result.pages) || (result.pages as number) < 0
+        || !Number.isSafeInteger(result.total) || (result.total as number) < 0
+        || page > 1 && (result.pages !== pages || result.total !== total)) throw fail('INVALID_RESPONSE');
+      pages = result.pages as number; total = result.total as number;
+      if (pages > Math.max(1, total) || (pages === 0 && total !== 0) || result.courses.length > 100
+        || (page < pages && result.courses.length === 0)) throw fail('INVALID_RESPONSE');
+      courses.push(...result.courses);
+      if (courses.length > total) throw fail('INVALID_RESPONSE');
+    }
+    if (courses.length !== total) throw fail('INVALID_RESPONSE');
+    return { courses };
+  }
   const timetable = action === 'jwSchedule' || action === 'jwPeriods';
   if ((action === 'jwWeek' || timetable) && !/^\d{4}[123]$/.test(params?.jwTermCode ?? '')) throw fail('INVALID_TERM');
   if (action === 'history' && (!Number.isSafeInteger(params?.courseId) || params!.courseId! <= 0
@@ -67,12 +96,17 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
     method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ XNXQDM: params!.jwTermCode!, XH: params?.studentNumber ?? '' }).toString(),
   } : { headers: { Accept: 'application/json' } });
+  return jsonResponse(response);
+}
+function jsonResponse(response: { contentType: string; text: string }): unknown {
   if (!response.contentType.includes('json')) throw fail(response.contentType.includes('html') ? 'AUTH_REQUIRED' : 'INVALID_RESPONSE');
   try { return JSON.parse(response.text); } catch { throw fail('INVALID_RESPONSE'); }
 }
 async function authenticate(onAuthorized?: () => void) {
   const version = generation;
   check(version);
+  verifiedTerms = null;
+  let terms: unknown = null;
   let stage = 'native', failed = false;
   let cookies: typeof import('@preeternal/react-native-cookie-manager').default | undefined;
   try {
@@ -104,8 +138,9 @@ async function authenticate(onAuthorized?: () => void) {
     await schoolBrowser.initializeAcademic();
     check(version);
     stage = 'academic-probe';
-    const terms = await read('jwTerms', undefined, version) as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
-    if (terms?.success === false || !Array.isArray(terms?.datas?.kfdxnxqcx?.rows)) throw fail('INVALID_ACADEMIC_SESSION');
+    const academic = await read('jwTerms', undefined, version) as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
+    if (academic?.success === false || !Array.isArray(academic?.datas?.kfdxnxqcx?.rows)) throw fail('INVALID_ACADEMIC_SESSION');
+    terms = academic;
     stage = 'lnt';
     await request('https://lnt.xmu.edu.cn/api/login?login=access_token', version, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ access_token: token, org_id: 1 }),
@@ -135,11 +170,13 @@ async function authenticate(onAuthorized?: () => void) {
     finally { schoolBrowser.close(); }
   }
   check(version);
+  verifiedTerms = terms;
   onAuthorized?.();
 }
 function clear(): Promise<void> {
   if (clearing) return clearing;
   generation++; mustClear = true;
+  verifiedTerms = null;
   schoolBrowser.close();
   for (const controller of requests.keys()) controller.abort();
   const pending = [...requests.values(), authenticating];
