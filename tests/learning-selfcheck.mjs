@@ -894,3 +894,36 @@ test('setting writes preserve accepted attendance, report storage failure, and c
     else assert.equal(JSON.parse(f.stored()).account.studentNumber, '009999');
   }
 });
+
+test('todo deadlines use calendar days and Monday-based weeks without a year', () => {
+  const monday = new Date(2026, 10, 16, 22);
+  const cases = [
+    [monday, new Date(2026, 10, 16, 8, 5), '今天 08:05'],
+    [monday, new Date(2026, 10, 17), '明天 00:00'],
+    [monday, new Date(2026, 10, 18, 23, 59), '后天 23:59'],
+    [monday, new Date(2026, 10, 19, 18), '周四 18:00'],
+    [monday, new Date(2026, 10, 22, 18), '周日 18:00'],
+    [monday, new Date(2026, 10, 23, 18), '11月23日 18:00'],
+    [monday, new Date(2027, 0, 3, 18), '1月3日 18:00'],
+    [monday, new Date(2026, 10, 15, 18), '11月15日 18:00'],
+    [new Date(2026, 10, 19), new Date(2026, 10, 17, 18), '周二 18:00'],
+    [new Date(2026, 10, 19), new Date(2026, 10, 15, 18), '11月15日 18:00'],
+    [new Date(2026, 10, 22, 23, 59), new Date(2026, 10, 23), '明天 00:00'],
+    [new Date(2026, 10, 22), new Date(2026, 10, 24, 18), '后天 18:00'],
+    [new Date(2026, 10, 22), new Date(2026, 10, 25, 18), '11月25日 18:00'],
+    [new Date(2026, 10, 30), new Date(2026, 11, 1, 18), '明天 18:00'],
+    [new Date(2026, 11, 31), new Date(2027, 0, 1, 18), '明天 18:00'],
+    [new Date(2026, 11, 31), new Date(2027, 0, 2, 18), '后天 18:00'],
+    [new Date(2026, 11, 31), new Date(2027, 0, 3, 18), '周日 18:00'],
+    [new Date(2026, 11, 31), new Date(2027, 0, 4, 18), '1月4日 18:00'],
+    [new Date(2028, 1, 28, 23), new Date(2028, 1, 29, 18), '明天 18:00'],
+    [new Date(2028, 1, 28), new Date(2028, 2, 1, 18), '后天 18:00'],
+    [new Date(2026, 2, 7, 23), new Date(2026, 2, 9, 18), '后天 18:00'],
+  ];
+  for (const [now, end, expected] of cases) {
+    const item = { ...todo, end_time: end.toISOString() };
+    assert.equal(todoView(item, now).deadline, expected);
+    assert.equal(item.end_time, end.toISOString(), 'display never rewrites the school timestamp');
+  }
+  assert.equal(todoView({ ...todo, end_time: null }, monday).deadline, null);
+});

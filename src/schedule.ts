@@ -1,5 +1,11 @@
-import { courses as courseColors, type Course, type Session } from './demo-data.ts';
+import { courses as courseColors, sessionTime, type Course, type Session } from './demo-data.ts';
 import type { LearningSnapshot, SchoolDevice, SchoolTerm } from './learning.ts';
+
+export function currentCourseIndex(sessions: Session[], now = new Date()) {
+  const time = now.toTimeString().slice(0, 5);
+  const index = sessions.findIndex(session => sessionTime(session).slice(-5) > time);
+  return index === -1 ? sessions.length - 1 : index;
+}
 
 export type SchoolPeriod = { DM: number; MC: string; KSSJ: string; JSSJ: string; JCFADM: string };
 export type SchoolScheduleRow = { WID: string; BJDM: string; KCMC: string; JASMC: string; JSXM: string;

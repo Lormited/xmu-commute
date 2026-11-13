@@ -486,6 +486,16 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
   let context, cursor = 0;
   let preview = demoState.demoReducer(demoState.initialState(), { type: 'scenario', scenario: 'signed-out' });
   const slots = [], navigations = [], focusEffects = [], effects = [];
+  const todoClock = { now: Date.now(), timer: null, listener: null };
+  class TodoDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [todoClock.now])); }
+    static now() { return todoClock.now; }
+  }
+  const todayClock = { now: Date.now(), timer: null, listener: null };
+  class TodayDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [todayClock.now])); }
+    static now() { return todayClock.now; }
+  }
   const react = { ...React, useEffect: effect => effects.push(effect), useMemo: factory => factory(), useCallback: callback => callback,
     useReducer: () => [preview, event => { preview = demoState.demoReducer(preview, event); }],
     useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
@@ -495,17 +505,26 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
       return [slot.value, next => { slot.value = next; }];
     },
   };
-  const native = { Platform: { OS: 'android' }, View: 'View', Text: 'Text', ScrollView: 'ScrollView', Switch: 'Switch',
+  const native = { AppState: { addEventListener(_event, listener) {
+    todayClock.listener = listener;
+    return { remove() { todayClock.listener = null; } };
+  } }, Platform: { OS: 'android' }, View: 'View', Text: 'Text', ScrollView: 'ScrollView', Switch: 'Switch',
     AccessibilityInfo: { isReduceMotionEnabled: async () => false, addEventListener: () => ({ remove() {} }) },
     StyleSheet: { create: value => value }, useWindowDimensions: () => ({ width: 400 }) };
   const provider = loadModule('../src/demo-context.tsx', {
-    react, 'react-native': native, './demo-state': demoState, './demo-data': demoData,
+    react, 'react-native': { ...native, AppState: { addEventListener(_event, listener) {
+      todoClock.listener = listener;
+      return { remove() { todoClock.listener = null; } };
+    } } }, './demo-state': demoState, './demo-data': demoData,
     './schedule': scheduleModule, './learning': { createLearning: () => f.learning, historyView, todoView }, './school-device': f,
     './qr.ts': qrModule, './location-attendance.ts': locationModule,
     './attendance-trial': { createAttendanceTrial }, './attendance-trial-device': { attendanceTrialDevice: {
       now: Date.now, load: async () => trialCache, save: async () => {}, stop: async () => {},
     } },
-  }, { __DEV__: development, process: { env: { EXPO_PUBLIC_PREVIEW: previewMode ? '1' : undefined } } });
+  }, { Date: TodoDate,
+    setTimeout(callback, delay) { todoClock.timer = { callback, delay }; return todoClock.timer; },
+    clearTimeout(timer) { if (todoClock.timer === timer) todoClock.timer = null; },
+    __DEV__: development, process: { env: { EXPO_PUBLIC_PREVIEW: previewMode ? '1' : undefined } } });
   const demo = { useDemo: () => context };
   let scrollConfig, drag, nativeScroll;
   const shared = value => ({ get: () => value, set: next => { value = next; } });
@@ -530,9 +549,14 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
   });
   const todayCard = loadModule('../src/today-course-card.tsx', { 'react-native': native, './demo-context': demo, './demo-data': demoData, './ui': ui });
   const pageMocks = { react, 'react-native': native, 'expo-router': { router, useFocusEffect: callback => focusEffects.push(callback) }, '@/demo-context': demo,
-    '@/demo-state': demoState, '@/demo-data': demoData, '@/ui': ui,
+    '@/demo-state': demoState, '@/demo-data': demoData, '@/schedule': scheduleModule, '@/ui': ui,
     '@/today-course-card': todayCard };
-  const today = loadModule('../app/(tabs)/index.tsx', pageMocks);
+  const today = loadModule('../app/(tabs)/index.tsx', pageMocks, {
+    Date: TodayDate,
+    setTimeout(callback, delay) { todayClock.timer = { callback, delay }; return todayClock.timer; },
+    clearTimeout(timer) { if (todayClock.timer === timer) todayClock.timer = null; },
+  });
+  function renderToday() { cursor = 50; return today.default(); }
   const profilePage = loadModule('../app/(tabs)/profile.tsx', pageMocks);
   const historyPage = loadModule('../app/history.tsx', { ...pageMocks, '@/swipe-pages': { SwipePages: 'SwipePages' } });
   const settingsPage = loadModule('../app/settings.tsx', { ...pageMocks, react, '@/style-options': styleOptions });
@@ -560,37 +584,39 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
     }
   }
   function screen(page) {
-    const root = page === 'today' ? today.default() : page === 'schedule' ? schedulePage.default()
+    const root = page === 'today' ? renderToday() : page === 'schedule' ? schedulePage.default()
       : page === 'learning' ? learningPage.LearningScreen() : profilePage.default();
     const screen = root.type(root.props);
     return screen.type(screen.props);
   }
   return {
-    navigations, find,
+    navigations, find, todoClock, todayClock,
+    focusToday() { const cleanups = focusEffects.slice(-2).map(effect => effect()); return () => cleanups.forEach(cleanup => cleanup?.()); },
+    centerToday() { focusEffects.at(-1)?.(); },
     historyPage() { cursor = 30; return historyPage.default(); },
     focusHistory() { focusEffects.at(-1)?.(); },
     pageTree(screen) { const page = screen.type(screen.props); return page.type(page.props); },
     historyContents(index) { cursor = 30; const screen = historyPage.default(); const swipe = find(screen, props => props?.max === 1); const block = swipe.props.children(index); return block.type(block.props); },
     pull(config) { scrollConfig = config; pageScroll.PageScroll({ children: null }); assert.equal(drag.enabled, true); nativeScroll.onScroll({ contentOffset: { y: 0 } }); drag.onBegin(); drag.onUpdate({ translationY: 200 }); drag.onDeactivate({ canceled: false }); drag.onFinalize(); },
-    runStartupEffects: () => effects.splice(0).forEach(effect => effect()),
+    runStartupEffects: () => effects.splice(0).map(effect => effect()),
     pullToRefresh(page) { this.pull(find(screen(page), props => props?.value?.pull && props.value.rotation).props.value); },
     learningPage: () => learningPage.LearningScreen(),
     settings: () => settingsPage.default(),
     courseList: (preview = false) => courseList.CourseList({ preview }),
     courseDetail: (id, session, week) => { Object.assign(params, { id, session, week }); return courseDetail.default(); },
-    today: () => today.default(),
+    today: () => renderToday(),
     schedulePage: () => schedulePage.default(),
     weekGrid: week => { const page = schedulePage.default(); const pager = find(page, props => typeof props?.children === 'function'); return expand(pager.props.children(week)); },
     conflicts: (session, week) => { Object.assign(params, { session, week }); return conflictsPage.default(); },
     render() { cursor = 0; context = provider.DemoProvider({ children: null }).props.value; return context; },
     loginButton(page) {
-      const tree = page === 'today' ? today.default() : page === 'profile' ? profilePage.default()
+      const tree = page === 'today' ? renderToday() : page === 'profile' ? profilePage.default()
         : ui.ResourceBlock({ resource: page, children: null, emptyTitle: '暂无数据' });
       return find(tree, props => props?.label === '学校统一登录' || props?.action === '学校统一登录');
     },
     refreshButton(page = 'profile') { return find(screen(page), props => props?.label?.includes('同步')); },
     attendanceEntry(title) {
-      return find(today.default(), props => props?.label?.startsWith(title + '，') && props.label.endsWith('去签到'));
+      return find(renderToday(), props => props?.label?.startsWith(title + '，') && props.label.endsWith('去签到'));
     },
   };
 }
@@ -1148,4 +1174,98 @@ test('release provider keeps school mode and debug selections with isolated tria
   assert.ok(context.isTrialRollcall(id));
   assert.equal((await context.submitNumber(id, '0206')).result, 'success');
   assert.equal(f.calls.length, 0, 'release trial submissions remain local');
+});
+
+
+test('today centers the next lesson at dismissal, recalibrates on resume, and cleans up its clock', async () => {
+  const f = fixture(), app = pages(f); app.render();
+  const now = new Date(); now.setHours(9, 39, 59, 0);
+  app.todayClock.now = now.getTime();
+  const times = [['0800', '0940'], ['1010', '1150'], ['1430', '1610']];
+  const rows = times.map(([start, end], index) => ({ WID: 'today-' + index, BJDM: '001-A', KCMC: '学校课程', JASMC: '学校教室', JSXM: '张老师', XQ: (now.getDay() + 6) % 7 + 1, KSJCDM: index + 1, JSJCDM: index + 1, KSSJ: start, JSSJ: end, ZCMC: '8周', JCFADM: 'a' }));
+  const periods = times.map(([start, end], index) => ({ DM: index + 1, MC: '课程时段', KSSJ: start, JSSJ: end, JCFADM: 'a' }));
+  f.handler = async url => url.includes('queryXspkjg.do') ? response(url, { success: true, pkjgList: rows })
+    : url.includes('queryXsskjc.do') ? response(url, { success: true, data: periods }) : undefined;
+  const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
+  app.render();
+  const requests = f.calls.length, scrolls = [];
+  const carousel = () => app.find(app.today(), props => props?.horizontal);
+  let cards = carousel();
+  cards.props.ref.current = { scrollTo: value => scrolls.push(value) };
+  assert.equal(cards.props.contentContainerStyle.paddingHorizontal, 50, 'a 300px card is centered in a 400px viewport');
+  cards.props.onContentSizeChange();
+  assert.equal(scrolls.at(-1).x, 0);
+  assert.equal(scrolls.at(-1).animated, false);
+  const leave = app.focusToday();
+  assert.equal(app.todayClock.timer.delay, 1000, 'the clock aligns to the next minute boundary');
+  now.setHours(9, 40, 0, 0); app.todayClock.now = now.getTime();
+  app.todayClock.timer.callback();
+  cards = carousel(); app.centerToday();
+  assert.equal(scrolls.at(-1).x, 312, 'the second card is centered as soon as the first ends, before the second starts');
+  assert.equal(app.todayClock.timer.delay, 60_000);
+  now.setHours(11, 50, 0, 0); app.todayClock.now = now.getTime();
+  app.todayClock.listener('active'); cards = carousel(); app.centerToday();
+  assert.equal(scrolls.at(-1).x, 624, 'foreground return immediately selects the next course');
+  cards.props.onLayout({ nativeEvent: { layout: { width: 700 } } });
+  cards = carousel(); cards.props.onContentSizeChange();
+  assert.equal(cards.props.contentContainerStyle.paddingHorizontal, 200, 'the last card also centers in a wide viewport');
+  now.setHours(23, 0, 0, 0); app.todayClock.now = now.getTime();
+  app.todayClock.listener('active'); cards = carousel(); app.centerToday();
+  assert.equal(scrolls.at(-1).x, 624, 'after the last course the last card stays centered');
+  now.setDate(now.getDate() + 1); now.setHours(0, 0, 0, 0); app.todayClock.now = now.getTime();
+  app.todayClock.listener('active');
+  assert.equal(carousel(), undefined, 'midnight changes to the new day instead of retaining yesterday cards');
+  assert.equal(f.calls.length, requests, 'clock changes never query school services');
+  leave();
+  assert.equal(app.todayClock.timer, null);
+  assert.equal(app.todayClock.listener, null);
+});
+
+test('shared todo dates update at midnight and resume; missing deadlines leave no placeholder or separator', async () => {
+  const items = [
+    { ...todo, id: 1, end_time: new Date(2026, 10, 17, 18).toISOString() },
+    { ...todo, id: 2, end_time: new Date(2026, 10, 18, 8, 5).toISOString() },
+    { ...todo, id: 3 },
+  ];
+  const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: items, todosAt: 1000 });
+  const f = fixture(new Map([['school-learning.json', raw]]));
+  await f.learning.restore();
+  f.handler = async url => url.includes('/todos') ? response(url, { todo_list: items }) : undefined;
+  const app = pages(f);
+  app.todoClock.now = new Date(2026, 10, 15, 23, 59, 59).getTime();
+  const context = app.render();
+  assert.deepEqual(context.todos.map(item => item.deadline), ['后天 18:00', '11月18日 08:05', null]);
+  const home = app.find(app.today(), props => Array.isArray(props?.children) && props.children.length === 3 && props.children.every(child => child?.props?.todo));
+  const pager = app.find(app.learningPage(), props => typeof props?.children === 'function');
+  const learning = app.find(pager.props.children(0), props => Array.isArray(props?.children) && props.children.length === 3 && props.children.every(child => child?.props?.todo));
+  for (const rows of [home, learning]) {
+    assert.deepEqual(rows.props.children.map(row => row.props.todo), context.todos);
+    for (const row of rows.props.children) {
+      const view = row.type(row.props), item = row.props.todo;
+      const meta = app.find(view, props => props?.children?.[0] === item.course);
+      assert.equal(meta.props.children.join(''), item.course + (item.deadline ? ' · ' + item.deadline : ''));
+      assert.equal(view.props.accessibilityLabel, item.title + '，' + item.course + (item.deadline ? '，' + item.deadline : ''));
+      assert.doesNotMatch(JSON.stringify(view), /未设.*截止时间/);
+    }
+  }
+  const cleanups = app.runStartupEffects();
+  await f.learning.refresh();
+  const requests = f.calls.length;
+  assert.equal(app.todoClock.timer.delay, 1000);
+  app.todoClock.now = new Date(2026, 10, 16).getTime();
+  app.todoClock.timer.callback();
+  assert.deepEqual(app.render().todos.map(item => item.deadline), ['明天 18:00', '后天 08:05', null]);
+  assert.equal(app.todoClock.timer.delay, 24 * 60 * 60 * 1000);
+  app.todoClock.now = new Date(2026, 10, 17, 9).getTime();
+  app.todoClock.listener('active');
+  assert.deepEqual(app.render().todos.map(item => item.deadline), ['今天 18:00', '明天 08:05', null]);
+  assert.equal(f.calls.length, requests, 'date changes never query school services');
+  assert.deepEqual(f.learning.getSnapshot().todos, items, 'display changes leave raw dates and order intact');
+  cleanups.forEach(cleanup => { if (typeof cleanup === 'function') cleanup(); });
+  assert.equal(app.todoClock.timer, null);
+  assert.equal(app.todoClock.listener, null);
+  const preview = pages(f, true);
+  preview.render(); preview.runStartupEffects();
+  assert.equal(preview.todoClock.timer, null, 'static previews do not start a date clock');
+  assert.equal(preview.todoClock.listener, null);
 });

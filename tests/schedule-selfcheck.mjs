@@ -95,3 +95,24 @@ test('one grid leaves only genuinely ambiguous active-plan times blank', () => {
   assert.equal(groupSessions(sessions)[0].sessions.length, 2);
   assert.equal(sessions[1].time, '09:00 — 09:40');
 });
+
+
+test('today advances at the actual lesson end, including gaps and overlapping lessons', () => {
+  const sessions = [
+    { id: 'first', courseId: '3', day: 0, start: 0, length: 2, time: '08:00 — 09:40' },
+    { id: 'second', courseId: '4', day: 0, start: 2, length: 2, time: '10:10 — 11:50' },
+    { id: 'last', courseId: '5', day: 0, start: 4, length: 2, time: '14:30 — 16:10' },
+  ];
+  for (const [hour, minute, second, expected] of [
+    [7, 0, 0, 0], [9, 39, 59, 0], [9, 40, 0, 1], [10, 0, 0, 1],
+    [10, 10, 0, 1], [11, 49, 59, 1], [11, 50, 0, 2], [16, 10, 0, 2], [23, 59, 59, 2],
+  ]) {
+    assert.equal(scheduleModule.currentCourseIndex(sessions, new Date(2026, 10, 13, hour, minute, second)), expected);
+  }
+  const overlap = [sessions[0], { ...sessions[1], time: '09:00 — 10:30' }, sessions[2]];
+  assert.equal(scheduleModule.currentCourseIndex(overlap, new Date(2026, 10, 13, 9, 40)), 1);
+  assert.equal(scheduleModule.currentCourseIndex([{ ...sessions[0], time: '08:00 — 10:40' }, sessions[2]], new Date(2026, 10, 13, 9, 40)), 0, 'school end times take precedence over demo periods');
+  assert.equal(scheduleModule.currentCourseIndex([{ ...sessions[0], time: undefined }, sessions[2]], new Date(2026, 10, 13, 9, 40)), 1, 'preview sessions fall back to their existing period times');
+  assert.equal(scheduleModule.currentCourseIndex([], new Date(at)), -1);
+  assert.equal(scheduleModule.currentCourseIndex([sessions[0]], new Date(2026, 10, 13, 23)), 0);
+});

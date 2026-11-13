@@ -126,10 +126,10 @@ export function TodoRow({ todo, last = false, flushTop = false }: { todo: Todo; 
   const style = [s.todoRow, rowStyle, flushTop && variant === 'space' && { paddingTop: 0, minHeight: 61 }];
   const content = <>
     <View style={s.todoIcon}><Icon name="document-text-outline" size={21} color="#8b759f" /></View>
-    <View style={{ flex: 1, minWidth: 0, gap: 5 }}><Text style={s.todoTitle} numberOfLines={1}>{todo.title}</Text><Text style={s.todoMeta} numberOfLines={1}>{todo.course} · {todo.deadline ?? '未设截止时间'}</Text></View>
+    <View style={{ flex: 1, minWidth: 0, gap: 5 }}><Text style={s.todoTitle} numberOfLines={1}>{todo.title}</Text><Text style={s.todoMeta} numberOfLines={1}>{todo.course}{todo.deadline ? ' · ' + todo.deadline : ''}</Text></View>
     {variant === 'group' && !last && <View style={s.insetRule} />}
   </>;
-  return <View accessible accessibilityLabel={todo.title + '，' + todo.course + '，' + (todo.deadline ?? '未设置截止时间')} style={style}>{content}</View>;
+  return <View accessible accessibilityLabel={todo.title + '，' + todo.course + (todo.deadline ? '，' + todo.deadline : '')} style={style}>{content}</View>;
 }
 export function SettingRow({ icon, title, value, onPress, danger = false, trailing, last = false }: { icon: IconName; title: string; value?: string; onPress?: () => void; danger?: boolean; trailing?: ReactNode; last?: boolean }) {
   const { variant, rowStyle } = useRowStyle();

@@ -39,9 +39,18 @@ export type SchoolDevice = {
   submitQr(rollcallId: string, data: unknown): Promise<AttendanceReceipt>;
 };
 export const todoKey = (item: SchoolTodo) => `${item.type}:${item.course_id}:${item.id}`;
-export function todoView(item: SchoolTodo) {
-  return { id: todoKey(item), title: item.title, course: item.course_name, type: item.type, locked: item.is_locked,
-    deadline: item.end_time ? new Date(item.end_time).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) : null };
+export function todoView(item: SchoolTodo, now = new Date()) {
+  let deadline: string | null = null;
+  if (item.end_time) {
+    const end = new Date(item.end_time);
+    const days = (Date.UTC(end.getFullYear(), end.getMonth(), end.getDate()) - Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())) / 86_400_000;
+    const dayOfWeek = (now.getDay() + 6) % 7;
+    const date = days >= 0 && days < 3 ? ['今天', '明天', '后天'][days]
+      : days >= -dayOfWeek && days < 7 - dayOfWeek ? '周' + '日一二三四五六'[end.getDay()]
+      : end.getMonth() + 1 + '月' + end.getDate() + '日';
+    deadline = date + ' ' + String(end.getHours()).padStart(2, '0') + ':' + String(end.getMinutes()).padStart(2, '0');
+  }
+  return { id: todoKey(item), title: item.title, course: item.course_name, type: item.type, locked: item.is_locked, deadline };
 }
 export function historyView(item: SchoolHistory): HistoryItem {
   const type = item.is_radar ? methodLabel.radar : item.is_number ? methodLabel.number : item.type === 'qr_rollcall' ? methodLabel.qr

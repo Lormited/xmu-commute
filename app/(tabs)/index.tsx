@@ -1,18 +1,43 @@
-import { ScrollView, Text, View, useWindowDimensions } from 'react-native';
-import { router } from 'expo-router';
+import { useCallback, useRef, useState } from 'react';
+import { AppState, ScrollView, Text, View, useWindowDimensions, type ScrollViewInstance } from 'react-native';
+import { router, useFocusEffect } from 'expo-router';
 import { useDemo } from '@/demo-context';
-import { courseFor, methodLabel } from '@/demo-data';
+import { courseFor, methodLabel, sessionTime } from '@/demo-data';
+import { currentCourseIndex, schoolScheduleView } from '@/schedule';
 import { TodayCourseCard } from '@/today-course-card';
 import { Glass, Icon, ResourceBlock, RowGroup, Screen, Section, StateCard, Tap, TodoRow, c, s } from '@/ui';
 
 export default function Today() {
-  const { state, real, data, todos: list, login, timetable, isTrialRollcall } = useDemo();
+  const { state, real, data, todos: list, login, timetable: savedTimetable, isTrialRollcall } = useDemo();
   const { width } = useWindowDimensions();
-  const today = timetable.sessionsForWeek(timetable.currentWeek).filter(item => item.day === (real ? (new Date().getDay() + 6) % 7 : 0)).sort((a, b) => a.start - b.start);
-  const title = real ? new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).replace('星期', ' · 星期') : '10月26日 · 星期一';
+  const [now, setNow] = useState(() => new Date());
+  const [carouselWidth, setCarouselWidth] = useState(width);
+  const carousel = useRef<ScrollViewInstance>(null);
+  const timetable = real ? schoolScheduleView(data, now) : savedTimetable;
+  const today = timetable.sessionsForWeek(timetable.currentWeek).filter(item => item.day === (real ? (now.getDay() + 6) % 7 : 0))
+    .sort((a, b) => sessionTime(a).slice(0, 5).localeCompare(sessionTime(b).slice(0, 5)));
+  const title = real ? now.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).replace('星期', ' · 星期') : '10月26日 · 星期一';
   const active = state.rollcalls.filter(item => !state.attendance[item.id]
     && (isTrialRollcall(item.id) || state.loggedIn && state.load === 'ready'));
-  const cardWidth = Math.min(Math.min(width, 440) - 84, 300);
+  const cardWidth = Math.min(Math.min(carouselWidth, 440) - 84, 300);
+  const courseIndex = real ? currentCourseIndex(today, now) : 0;
+  const courseId = today[courseIndex]?.id;
+  const offset = Math.max(0, courseIndex) * (cardWidth + 12);
+  const centerCourse = useCallback(() => carousel.current?.scrollTo({ x: offset, animated: false }), [offset]);
+  useFocusEffect(useCallback(() => {
+    if (!real) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const update = () => {
+      setNow(new Date());
+      timer = setTimeout(update, 60_000 - Date.now() % 60_000);
+    };
+    update();
+    const listener = AppState.addEventListener('change', status => {
+      if (status === 'active') { clearTimeout(timer); update(); }
+    });
+    return () => { clearTimeout(timer); listener.remove(); };
+  }, [real]));
+  useFocusEffect(useCallback(() => { centerCourse(); }, [centerCourse, courseId, state.loggedIn]));
   const attendanceCards = active.length > 0 && <View style={{ marginHorizontal: 24, marginTop: state.loggedIn && today.length > 0 && (real || state.load === 'ready') ? 2 : 22, marginBottom: 22, gap: 10 }}>{active.map(item => {
     const course = real ? timetable.courseFor(item.courseId) : courseFor(item.courseId, state.longText);
     const name = item.title ?? course?.title ?? '签到活动';
@@ -32,7 +57,8 @@ export default function Today() {
   return <Screen tab resource="jw" title={title}>
     <Section title="今日课程" action="全部课表" onPress={() => router.navigate('/schedule')} />
     <ResourceBlock resource="jw" emptyTitle="今天没有课程">
-      {today.length ? <ScrollView horizontal directionalLockEnabled nestedScrollEnabled bounces overScrollMode="always" showsHorizontalScrollIndicator={false} snapToInterval={cardWidth + 12} decelerationRate="fast" contentContainerStyle={{ paddingHorizontal: 24, gap: 12, paddingBottom: 20 }}>
+      {today.length ? <ScrollView ref={carousel} onLayout={event => setCarouselWidth(event.nativeEvent.layout.width)} onContentSizeChange={centerCourse}
+        horizontal directionalLockEnabled nestedScrollEnabled bounces overScrollMode="always" showsHorizontalScrollIndicator={false} snapToInterval={cardWidth + 12} decelerationRate="fast" contentContainerStyle={{ paddingHorizontal: (carouselWidth - cardWidth) / 2, gap: 12, paddingBottom: 20 }}>
         {today.map(session => {
           const course = timetable.courseFor(session.courseId, session)!;
           return <Tap key={session.id} label={'查看' + course.title + '课程详情'} onPress={() => router.push({ pathname: '/course', params: { id: course.id, session: session.id, week: timetable.currentWeek } })}>

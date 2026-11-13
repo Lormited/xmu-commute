@@ -93,7 +93,7 @@ export function weekDays(week: number) {
 export type Todo = { id: string; title: string; course: string; type: string; deadline: string | null; locked?: boolean };
 export const todos: Todo[] = [
   { id: 'reading', title: '阅读：设计中的设计', course: '设计思维与方法', type: 'homework', deadline: '明天 18:00' },
-  { id: 'writing', title: 'Unit 4 · A letter to the future', course: '大学英语', type: 'homework', deadline: '周三 23:59' },
+  { id: 'writing', title: 'Unit 4 · A letter to the future', course: '大学英语', type: 'homework', deadline: '后天 23:59' },
   { id: 'coding', title: '实验三：循环与数组', course: '程序设计基础', type: 'homework', deadline: '周四 22:00' },
   { id: 'calculus', title: '第三章习题：导数的应用', course: '高等数学', type: 'homework', deadline: '周五 18:00' },
   { id: 'physics-report', title: '实验报告：测量与误差分析', course: '大学物理', type: 'homework', deadline: '周五 23:59' },

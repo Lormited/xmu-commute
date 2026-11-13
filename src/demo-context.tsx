@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore, type Dispatch, type ReactNode } from 'react';
-import { AccessibilityInfo, Platform } from 'react-native';
+import { AccessibilityInfo, AppState, Platform } from 'react-native';
 import { demoReducer, initialState, type DemoEvent, type DemoState } from './demo-state';
 import { TERM, courseFor, periods, sessionsForWeek, weekDays, todoFixtures, type Todo } from './demo-data';
 import { createLearning, historyView, todoView, type LearningSnapshot } from './learning';
@@ -22,6 +22,23 @@ const deviceTrial = createAttendanceTrial(attendanceTrialDevice,
 export function DemoProvider({ children }: { children: ReactNode }) {
   const [preview, previewDispatch] = useReducer(demoReducer, undefined, initialState);
   const real = Platform.OS === 'android' && (!__DEV__ || process.env.EXPO_PUBLIC_PREVIEW !== '1');
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    if (!real) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const update = () => {
+      const current = new Date();
+      setNow(current);
+      const midnight = new Date(current);
+      midnight.setHours(24, 0, 0, 0);
+      timer = setTimeout(update, midnight.getTime() - current.getTime());
+    };
+    update();
+    const listener = AppState.addEventListener('change', status => {
+      if (status === 'active') { clearTimeout(timer); update(); }
+    });
+    return () => { clearTimeout(timer); listener.remove(); };
+  }, [real]);
   const [learning] = useState(() => createLearning(schoolDevice));
   const trial = deviceTrial;
   const trialData = useSyncExternalStore(trial.subscribe, trial.getSnapshot, trial.getSnapshot);
@@ -117,7 +134,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     if (isPosition(position) && trialData.rollcalls.some(item => item.id === id && item.method === 'radar')) return trial.submit(id);
     return { result: 'failed' as const, message: '模拟定位活动或位置不可用' };
   }
-  const todos = useMemo(() => real ? data.todos.map(todoView) : todoFixtures(preview.longText), [real, data.todos, preview.longText]);
+  const todos = useMemo(() => real ? data.todos.map(item => todoView(item, now)) : todoFixtures(preview.longText), [real, data.todos, preview.longText, now]);
   return <Context.Provider value={{ state, dispatch, refresh, refreshHistory, refreshing: real ? data.refreshing : refreshing,
     syncResult: real && data.message ? 'offline' : syncResult, reducedMotion, timetable, real, data, todos, login, logout,
     trial, trialData, isTrialRollcall: trial.isTrialRollcall,

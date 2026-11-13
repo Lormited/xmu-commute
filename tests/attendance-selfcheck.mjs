@@ -66,6 +66,10 @@ function screen(outcome = 'success', platform = 'android', learning = null, sele
   const timers = new Map();
   const navigationListeners = new Map();
   let cursor = 0, sequence = 0, now = 0, backRequests = 0, tree, focused = true;
+  const clock = {
+    setTimeout: (callback, delay) => { const timer = ++sequence; timers.set(timer, { callback, due: now + delay }); return timer; },
+    clearTimeout: timer => timers.delete(timer),
+  };
   let effects = [];
   const navigation = { isFocused: () => focused, addListener: (name, listener) => { navigationListeners.set(name, listener); return () => navigationListeners.delete(name); } };
   function memo(factory, deps) {
@@ -95,9 +99,9 @@ function screen(outcome = 'success', platform = 'android', learning = null, sele
   };
   const provider = {};
   runInNewContext(providerSource, {
-    exports: provider, __DEV__: true, process: { env: { EXPO_PUBLIC_PREVIEW: learning ? undefined : '1' } }, setTimeout, clearTimeout, require(name) {
+    exports: provider, __DEV__: true, process: { env: { EXPO_PUBLIC_PREVIEW: learning ? undefined : '1' } }, ...clock, require(name) {
       if (name === 'react') return react;
-      if (name === 'react-native') return { Platform: { OS: platform }, AccessibilityInfo: { isReduceMotionEnabled: async () => false, addEventListener: () => ({ remove() { } }) } };
+      if (name === 'react-native') return { AppState: { addEventListener: () => ({ remove() {} }) }, Platform: { OS: platform }, AccessibilityInfo: { isReduceMotionEnabled: async () => false, addEventListener: () => ({ remove() { } }) } };
       if (name === './demo-state') return { demoReducer, initialState };
       if (name === './demo-data') return data;
       if (name === './schedule') return schedule;
@@ -115,8 +119,7 @@ function screen(outcome = 'success', platform = 'android', learning = null, sele
   const goBack = () => { focused = false; navigationListeners.get('blur')?.(); backRequests++; };
   runInNewContext(source, {
     exports,
-    setTimeout: (callback, delay) => { const timer = ++sequence; timers.set(timer, { callback, due: now + delay }); return timer; },
-    clearTimeout: timer => timers.delete(timer),
+    ...clock,
     require(name) {
       if (name === 'react') return react;
       if (name === 'react-native') return { Keyboard: { dismiss() { } }, Platform: { OS: platform }, ScrollView: 'ScrollView', Text: 'Text', TextInput: 'TextInput', View: 'View', StyleSheet: { create: value => value } };
