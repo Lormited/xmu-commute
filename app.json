@@ -40,10 +40,10 @@
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "local.xmu.prototype"
+      "bundleIdentifier": "dev.lormited.xmuc"
     },
     "android": {
-      "package": "local.xmu.prototype",
+      "package": "dev.lormited.xmuc",
       "softwareKeyboardLayoutMode": "resize",
       "allowBackup": false
     }

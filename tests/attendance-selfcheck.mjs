@@ -288,7 +288,7 @@ async function realScreen(reply = async () => ({ result: 'success', message: '�
       lntTerms: { semesters: [{ id: 9, name: 'LNT 当前学期', is_active: true }] },
       jwTerms: { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '当前学期' }] } } },
       jwWeek: { success: true, currentZc: '8', zcList: [{ ZC: '8' }] }, courses: { courses: [] },
-      jwSchedule: { success: true, pkjgList: [] }, jwPeriods: { success: true, data: [] },
+      jwSchedule: { success: true, pkjgList: [] },
     })[action],
     answerNumber: async (id, code) => { answers.push({ id, code }); return reply(); },
     submitLocation: async (id, position) => { answers.push({ id, position }); return reply(); },

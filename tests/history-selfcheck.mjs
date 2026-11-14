@@ -8,7 +8,6 @@ const otherCourse = { ...course, id: 4, name: '另一课程' };
 const term = { jwTermCode: '20261', lntTermCode: '2026-1', name: '秋季学期', currentWeek: 8, weeks: [8] };
 const record = { rollcall_id: 11, student_rollcall_id: 111, rollcall_time: '2026-11-08T08:00:00+08:00', title: '课堂签到', student_status: 'on_call', status: 'on_call_fine', student_status_detail: null, is_number: true, is_radar: false, type: 'manual', rollcall_status: 'closed', is_expired: true };
 const scheduleRow = { WID: 'row-1', BJDM: '001-A', KCMC: '学校课程', JASMC: '教学楼 101', JSXM: '张老师', XQ: 2, KSJCDM: 1, JSJCDM: 1, KSSJ: '0800', JSSJ: '0845', ZCMC: '8周', JCFADM: 'a' };
-const schedulePeriods = [{ DM: 1, MC: '第一节', KSSJ: '0800', JSSJ: '0845', JCFADM: 'a' }];
 const saved = { version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [], todosAt: 1000, term, courses: [course, otherCourse], coursesAt: 1000 };
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -22,7 +21,7 @@ function fixture(raw = JSON.stringify(saved)) {
       return { profile: { id: 42, user_no: '001234', name: '测试同学' }, todos: { todo_list: [] }, rollcalls: { rollcalls: [] }, courses: { courses: [course, otherCourse] },
         lntTerms: { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] },
         jwTerms: { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '秋季学期' }] } } }, jwWeek: { success: true, currentZc: 8, zcList: [{ ZC: 8 }] },
-        jwSchedule: { success: true, pkjgList: [scheduleRow] }, jwPeriods: { data: schedulePeriods } }[action];
+        jwSchedule: { success: true, pkjgList: [scheduleRow] } }[action];
     },
   };
   return { device, calls, stored: () => raw, learning: createLearning(device, () => 2000) };
@@ -361,7 +360,7 @@ test('both ordinary/history orders preserve all collections, accepted receipts a
     const before = f.learning.getSnapshot(); f.calls.length = 0;
     const first = f.learning[order[0]](), second = f.learning[order[1]]();
     assert.equal(await first, true); assert.equal(await second, true);
-    const ordinary = ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwTerms', 'jwWeek', 'jwSchedule', 'jwPeriods'] : [])];
+    const ordinary = ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : [])];
     const history = ['history', 'history'];
     assert.deepEqual(f.calls.map(([action]) => action), order[0] === 'refreshHistory' ? [...history, ...ordinary] : [...ordinary, ...history]);
     const stored = JSON.parse(f.stored());
@@ -402,7 +401,7 @@ test('every failed ordinary request or save keeps the complete combined cache an
     const setup = await combinedFixture(enabled);
     await setup.learning.submitNumber('81', '0007'); await tick();
     const saved = setup.stored();
-    for (const failure of ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwTerms', 'jwWeek', 'jwSchedule', 'jwPeriods'] : []), 'save']) {
+    for (const failure of ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : []), 'save']) {
       const f = fixture(saved); await f.learning.restore();
       const before = f.learning.getSnapshot(), seen = [], read = f.device.read;
       f.learning.subscribe(() => seen.push(f.learning.getSnapshot()));

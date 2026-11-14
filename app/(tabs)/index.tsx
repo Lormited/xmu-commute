@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from 'react';
 import { AppState, ScrollView, Text, View, useWindowDimensions, type ScrollViewInstance } from 'react-native';
 import { router, useFocusEffect } from 'expo-router';
 import { useDemo } from '@/demo-context';
-import { courseFor, methodLabel, sessionTime } from '@/demo-data';
+import { courseFor, methodLabel } from '@/demo-data';
 import { currentCourseIndex, schoolScheduleView } from '@/schedule';
 import { TodayCourseCard } from '@/today-course-card';
 import { Glass, Icon, ResourceBlock, RowGroup, Screen, Section, StateCard, Tap, TodoRow, c, s } from '@/ui';
@@ -15,7 +15,7 @@ export default function Today() {
   const carousel = useRef<ScrollViewInstance>(null);
   const timetable = real ? schoolScheduleView(data, now) : savedTimetable;
   const today = timetable.sessionsForWeek(timetable.currentWeek).filter(item => item.day === (real ? (now.getDay() + 6) % 7 : 0))
-    .sort((a, b) => sessionTime(a).slice(0, 5).localeCompare(sessionTime(b).slice(0, 5)));
+    .sort((a, b) => a.start - b.start);
   const title = real ? now.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).replace('星期', ' · 星期') : '10月26日 · 星期一';
   const active = state.rollcalls.filter(item => !state.attendance[item.id]
     && (isTrialRollcall(item.id) || state.loggedIn && state.load === 'ready'));

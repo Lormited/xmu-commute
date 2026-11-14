@@ -66,7 +66,6 @@ function fixture(files = new Map()) {
     if (url.includes('/api/login')) return response(url, '');
     if (url.includes('kfdxnxqcx')) return response(url, academicTerms);
     if (url.includes('queryXspkjg.do')) return response(url, { success: true, pkjgList: [] });
-    if (url.includes('queryXsskjc.do')) return response(url, { success: true, data: [] });
     if (url.includes('getZcxx.do')) return response(url, academicWeeks);
     if (url.endsWith('/api/semesters')) return response(url, { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] });
     if (url.includes('/my-courses')) return response(url, { courses: [course], pages: 1, total: 1 });
@@ -195,6 +194,8 @@ test('two-site login uses PKCE, waits for authentication and cookie saving, then
   assert.equal(JSON.parse(saved).historyAt, JSON.parse(saved).todosAt);
   assert.deepEqual(f.calls.filter(call => /\/course\/\d+\/student\//.test(call.url)).map(call => call.url), ['https://lnt.xmu.edu.cn/api/course/3/student/42/rollcalls?page=1&page_size=100']);
   assert.doesNotMatch(saved, /single-code|access-token|code_verifier/);
+  await f.schoolDevice.read('jwTerms');
+  assert.equal(f.calls.filter(call => call.url.includes('kfdxnxqcx')).length, 2, 'the authentication probe is consumed only once');
   const reopened = createLearning(f.schoolDevice); await reopened.restore();
   assert.deepEqual(reopened.getSnapshot().todos, [todo]);
   assert.equal(await reopened.refresh(), true);
@@ -986,17 +987,17 @@ test('learning tabs use independent school collections, preserve switching, and 
 });
 test('timetable requests send the current term and own student number without a week filter', async () => {
   const f = fixture();
-  for (const action of ['jwSchedule', 'jwPeriods']) {
+  for (const action of ['jwSchedule']) {
     await assert.rejects(f.schoolDevice.read(action, { jwTermCode: 'invalid', studentNumber: '001234' }), { code: 'INVALID_TERM' });
     await f.schoolDevice.read(action, { jwTermCode: '20261', studentNumber: '001234' });
     const request = f.calls.at(-1);
-    assert.ok(request.url.endsWith(action === 'jwSchedule' ? '/queryXspkjg.do' : '/queryXsskjc.do'));
+    assert.ok(request.url.endsWith('/queryXspkjg.do'));
     assert.equal(request.options.method, 'POST');
     assert.equal(request.options.headers['Content-Type'], 'application/x-www-form-urlencoded');
     assert.equal(request.options.body, 'XNXQDM=20261&XH=001234');
     assert.equal(new URLSearchParams(request.options.body).has('ZC'), false);
   }
-  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls.length, 1);
 });
 
 test('school timetable reaches today, selected weeks and conflict details through the provider', async () => {
@@ -1006,7 +1007,6 @@ test('school timetable reaches today, selected weeks and conflict details throug
   const weekday = (new Date().getDay() + 6) % 7 + 1;
   const row = { WID: 'school-row', BJDM: '001-A', KCMC: '学校课程', JASMC: '学校教室 101', JSXM: '张老师', XQ: weekday, KSJCDM: 1, JSJCDM: 2, KSSJ: '0800', JSSJ: '0940', ZCMC: '8周', JCFADM: 'a' };
   f.handler = async url => url.includes('queryXspkjg.do') ? response(url, { success: true, pkjgList: [row, { ...row, WID: 'second-room', JASMC: '学校教室 102' }, { ...row, WID: 'overlap', BJDM: 'other-class', KCMC: '重叠课程', JSXM: '李老师', JASMC: '学校教室 202' }] })
-    : url.includes('queryXsskjc.do') ? response(url, { success: true, data: [{ DM: 1, MC: '第一节', KSSJ: '0800', JSSJ: '0845', JCFADM: 'a' }, { DM: 2, MC: '第二节', KSSJ: '0855', JSSJ: '0940', JCFADM: 'a' }] })
     : url.includes('/todos') ? response(url, { todo_list: [] }) : undefined;
   const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
   await app.render().trial.restore();
@@ -1057,7 +1057,7 @@ test('course list details retain the original fields and linked teacher outside 
   const f = fixture(), app = pages(f); app.render();
   f.handler = async url => url.includes('queryXspkjg.do') ? response(url, { success: true, pkjgList: [
     { WID: 'odd-week', BJDM: '001-A', KCMC: '学校课程', JASMC: '学校教室 301', JSXM: '王老师', XQ: 2, KSJCDM: 1, JSJCDM: 1, KSSJ: '0800', JSSJ: '0845', ZCMC: '1-15周，单周', JCFADM: 'a' },
-  ] }) : url.includes('queryXsskjc.do') ? response(url, { data: [{ DM: 1, MC: '第一节', KSSJ: '0800', JSSJ: '0845', JCFADM: 'a' }] }) : undefined;
+  ] }) : undefined;
   const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
   const context = app.render();
   assert.equal(context.data.schedule.rows.length, 1);
@@ -1154,7 +1154,7 @@ test('settings timetable switch controls the real saved preference and preview s
 
 
 const ordinaryPaths = ['/api/my-courses', '/api/semesters', '/api/profile', '/api/radar/rollcalls', '/api/todos'];
-const timetablePaths = ['/gsapp/sys/wdkbapp/modules/xskcb/kfdxnxqcx.do', '/gsapp/sys/wdkbapp/wdkcb/getZcxx.do', '/gsapp/sys/wdkbapp/wdkcb/queryXspkjg.do', '/gsapp/sys/wdkbapp/wdkcb/queryXsskjc.do'];
+const timetablePaths = ['/gsapp/sys/wdkbapp/modules/xskcb/kfdxnxqcx.do', '/gsapp/sys/wdkbapp/wdkcb/getZcxx.do', '/gsapp/sys/wdkbapp/wdkcb/queryXspkjg.do'];
 test('every ordinary page header and pull callback uses the same setting-controlled batch and school todo previews', async () => {
   for (const enabled of [false, true]) {
     const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [todo], todosAt: 1000, refreshSchedule: enabled });
@@ -1168,7 +1168,7 @@ test('every ordinary page header and pull callback uses the same setting-control
       if (entry === 'header') app.refreshButton(page).props.onPress(); else app.pullToRefresh(page);
       assert.equal(f.learning.getSnapshot().refreshing, true, page + ':' + entry + ' starts the batch');
       assert.equal(await f.learning.refresh(), true);
-      assert.deepEqual(f.calls.slice(start).map(call => new URL(call.url).pathname).sort(), [...ordinaryPaths, ...(enabled ? timetablePaths : [])].sort(), page + ':' + entry);
+      assert.deepEqual(f.calls.slice(start).map(call => new URL(call.url).pathname).sort(), [...ordinaryPaths, ...(enabled ? (page === 'today' && entry === 'header' ? timetablePaths : [timetablePaths[2]]) : [])].sort(), page + ':' + entry);
       assert.equal(app.render().todos.length, 4);
     }
     const preview = app.find(app.today(), props => Array.isArray(props?.children) && props.children.length === 3 && props.children.every(child => child?.props?.todo));
@@ -1218,15 +1218,27 @@ test('release provider keeps school mode and debug selections with isolated tria
 });
 
 
+test('today renders school course cards by starting section', async () => {
+  const f = fixture(), app = pages(f); app.render();
+  const now = new Date(app.todayClock.now), weekday = (now.getDay() + 6) % 7 + 1;
+  const rows = [
+    { WID: 'section-2', BJDM: 'section-2', KCMC: '第二节课程', JASMC: '教室 2', JSXM: '张老师', XQ: weekday, KSJCDM: 2, JSJCDM: 2, KSSJ: '0800', JSSJ: '0845', ZCMC: '8周', JCFADM: 'a' },
+    { WID: 'section-1', BJDM: 'section-1', KCMC: '第一节课程', JASMC: '教室 1', JSXM: '李老师', XQ: weekday, KSJCDM: 1, JSJCDM: 1, KSSJ: '1000', JSSJ: '1045', ZCMC: '8周', JCFADM: 'a' },
+  ];
+  f.handler = async url => url.includes('queryXspkjg.do') ? response(url, { success: true, pkjgList: rows }) : undefined;
+  const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
+  app.render();
+  const carousel = app.find(app.today(), props => props?.horizontal);
+  assert.deepEqual(React.Children.toArray(carousel.props.children).map(card => card.props.children.props.session.start), [0, 1]);
+});
+
 test('today centers the next lesson at dismissal, recalibrates on resume, and cleans up its clock', async () => {
   const f = fixture(), app = pages(f); app.render();
   const now = new Date(); now.setHours(9, 39, 59, 0);
   app.todayClock.now = now.getTime();
   const times = [['0800', '0940'], ['1010', '1150'], ['1430', '1610']];
   const rows = times.map(([start, end], index) => ({ WID: 'today-' + index, BJDM: '001-A', KCMC: '学校课程', JASMC: '学校教室', JSXM: '张老师', XQ: (now.getDay() + 6) % 7 + 1, KSJCDM: index + 1, JSJCDM: index + 1, KSSJ: start, JSSJ: end, ZCMC: '8周', JCFADM: 'a' }));
-  const periods = times.map(([start, end], index) => ({ DM: index + 1, MC: '课程时段', KSSJ: start, JSSJ: end, JCFADM: 'a' }));
-  f.handler = async url => url.includes('queryXspkjg.do') ? response(url, { success: true, pkjgList: rows })
-    : url.includes('queryXsskjc.do') ? response(url, { success: true, data: periods }) : undefined;
+  f.handler = async url => url.includes('queryXspkjg.do') ? response(url, { success: true, pkjgList: rows }) : undefined;
   const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
   app.render();
   const requests = f.calls.length, scrolls = [];

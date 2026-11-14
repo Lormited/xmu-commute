@@ -12,7 +12,7 @@ const lntTerms = { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] }
 const weeks = { success: true, currentZc: '8', zcList: Array.from({ length: 18 }, (_, i) => ({ ZC: String(i + 1) })) };
 const scheduleRow = { WID: 'row-1', BJDM: '001-A', KCMC: '学校课程', JASMC: '教学楼 101', JSXM: '张老师', XQ: '1', KSJCDM: '1', JSJCDM: '2', KSSJ: '0800', JSSJ: '0940', ZCMC: '1-2,7-9周', JCFADM: 'plan-a' };
 const schedulePeriods = [{ DM: '1', MC: '第一节', KSSJ: '0800', JSSJ: '0845', JCFADM: 'plan-a' }, { DM: '2', MC: '第二节', KSSJ: '0855', JSSJ: '0940', JCFADM: 'plan-a' }];
-const schoolData = action => ({ profile, todos: { todo_list: [todo] }, rollcalls: { rollcalls: [] }, lntTerms, jwTerms: terms, jwWeek: weeks, courses: { courses: [course] }, history: { rollcalls: [] }, jwSchedule: { success: true, pkjgList: [scheduleRow] }, jwPeriods: { success: true, data: schedulePeriods } })[action];
+const schoolData = action => ({ profile, todos: { todo_list: [todo] }, rollcalls: { rollcalls: [] }, lntTerms, jwTerms: terms, jwWeek: weeks, courses: { courses: [course] }, history: { rollcalls: [] }, jwSchedule: { success: true, pkjgList: [scheduleRow] } })[action];
 const previous = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [todo], todosAt: 1000 });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
@@ -42,7 +42,7 @@ test('login saves one account, preserves the school collection, and publishes on
   assert.deepEqual(f.learning.getSnapshot().courses, []);
   gate.resolve();
   assert.equal(await login, true);
-  assert.deepEqual(f.calls, ['authenticate', 'profile', 'todos', 'rollcalls', 'lntTerms', 'courses', 'jwTerms', 'jwWeek', 'jwSchedule', 'jwPeriods', 'history', 'save']);
+  assert.deepEqual(f.calls, ['authenticate', 'profile', 'todos', 'rollcalls', 'lntTerms', 'courses', 'jwTerms', 'jwWeek', 'jwSchedule', 'history', 'save']);
   assert.equal(JSON.parse(f.stored()).account.studentNumber, '001234');
   assert.deepEqual(f.learning.getSnapshot().todos, [todo]);
   assert.equal(f.learning.getSnapshot().todosAt, 2000);
@@ -99,7 +99,7 @@ test('reopen publishes cache before one refresh; old test formats are discarded'
   assert.match(malformed.learning.getSnapshot().message, /读取失败/);
 });
 test('first business read or save failure keeps authentication and ordinary refresh recovers', async () => {
-  for (const failure of ['profile', 'todos', 'rollcalls', 'jwTerms', 'jwWeek', 'courses', 'jwSchedule', 'jwPeriods', 'history', 'save']) {
+  for (const failure of ['profile', 'todos', 'rollcalls', 'jwTerms', 'jwWeek', 'courses', 'jwSchedule', 'history', 'save']) {
     const f = fixture();
     const { read, save } = f.device;
     if (failure === 'save') f.device.save = async () => { throw Error('DISK'); };
@@ -122,7 +122,7 @@ test('first business read or save failure keeps authentication and ordinary refr
 });
 
 test('invalid school data and failed storage retain the last saved page', async () => {
-  for (const failure of ['profile', 'todos', 'rollcalls', 'jwTerms', 'jwWeek', 'courses', 'jwSchedule', 'jwPeriods', 'save']) {
+  for (const failure of ['profile', 'todos', 'rollcalls', 'jwTerms', 'jwWeek', 'courses', 'jwSchedule', 'save']) {
     const f = fixture(previous); await f.learning.restore();
     assert.equal(await f.learning.setRefreshSchedule(true), true);
     const saved = f.stored();
@@ -267,7 +267,7 @@ test('invalid term, week, and course responses retain the entire saved batch', a
     await f.learning.setRefreshSchedule(true);
     const saved = f.stored(), before = f.learning.getSnapshot();
     f.device.read = async action => action === failedAction ? response : schoolData(action);
-    assert.equal(await f.learning.refresh(), false, failedAction);
+    assert.equal(await (failedAction === 'jwTerms' || failedAction === 'jwWeek' ? f.learning.login() : f.learning.refresh()), false, failedAction);
     assert.equal(f.stored(), saved);
     assert.deepEqual(f.learning.getSnapshot().courses, before.courses);
     assert.deepEqual(f.learning.getSnapshot().term, before.term);
@@ -325,7 +325,7 @@ test('late term, week, or course responses cannot restore courses after logout',
     await f.learning.setRefreshSchedule(true);
     const gate = deferred(), read = f.device.read;
     f.device.read = async (action, params) => { if (action === paused) await gate.promise; return read(action, params); };
-    const pending = f.learning.refresh(); await tick();
+    const pending = f.learning.login(); await tick();
     assert.equal(await f.learning.logout(), true);
     gate.resolve(); assert.equal(await pending, false);
     assert.equal(f.stored(), null);
@@ -334,19 +334,58 @@ test('late term, week, or course responses cannot restore courses after logout',
     assert.equal(f.learning.getSnapshot().coursesAt, null);
   }
 });
-test('first login saves school timetable and section times, then cache reopens before requests', async () => {
+test('first login saves school timetable without section metadata, then cache reopens before requests', async () => {
   const f = fixture();
   assert.equal(await f.learning.login(), true);
   const schedule = f.learning.getSnapshot().schedule;
   assert.equal(schedule?.jwTermCode, '20261');
   assert.equal(schedule.rows[0].BJDM, '001-A');
   assert.equal(schedule.rows[0].KSSJ, '08:00');
-  assert.equal(schedule.periods[1].JSSJ, '09:40');
+  assert.equal(Object.hasOwn(schedule, 'periods'), false);
   assert.equal(f.learning.getSnapshot().scheduleAt, 2000);
   const reopened = fixture(f.stored()); await reopened.learning.restore();
   assert.deepEqual(reopened.calls, ['load']);
   assert.deepEqual(reopened.learning.getSnapshot().schedule, schedule);
   assert.equal(reopened.learning.getSnapshot().scheduleAt, 2000);
+});
+
+test('enabled refresh preserves the calendar across weeks, recalibrates beyond its range, and ignores legacy periods', async () => {
+  let clock = new Date(2026, 9, 26, 12).getTime();
+  const f = fixture(); f.learning = createLearning(f.device, () => clock);
+  assert.equal(await f.learning.login(), true);
+  assert.equal(await f.learning.setRefreshSchedule(true), true);
+  const initial = f.learning.getSnapshot().schedule;
+  clock += 7 * 86400000; f.calls.length = 0;
+  assert.equal(await f.learning.refresh(), true);
+  assert.deepEqual(f.calls.filter(action => action.startsWith('jw')), ['jwSchedule']);
+  assert.equal(f.learning.getSnapshot().schedule.weekAt, initial.weekAt);
+  assert.equal(schoolScheduleView(f.learning.getSnapshot(), new Date(clock)).currentWeek, 9);
+  const saved = JSON.parse(f.stored());
+  for (const periods of [schedulePeriods, null, 'obsolete invalid field']) {
+    const reopened = fixture(JSON.stringify({ ...saved, schedule: { ...saved.schedule, periods } }));
+    await reopened.learning.restore();
+    assert.deepEqual(reopened.learning.getSnapshot().schedule, saved.schedule);
+  }
+  clock += 20 * 7 * 86400000;
+  for (const failedAction of ['jwTerms', 'jwWeek', 'jwSchedule']) {
+    const before = f.learning.getSnapshot(), raw = f.stored(), read = f.device.read;
+    f.device.read = async (action, params) => { if (action === failedAction) throw Error('NETWORK'); return read(action, params); };
+    assert.equal(await f.learning.refresh(), false);
+    assert.equal(f.stored(), raw);
+    assert.strictEqual(f.learning.getSnapshot().schedule, before.schedule);
+    f.device.read = read;
+  }
+  f.calls.length = 0;
+  assert.equal(await f.learning.refresh(), true);
+  assert.deepEqual(f.calls.filter(action => action.startsWith('jw')), ['jwTerms', 'jwWeek', 'jwSchedule']);
+  assert.equal(f.learning.getSnapshot().schedule.weekAt, clock);
+  const gate = deferred(), read = f.device.read;
+  f.device.read = async (action, params) => { if (action === 'jwSchedule') await gate.promise; return read(action, params); };
+  const pending = f.learning.refresh(); await tick();
+  assert.equal(await f.learning.logout(), true);
+  gate.resolve(); assert.equal(await pending, false);
+  assert.equal(f.learning.getSnapshot().schedule, null);
+  assert.equal(f.stored(), null);
 });
 test('invalid timetable data never replaces a saved batch or expands unknown teaching weeks', async () => {
   for (const [action, response] of [
@@ -354,9 +393,7 @@ test('invalid timetable data never replaces a saved batch or expands unknown tea
     ['jwSchedule', { success: true, pkjgList: [{ ...scheduleRow, ZCMC: '单周' }] }],
     ['jwSchedule', { success: true, pkjgList: [{ ...scheduleRow, ZCMC: '未知周次' }] }],
     ['jwSchedule', { success: true, pkjgList: [{ ...scheduleRow, KSSJ: null }] }],
-    ['jwSchedule', { success: true, pkjgList: [{ ...scheduleRow, JCFADM: 'missing-plan' }] }],
-    ['jwPeriods', { success: false, data: [] }],
-    ['jwPeriods', { data: [{ ...schedulePeriods[0], KSSJ: '08:75' }] }],
+    ['jwSchedule', { success: true, pkjgList: [{ ...scheduleRow, JSJCDM: 101 }] }],
   ]) {
     const f = fixture(); assert.equal(await f.learning.login(), true);
     const before = f.learning.getSnapshot(), saved = f.stored();
@@ -376,7 +413,7 @@ test('ordinary refresh keeps the cached timetable and late timetable reads canno
   assert.equal(await f.learning.refresh(), true);
   assert.equal(f.calls.includes('jwSchedule'), false);
   assert.deepEqual(f.learning.getSnapshot().schedule, original);
-  for (const paused of ['jwSchedule', 'jwPeriods']) {
+  for (const paused of ['jwSchedule']) {
     const pending = fixture(), gate = deferred(), read = pending.device.read;
     pending.device.read = async (action, params) => { if (action === paused) await gate.promise; return read(action, params); };
     const login = pending.learning.login(); await tick();
@@ -414,13 +451,13 @@ test('enabled timetable refresh isolates same-term accounts and failed reads ret
     { id: 99, user_no: '009999', name: '新账号' },
     { ...profile, user_no: '009999' },
     { ...profile, id: 99 },
-  ]) for (const initialFailure of [null, 'profile', 'jwSchedule', 'jwPeriods']) {
+  ]) for (const initialFailure of [null, 'profile', 'jwSchedule']) {
     const f = fixture(savedA); await f.learning.restore();
     let failedAction = initialFailure;
     const scheduleCalls = [];
     f.device.read = async (action, params) => {
       f.calls.push(action);
-      if (action === 'jwSchedule' || action === 'jwPeriods') scheduleCalls.push([action, params]);
+      if (action === 'jwSchedule') scheduleCalls.push([action, params]);
       if (action === failedAction) throw Error('NETWORK');
       return action === 'profile' ? nextProfile : action === 'todos' ? { todo_list: [nextTodo] }
         : action === 'courses' ? { courses: [nextCourse] }
@@ -444,9 +481,8 @@ test('enabled timetable refresh isolates same-term accounts and failed reads ret
     assert.equal(await f.learning.refresh(), true);
     assert.deepEqual(scheduleCalls, [
       ['jwSchedule', { jwTermCode: '20261', studentNumber: nextProfile.user_no }],
-      ['jwPeriods', { jwTermCode: '20261', studentNumber: nextProfile.user_no }],
     ]);
-    assert.deepEqual(f.calls, ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', 'jwTerms', 'jwWeek', 'jwSchedule', 'jwPeriods', 'save']);
+    assert.deepEqual(f.calls, ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', 'jwTerms', 'jwWeek', 'jwSchedule', 'save']);
     const snapshot = f.learning.getSnapshot(), savedB = JSON.parse(f.stored());
     assert.deepEqual(snapshot.account, { lntId: nextProfile.id, studentNumber: nextProfile.user_no, name: nextProfile.name });
     assert.deepEqual(snapshot.todos, [nextTodo]);
@@ -742,7 +778,7 @@ test('disabled ordinary refresh reads the core batch without timetable requests 
     assert.equal(await reopened.learning.setRefreshSchedule(true), true);
     const enabled = fixture(reopened.stored()); await enabled.learning.restore();
     assert.equal(await enabled.learning.refresh(), true);
-    assert.deepEqual(enabled.calls.filter(action => !['load', 'save'].includes(action)).sort(), ['courses', 'jwPeriods', 'jwSchedule', 'jwTerms', 'jwWeek', 'lntTerms', 'profile', 'rollcalls', 'todos']);
+    assert.deepEqual(enabled.calls.filter(action => !['load', 'save'].includes(action)).sort(), ['courses', 'jwSchedule', ...(!oldSchedule ? ['jwTerms', 'jwWeek'] : []), 'lntTerms', 'profile', 'rollcalls', 'todos']);
     assert.equal(enabled.learning.getSnapshot().scheduleAt, 2000);
     assert.equal(await enabled.learning.setRefreshSchedule(false), true);
     enabled.calls.length = 0;
@@ -838,7 +874,7 @@ test('any request or save failure retains every collection and timestamp in the 
     const setup = fixture(initial.stored()); await setup.learning.restore();
     assert.equal(await setup.learning.setRefreshSchedule(enabled), true);
     const saved = setup.stored();
-    for (const failedAction of ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwTerms', 'jwWeek', 'jwSchedule', 'jwPeriods'] : []), 'save']) {
+    for (const failedAction of ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : []), 'save']) {
       const f = fixture(saved); await f.learning.restore();
       const before = f.learning.getSnapshot(), seen = [];
       f.learning.subscribe(() => seen.push(f.learning.getSnapshot()));
@@ -889,13 +925,12 @@ test('enabled refresh waits for the timetable and successful saving before publi
   assert.equal(await initial.learning.setRefreshSchedule(true), true);
   const f = fixture(initial.stored()); await f.learning.restore();
   const before = f.learning.getSnapshot(), saved = f.stored(), reads = deferred(), disk = deferred(), save = f.device.save;
-  f.device.read = async action => action === 'jwPeriods' ? reads.promise
+  f.device.read = async action => action === 'jwSchedule' ? reads.promise
     : action === 'profile' ? { ...profile, name: '更新资料' }
     : action === 'todos' ? { todo_list: [{ ...todo, title: '更新待办' }] }
     : action === 'courses' ? { courses: [{ ...course, name: '更新课程' }] }
     : action === 'rollcalls' ? { rollcalls: schoolRollcalls }
-    : action === 'jwWeek' ? { ...weeks, currentZc: '9' }
-    : action === 'jwSchedule' ? { success: true, pkjgList: [{ ...scheduleRow, JASMC: '更新教室' }] } : schoolData(action);
+    : schoolData(action);
   f.device.save = async value => { await disk.promise; await save(value); };
   const pending = f.learning.refresh(); await tick();
   const assertOld = () => {
@@ -903,13 +938,14 @@ test('enabled refresh waits for the timetable and successful saving before publi
     for (const key of ['account', 'todos', 'courses', 'term', 'rollcalls', 'schedule', 'todosAt', 'coursesAt', 'scheduleAt']) assert.strictEqual(f.learning.getSnapshot()[key], before[key], key);
   };
   assertOld();
-  reads.resolve(schoolData('jwPeriods')); await tick(); assertOld();
+  reads.resolve({ success: true, pkjgList: [{ ...scheduleRow, JASMC: '更新教室' }] }); await tick(); assertOld();
   disk.resolve(); assert.equal(await pending, true);
   const next = f.learning.getSnapshot();
   assert.equal(next.account.name, '更新资料');
   assert.equal(next.todos[0].title, '更新待办');
   assert.equal(next.courses[0].name, '更新课程');
-  assert.equal(next.schedule.currentWeek, 9);
+  assert.equal(next.schedule.currentWeek, before.schedule.currentWeek);
+  assert.equal(next.schedule.weekAt, before.schedule.weekAt);
   assert.equal(next.rollcalls.length, 3);
   assert.equal(next.schedule.rows[0].JASMC, '更新教室');
   assert.deepEqual([next.todosAt, next.coursesAt, next.scheduleAt], [2000, 2000, 2000]);

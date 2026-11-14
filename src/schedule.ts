@@ -1,4 +1,4 @@
-import { courses as courseColors, sessionTime, type Course, type Session } from './demo-data.ts';
+import { courses as courseColors, periods as defaultPeriods, sessionTime, type Course, type Session } from './demo-data.ts';
 import type { LearningSnapshot, SchoolDevice } from './learning.ts';
 
 export function currentCourseIndex(sessions: Session[], now = new Date()) {
@@ -7,11 +7,10 @@ export function currentCourseIndex(sessions: Session[], now = new Date()) {
   return index === -1 ? sessions.length - 1 : index;
 }
 
-export type SchoolPeriod = { DM: number; MC: string; KSSJ: string; JSSJ: string; JCFADM: string };
 export type SchoolScheduleRow = { WID: string; BJDM: string; KCMC: string; JASMC: string; JSXM: string;
   XQ: number; KSJCDM: number; JSJCDM: number; KSSJ: string; JSSJ: string; ZCMC: string; JCFADM: string };
 export type ScheduleTerm = { jwTermCode: string; name: string; currentWeek: number; weeks: number[] };
-export type SchoolSchedule = ScheduleTerm & { weekAt: number; rows: SchoolScheduleRow[]; periods: SchoolPeriod[] };
+export type SchoolSchedule = ScheduleTerm & { weekAt: number; rows: SchoolScheduleRow[] };
 function number(value: unknown) {
   const parsed = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
   if (!Number.isSafeInteger(parsed) || (parsed as number) < 1) throw Error('INVALID_SCHEDULE');
@@ -27,22 +26,16 @@ function time(value: unknown) {
   if (!/^([01]\d|2[0-3])[0-5]\d$/.test(raw)) throw Error('INVALID_SCHEDULE');
   return raw.slice(0, 2) + ':' + raw.slice(2);
 }
-export function scheduleFrom(rowsValue: unknown, periodsValue: unknown, jwTermCode: string) {
+export function scheduleFrom(rowsValue: unknown, jwTermCode: string) {
   const response = rowsValue as { success?: boolean; pkjgList?: unknown } | null;
-  const periodResponse = periodsValue as { success?: boolean; data?: unknown } | null;
-  if (response?.success !== true || !Array.isArray(response.pkjgList)
-    || periodResponse?.success === false || !Array.isArray(periodResponse?.data)) throw Error('INVALID_SCHEDULE');
-  const periods = periodResponse.data.map(row => ({ DM: number(row?.DM), MC: text(row?.MC),
-    KSSJ: time(row?.KSSJ), JSSJ: time(row?.JSSJ), JCFADM: text(row?.JCFADM) }));
+  if (response?.success !== true || !Array.isArray(response.pkjgList)) throw Error('INVALID_SCHEDULE');
   const rows = response.pkjgList.map(row => ({ WID: text(row?.WID), BJDM: text(row?.BJDM), KCMC: text(row?.KCMC),
     JASMC: row?.JASMC == null ? '' : text(row.JASMC), JSXM: row?.JSXM == null ? '' : text(row.JSXM),
     XQ: number(row?.XQ), KSJCDM: number(row?.KSJCDM), JSJCDM: number(row?.JSJCDM),
     KSSJ: time(row?.KSSJ), JSSJ: time(row?.JSSJ), ZCMC: text(row?.ZCMC), JCFADM: text(row?.JCFADM) }));
   rows.forEach(row => teachingWeeks(row.ZCMC));
-  if (periods.some(period => period.DM > 100 || period.KSSJ >= period.JSSJ) || rows.some(row => row.XQ > 7 || row.KSJCDM > row.JSJCDM || row.KSSJ >= row.JSSJ
-    || !periods.some(period => period.JCFADM === row.JCFADM && period.DM === row.KSJCDM)
-    || !periods.some(period => period.JCFADM === row.JCFADM && period.DM === row.JSJCDM))) throw Error('INVALID_SCHEDULE');
-  return { jwTermCode, rows, periods };
+  if (rows.some(row => row.XQ > 7 || row.KSJCDM > row.JSJCDM || row.JSJCDM > 100 || row.KSSJ >= row.JSSJ)) throw Error('INVALID_SCHEDULE');
+  return { jwTermCode, rows };
 }
 function termsFrom(value: unknown): Pick<ScheduleTerm, 'jwTermCode' | 'name'>[] {
   const response = value as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
@@ -66,14 +59,19 @@ function weeksFrom(value: unknown): Pick<ScheduleTerm, 'currentWeek' | 'weeks'> 
   if (weeks.some(week => week < 1)) throw Error('INVALID_WEEKS');
   return { currentWeek: response.currentZc == null || response.currentZc === '' ? 0 : weekNumber(response.currentZc), weeks };
 }
-export async function readSchedule(device: SchoolDevice, studentNumber: string, now = Date.now): Promise<SchoolSchedule> {
+export async function readSchedule(device: SchoolDevice, studentNumber: string, now = Date.now, cached: SchoolSchedule | null = null): Promise<SchoolSchedule> {
+  const elapsedWeeks = cached ? Math.round((monday(new Date(now())).getTime() - monday(new Date(cached.weekAt)).getTime()) / 604800000) : 0;
+  if (cached && cached.weeks.includes(cached.currentWeek + elapsedWeeks)) {
+    const rows = await device.read('jwSchedule', { jwTermCode: cached.jwTermCode, studentNumber });
+    return { ...cached, ...scheduleFrom(rows, cached.jwTermCode) };
+  }
   for (const candidate of termsFrom(await device.read('jwTerms'))) {
     const week = weeksFrom(await device.read('jwWeek', { jwTermCode: candidate.jwTermCode }));
     if (!week.weeks.includes(week.currentWeek)) continue;
     const weekAt = now();
     const params = { jwTermCode: candidate.jwTermCode, studentNumber };
-    const [rows, periods] = await Promise.all([device.read('jwSchedule', params), device.read('jwPeriods', params)]);
-    return { ...scheduleFrom(rows, periods, candidate.jwTermCode), ...candidate, ...week, weekAt };
+    const rows = await device.read('jwSchedule', params);
+    return { ...scheduleFrom(rows, candidate.jwTermCode), ...candidate, ...week, weekAt };
   }
   throw Error('NO_CURRENT_TERM');
 }
@@ -114,11 +112,8 @@ export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'sch
   const anchor = monday(new Date(schedule?.weekAt ?? data.scheduleAt ?? now.getTime()));
   const currentWeek = (term?.currentWeek ?? 1) + Math.round((monday(now).getTime() - anchor.getTime()) / 604800000);
   const courseId = (row: SchoolScheduleRow) => String(data.courses.find(course => course.course_code === row.BJDM)?.id ?? 'jw:' + row.BJDM);
-  const sections = schedule?.periods.filter(period => !rows.length || rows.some(row => row.JCFADM === period.JCFADM)) ?? [];
-  const periods = Array.from({ length: sections.length ? Math.max(...sections.map(period => period.DM)) : 11 }, (_, index): [string, string] => {
-    const times = sections.filter(period => period.DM === index + 1), first = times[0];
-    return first && times.every(period => period.KSSJ === first.KSSJ && period.JSSJ === first.JSSJ) ? [first.KSSJ, first.JSSJ] : ['', ''];
-  });
+  const periods = Array.from({ length: rows.reduce((length, row) => Math.max(length, row.JSJCDM), defaultPeriods.length) },
+    (_, index): [string, string] => [defaultPeriods[index]?.[0] ?? '', defaultPeriods[index]?.[1] ?? '']);
   const sessions: Session[] = rows.map((row, index) => ({
     id: row.WID + ':' + index, courseId: courseId(row), day: row.XQ - 1, start: row.KSJCDM - 1,
     length: row.JSJCDM - row.KSJCDM + 1, room: row.JASMC, teacher: row.JSXM,

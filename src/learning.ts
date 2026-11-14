@@ -33,7 +33,7 @@ export type SchoolDevice = {
   save(value: string): Promise<void>;
   clear(): Promise<void>;
   authenticate(onAuthorized?: () => void): Promise<void>;
-  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule' | 'jwPeriods', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }): Promise<unknown>;
+  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }): Promise<unknown>;
   answerNumber(rollcallId: string, numberCode: string): Promise<AttendanceReceipt>;
   submitLocation(rollcallId: string, position: Position): Promise<AttendanceReceipt>;
   submitQr(rollcallId: string, data: unknown): Promise<AttendanceReceipt>;
@@ -158,7 +158,7 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
       || !Number.isSafeInteger(metadata.currentWeek) || !Array.isArray(metadata.weeks) || !metadata.weeks.every(week => Number.isSafeInteger(week) && week > 0)
       || !metadata.weeks.includes(metadata.currentWeek!) || data.schedule.jwTermCode !== metadata.jwTermCode
       || !Number.isFinite(weekAt) || !Number.isFinite(data.scheduleAt)) throw Error('INVALID_CACHE');
-    schedule = { ...scheduleFrom({ success: true, pkjgList: data.schedule.rows }, { data: data.schedule.periods }, metadata.jwTermCode),
+    schedule = { ...scheduleFrom({ success: true, pkjgList: data.schedule.rows }, metadata.jwTermCode),
       name: metadata.name, currentWeek: metadata.currentWeek!, weeks: metadata.weeks, weekAt: weekAt! };
     scheduleAt = data.scheduleAt;
   }
@@ -272,7 +272,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         if (!current(version)) return false;
         failure = '教务课表更新失败，已保留原数据';
         const cachedSchedule = state.account?.studentNumber === account.studentNumber && state.account?.lntId === account.lntId ? state.schedule : null;
-        const schedule = includeSchedule ? await readSchedule(device, account.studentNumber, now) : cachedSchedule;
+        const schedule = includeSchedule ? await readSchedule(device, account.studentNumber, now, login ? null : cachedSchedule) : cachedSchedule;
         if (!current(version)) return false;
         const keepHistory = state.account?.lntId === account.lntId && (state.term?.id === term.id
           || state.term?.id === null && courses.some(course => state.courses.some(previous => previous.id === course.id)));

@@ -84,14 +84,14 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
     if (courses.length !== total) throw fail('INVALID_RESPONSE');
     return { courses };
   }
-  const timetable = action === 'jwSchedule' || action === 'jwPeriods';
+  const timetable = action === 'jwSchedule';
   if ((action === 'jwWeek' || timetable) && !/^\d{4}[123]$/.test(params?.jwTermCode ?? '')) throw fail('INVALID_TERM');
   if (action === 'history' && (!Number.isSafeInteger(params?.courseId) || params!.courseId! <= 0
     || !Number.isSafeInteger(params?.studentId) || params!.studentId! <= 0)) throw fail('INVALID_HISTORY_QUERY');
   const url = action === 'history'
     ? `https://lnt.xmu.edu.cn/api/course/${params!.courseId}/student/${params!.studentId}/rollcalls?page=1&page_size=100`
     : action === 'jwWeek'
-    ? 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/wdkcb/getZcxx.do?' + new URLSearchParams({ XNXQDM: params!.jwTermCode! }) : timetable ? 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/wdkcb/' + (action === 'jwSchedule' ? 'queryXspkjg.do' : 'queryXsskjc.do') : endpoints[action as keyof typeof endpoints];
+    ? 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/wdkcb/getZcxx.do?' + new URLSearchParams({ XNXQDM: params!.jwTermCode! }) : timetable ? 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/wdkcb/queryXspkjg.do' : endpoints[action as keyof typeof endpoints];
   const response = await request(url, version, timetable ? {
     method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ XNXQDM: params!.jwTermCode!, XH: params?.studentNumber ?? '' }).toString(),
