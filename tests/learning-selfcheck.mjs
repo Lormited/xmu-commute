@@ -122,7 +122,7 @@ test('a bound account without a business batch can refresh without inventing cac
   assert.equal(f.stored(), null);
   const read = f.device.read;
   f.device.read = (action, params, account) => {
-    assert.deepEqual(account, boundAccount);
+    assert.deepEqual(account, action === 'profile' ? undefined : boundAccount);
     return read(action, params);
   };
   assert.equal(await f.learning.refresh(), true);
@@ -542,32 +542,21 @@ async function attendanceFixture() {
   return f;
 }
 
-test('a different bound account can refresh without using another account’s saved scope', async () => {
+test('cached timetable and activities remain readable without admitting unauthenticated actions', async () => {
   const initial = await attendanceFixture();
   assert.equal(await initial.learning.login(), true);
   const saved = initial.stored();
-  const account = { lntId: 99, studentNumber: '009999', name: '另一同学' };
-  const f = fixture(saved, account); await f.learning.restore();
+  const f = fixture(saved, null); await f.learning.restore();
   assert.deepEqual(f.learning.getSnapshot().account, boundAccount);
-  assert.equal(f.learning.getSnapshot().authenticated, true);
+  assert.equal(f.learning.getSnapshot().authenticated, false);
   assert.ok(f.learning.getSnapshot().schedule);
+  assert.equal(f.learning.getSnapshot().rollcalls.length, 3);
+  assert.equal(await f.learning.refresh(), false);
   assert.equal(await f.learning.refreshHistory(), false);
   f.device.answerNumber = async () => { f.calls.push('answerNumber'); return { result: 'success' }; };
   assert.equal((await f.learning.submitNumber('81', '0007')).result, 'failed');
-  assert.equal(await f.learning.setRefreshSchedule(true), false);
   assert.deepEqual(f.calls, ['load']);
   assert.equal(f.stored(), saved);
-  const read = f.device.read;
-  f.device.read = async (action, params, expected) => {
-    assert.deepEqual(expected, account);
-    return action === 'profile' ? { id: 99, user_no: '009999', name: '另一同学' } : read(action, params);
-  };
-  assert.equal(await f.learning.refresh(), true);
-  const refreshed = f.learning.getSnapshot();
-  assert.deepEqual(refreshed.account, account);
-  assert.deepEqual([refreshed.scheduleAt, refreshed.historyAt], [null, null]);
-  assert.equal(refreshed.schedule, null);
-  assert.deepEqual(refreshed.rollcalls, []);
 });
 
 test('school activities preserve identities, names and methods; malformed collections cannot clear the batch', async () => {
@@ -886,32 +875,27 @@ test('disabled ordinary refresh reads the core batch without timetable requests 
 });
 
 
-test('disabled refresh preserves the timetable across terms and rejects another account', async () => {
+test('timetable stays cached across terms and when the device rejects a session', async () => {
   const initial = fixture(); initial.learning = createLearning(initial.device, () => 1000);
   assert.equal(await initial.learning.login(), true);
   const saved = initial.stored();
-  for (const scenario of [
-    { account: { ...profile, id: 99 }, semesterId: 9 },
-    { account: { ...profile, user_no: '009999' }, semesterId: 9 },
-    { account: { ...profile, id: 99, user_no: '009999' }, semesterId: 9 },
-    { account: profile, semesterId: 10 },
-  ]) {
+  for (const rejected of [true, false]) {
     const f = fixture(saved); await f.learning.restore();
     const before = f.learning.getSnapshot();
     let failCourses = true;
     f.device.read = async action => {
       f.calls.push(action);
+      if (action === 'profile' && rejected) throw Object.assign(Error('AUTH_REQUIRED'), { code: 'AUTH_REQUIRED' });
       if (action === 'courses' && failCourses) throw Error('NETWORK');
       if (action.startsWith('jw')) assert.fail('disabled refresh cannot access academic endpoints');
-      return action === 'profile' ? scenario.account
-        : action === 'lntTerms' ? { semesters: [{ id: scenario.semesterId, name: 'LNT 新学期', is_active: true }] }
-        : action === 'courses' ? { courses: [{ ...course, name: '新批课程', semester_id: scenario.semesterId }] }
+      return action === 'lntTerms' ? { semesters: [{ id: 10, name: 'LNT 新学期', is_active: true }] }
+        : action === 'courses' ? { courses: [{ ...course, name: '新批课程', semester_id: 10 }] }
         : action === 'todos' ? { todo_list: [{ ...todo, title: '新批待办' }] } : schoolData(action);
     };
     assert.equal(await f.learning.refresh(), false);
     assert.equal(f.stored(), saved);
     for (const key of ['account', 'term', 'courses', 'todos', 'rollcalls', 'schedule', 'scheduleAt']) assert.strictEqual(f.learning.getSnapshot()[key], before[key], key);
-    if (scenario.account !== profile) {
+    if (rejected) {
       assert.equal(f.learning.getSnapshot().needsLogin, true);
       assert.deepEqual(f.calls, ['load', 'profile']);
       continue;
@@ -923,9 +907,8 @@ test('disabled refresh preserves the timetable across terms and rejects another 
     assert.equal(next.scheduleAt, before.scheduleAt);
     assert.equal(next.todos[0].title, '新批待办');
     assert.equal(next.courses[0].name, '新批课程');
-    assert.equal(next.account.lntId, scenario.account.id);
-    assert.equal(next.account.studentNumber, scenario.account.user_no);
-    assert.equal(next.term.id, scenario.semesterId);
+    assert.deepEqual(next.account, boundAccount);
+    assert.equal(next.term.id, 10);
     const reopened = fixture(f.stored()); await reopened.learning.restore();
     assert.equal(reopened.learning.getSnapshot().authenticated, true);
     assert.deepEqual(reopened.learning.getSnapshot().schedule, before.schedule);

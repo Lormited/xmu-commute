@@ -316,25 +316,17 @@ test('logout discards a login batch waiting for history or saving', async () => 
   }
 });
 
-test('history clears after explicit account replacement, a term change, or an empty collection', async () => {
-  for (const changed of ['account', 'term', 'empty']) {
+test('history clears after a term change or an empty collection', async () => {
+  for (const changed of ['term', 'empty']) {
     const f = fixture(); await f.learning.restore(); await f.learning.refreshHistory();
     const read = f.device.read;
     f.device.read = async (action, params) => {
-      if (changed === 'account' && action === 'profile') return { id: 99, user_no: '009999' };
       if (changed === 'term' && action === 'lntTerms') return { semesters: [{ id: 10, name: 'LNT 春季', is_active: true }] };
       if (changed === 'term' && action === 'courses') return { courses: [{ ...course, semester_id: 10 }] };
-      if ((changed === 'empty' || changed === 'account') && action === 'history') return { rollcalls: [] };
+      if (changed === 'empty' && action === 'history') return { rollcalls: [] };
       return read(action, params);
     };
-    if (changed === 'account') {
-      const oldBatch = f.stored();
-      assert.equal(await f.learning.refresh(), false);
-      assert.equal(f.stored(), oldBatch);
-      assert.equal(await f.learning.login(), true);
-    } else {
-      assert.equal(await (changed === 'empty' ? f.learning.refreshHistory() : f.learning.refresh()), true);
-    }
+    assert.equal(await (changed === 'empty' ? f.learning.refreshHistory() : f.learning.refresh()), true);
     assert.deepEqual(f.learning.getSnapshot().history, []);
     assert.deepEqual(JSON.parse(f.stored()).history, []);
   }
