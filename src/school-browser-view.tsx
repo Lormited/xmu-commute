@@ -1,11 +1,14 @@
 import { useLayoutEffect, useRef, useSyncExternalStore } from 'react';
 import { ActivityIndicator, Modal, Text, View } from 'react-native';
 import WebView from 'react-native-webview';
-import { identityPage, schoolUrl, type BrowserRequest } from './school-browser';
+import { LNT_LANDING, schoolUrl, type BrowserRequest } from './school-browser';
 import { schoolBrowser } from './school-device';
 
-const interactionRequired = 'school-interaction-required';
-const detectInteraction = `(() => {
+const recoveryScript = (challenge: string) => `(() => {
+  if (window.top !== window || document.readyState !== 'complete') return;
+  const page = location.origin + location.pathname;
+  const report = kind => window.ReactNativeWebView.postMessage(JSON.stringify([${JSON.stringify(challenge)}, kind, page + location.search]));
+  if (page === '${LNT_LANDING}') { report('landing'); return; }
   if (location.origin !== 'https://ids.xmu.edu.cn' && location.origin !== 'https://c-identity.xmu.edu.cn') return;
   for (const form of document.forms) {
     const action = new URL(form.action, location.href);
@@ -16,7 +19,7 @@ const detectInteraction = `(() => {
     if (!schoolForm) continue;
     const fields = form.querySelectorAll('input:not([type]), input[type="text"], input[type="password"], input[type="email"], input[type="tel"], input[type="number"]');
     if (Array.from(fields).some(field => field.getClientRects().length && getComputedStyle(field).visibility === 'visible')) {
-      window.ReactNativeWebView.postMessage('${interactionRequired}');
+      report('interaction');
       return;
     }
   }
@@ -46,11 +49,8 @@ function LoginPage({ request }: { request: BrowserRequest }) {
   return <WebView<object> ref={web} source={{ uri: request.url }} style={{ flex: 1 }} originWhitelist={['*']}
       startInLoadingState={!recovery} renderLoading={() => <LoginProgress label={request.kind === 'authorize' ? '正在打开学校登录页面' : '正在连接教务系统'} />}
       onShouldStartLoadWithRequest={event => schoolUrl(event.url)}
-      injectedJavaScript={recovery ? detectInteraction : undefined}
-      onMessage={recovery ? ({ nativeEvent: { data, url } }) => {
-        if (data === interactionRequired && identityPage(topUrl.current) && schoolUrl(url)
-          && new URL(url).origin === new URL(topUrl.current).origin) schoolBrowser.fail(request, 'AUTH_REQUIRED');
-      } : undefined}
+      injectedJavaScript={recovery ? recoveryScript(request.challenge) : undefined}
+      onMessage={recovery ? ({ nativeEvent }) => schoolBrowser.recoveryDocument(request, topUrl.current, nativeEvent) : undefined}
       javaScriptEnabled domStorageEnabled sharedCookiesEnabled cacheEnabled={false} saveFormDataDisabled
       allowFileAccess={false} allowFileAccessFromFileURLs={false} allowUniversalAccessFromFileURLs={false}
       mixedContentMode="never" setSupportMultipleWindows={false} webviewDebuggingEnabled={false}
@@ -60,7 +60,7 @@ function LoginPage({ request }: { request: BrowserRequest }) {
       }}
       onLoadEnd={event => {
         console.info('[school-browser]', { page: request.kind, event: 'load-end' });
-        schoolBrowser.loaded(request, event.nativeEvent.url);
+        if (!recovery) schoolBrowser.loaded(request, event.nativeEvent.url);
       }}
       onRenderProcessGone={() => schoolBrowser.fail(request, 'WEBVIEW_PROCESS_GONE')}
       onError={event => schoolBrowser.fail(request, 'NETWORK', { nativeCode: event.nativeEvent.code })}

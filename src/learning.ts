@@ -33,7 +33,7 @@ export type SchoolDevice = {
   save(value: string): Promise<void>;
   clear(): Promise<void>;
   authenticate(onAuthorized?: () => void): Promise<void>;
-  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }): Promise<unknown>;
+  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account): Promise<unknown>;
   answerNumber(rollcallId: string, numberCode: string): Promise<AttendanceReceipt>;
   submitLocation(rollcallId: string, position: Position): Promise<AttendanceReceipt>;
   submitQr(rollcallId: string, data: unknown): Promise<AttendanceReceipt>;
@@ -220,9 +220,10 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     })();
     return restoring;
   }
-  async function readHistory(courses: SchoolCourse[], studentId: number | null): Promise<SchoolHistory[]> {
+  async function readHistory(courses: SchoolCourse[], account: Account): Promise<SchoolHistory[]> {
+    const studentId = account.lntId;
     if (studentId === null || studentId <= 0) throw Error('INVALID_PROFILE');
-    const responses = await Promise.all(courses.map(async course => historyFrom(await device.read('history', { courseId: course.id, studentId }), course)));
+    const responses = await Promise.all(courses.map(async course => historyFrom(await device.read('history', { courseId: course.id, studentId }, account), course)));
     return sortHistory(responses.flat());
   }
   function update(login: boolean, onAuthorized?: () => void): Promise<boolean> {
@@ -249,21 +250,21 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         if (!current(version)) return false;
         publish({ refreshing: true });
         failure = 'LNT 个人资料读取失败，已保留原数据';
-        const account = accountFrom(await device.read('profile'));
+        const account = accountFrom(await device.read('profile', undefined, login ? undefined : state.account ?? undefined));
         if (!current(version)) return false;
         failure = 'LNT 待办更新失败，已保留原数据';
-        const todos = todosFrom(await device.read('todos'));
+        const todos = todosFrom(await device.read('todos', undefined, account));
         if (!current(version)) return false;
         failure = 'LNT 进行中签到更新失败，已保留原数据';
-        const rollcalls = rollcallsFrom(await device.read('rollcalls'));
+        const rollcalls = rollcallsFrom(await device.read('rollcalls', undefined, account));
         if (!current(version)) return false;
         const sameAccount = state.account && (account.lntId !== null ? account.lntId === state.account.lntId
           : !!account.studentNumber && account.studentNumber === state.account.studentNumber);
         failure = 'LNT 当前学期读取失败，已保留原数据';
-        const term = lntTermFrom(await device.read('lntTerms'));
+        const term = lntTermFrom(await device.read('lntTerms', undefined, account));
         if (!current(version)) return false;
         failure = 'LNT 课程更新失败，已保留原数据';
-        const courses = coursesFrom(await device.read('courses', { semesterId: term.id! }), term);
+        const courses = coursesFrom(await device.read('courses', { semesterId: term.id! }, account), term);
         if (!current(version)) return false;
         failure = '教务课表更新失败，已保留原数据';
         const cachedSchedule = state.account?.studentNumber === account.studentNumber && state.account?.lntId === account.lntId ? state.schedule : null;
@@ -272,7 +273,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         const keepHistory = state.account?.lntId === account.lntId && (state.term?.id === term.id
           || state.term?.id === null && courses.some(course => state.courses.some(previous => previous.id === course.id)));
         if (login) failure = '历史签到读取失败，已保留原数据';
-        const history = login ? await readHistory(courses, account.lntId)
+        const history = login ? await readHistory(courses, account)
           : keepHistory ? state.history.filter(item => courses.some(course => course.id === item.course_id)) : [];
         if (!current(version)) return false;
         const updatedAt = now();
@@ -353,7 +354,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     const task = (async () => {
       let failure = '历史签到读取失败，已保留原数据';
       try {
-        const history = await readHistory(courses, account.lntId);
+        const history = await readHistory(courses, account);
         if (!current(version)) return false;
         const historyAt = now();
         failure = '历史签到保存失败，已保留原数据';

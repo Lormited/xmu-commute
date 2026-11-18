@@ -25,6 +25,7 @@ const academicPage = 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/*default/index.do'
 // The school's jw-xskcbBS.js reads this envelope, not a top-level array.
 const academicTerms = { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '测试学期' }] } } };
 const profile = { id: 42, user_no: '001234', name: '测试同学' };
+const recoveryAccount = { lntId: 42, studentNumber: '001234', name: '测试同学' };
 const todo = { id: 7, course_id: 3, course_name: '课程', title: '学校返回的作业', type: 'homework', end_time: null, is_locked: false };
 const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9 };
 const academicWeeks = { success: true, currentZc: '8', zcList: Array.from({ length: 18 }, (_, i) => ({ ZC: i + 1 })) };
@@ -123,6 +124,10 @@ async function initialize(f) {
   f.schoolBrowser.loaded(page, academicPage);
   await tick();
 }
+function deliverRecoveryLanding(f, page, url = 'https://lnt.xmu.edu.cn/user/index#/') {
+  const documentUrl = url.split('#')[0];
+  f.schoolBrowser.recoveryDocument(page, url, { url, data: JSON.stringify([page.challenge, 'landing', documentUrl]) });
+}
 
 test('LNT courses use the selected semester and collect every page before returning', async () => {
   const f = fixture();
@@ -150,15 +155,15 @@ test('expired LNT course POST waits for official browser recovery and Cookie flu
   f.handler = async url => {
     if (url.endsWith('/my-courses') && attempts++ === 0) return response(url, {}, 401);
   };
-  const result = f.schoolDevice.read('courses', { semesterId: 9 });
+  const result = f.schoolDevice.read('courses', { semesterId: 9 }, recoveryAccount);
   void result.catch(() => {});
   await tick();
   const page = f.schoolBrowser.getSnapshot();
   assert.equal(page?.url, 'https://lnt.xmu.edu.cn/');
   assert.equal(page.kind, 'recovery');
-  f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/app-redirect');
+  deliverRecoveryLanding(f, page, 'https://lnt.xmu.edu.cn/app-redirect');
   assert.equal(f.schoolBrowser.getSnapshot(), page);
-  f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+  deliverRecoveryLanding(f, page);
   await tick();
   assert.deepEqual(f.cookieCalls, ['flush']);
   assert.equal(attempts, 1);
@@ -180,16 +185,35 @@ test('simultaneous and late stale history responses share one recovery and each 
     if (count === 1 && courseId === 5) await late.promise;
     if (count === 1 || courseId === 5) return response(url, {}, 401);
   };
-  const requests = [3, 4, 5].map(courseId => f.schoolDevice.read('history', { courseId, studentId: 42 }));
+  const requests = [3, 4, 5].map(courseId => f.schoolDevice.read('history', { courseId, studentId: 42 }, recoveryAccount));
   const rejected = assert.rejects(requests[2], { code: 'AUTH_REQUIRED' });
   await tick();
   const page = f.schoolBrowser.getSnapshot();
   assert.equal(page?.kind, 'recovery');
-  f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+  deliverRecoveryLanding(f, page);
   await Promise.all(requests.slice(0, 2));
   late.resolve();
   await rejected;
   assert.deepEqual([...sent.values()], [2, 2, 2]);
+  assert.deepEqual(f.cookieCalls, ['flush']);
+  assert.equal(f.schoolBrowser.getSnapshot(), null);
+});
+
+test('a late history waiter cannot replay under another account’s successful recovery', async () => {
+  const f = fixture(), late = deferred();
+  let expired = true;
+  f.handler = async url => {
+    if (url.includes('/student/43/')) { await late.promise; return response(url, {}, 401); }
+    if (url.includes('/student/42/') && expired) { expired = false; return response(url, {}, 401); }
+  };
+  const first = f.schoolDevice.read('history', { courseId: 3, studentId: 42 }, { ...recoveryAccount, studentNumber: '' });
+  const peer = assert.rejects(f.schoolDevice.read('history', { courseId: 3, studentId: 43 }, { ...recoveryAccount, lntId: 43 }), { code: 'AUTH_REQUIRED' });
+  await tick();
+  deliverRecoveryLanding(f, f.schoolBrowser.getSnapshot());
+  assert.deepEqual((await first).rollcalls, []);
+  late.resolve();
+  await peer;
+  assert.equal(f.calls.filter(call => call.url.includes('/student/43/')).length, 1);
   assert.deepEqual(f.cookieCalls, ['flush']);
   assert.equal(f.schoolBrowser.getSnapshot(), null);
 });
@@ -213,6 +237,65 @@ test('invalid or failed later course pages retain the entire saved learning batc
       assert.strictEqual(f.learning.getSnapshot()[key], before[key], failure + ':' + key);
     }
   }
+});
+
+test('a different recovery account cannot replace the cached or in-flight refresh account', async () => {
+  for (const [stage, recovered] of [['profile', { ...profile, id: 43 }], ['todos', { ...profile, user_no: '009999' }]]) {
+    const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: [todo], todosAt: 1000 });
+    const f = fixture(new Map([['school-learning.json', raw]]));
+    let recoveredSession = false;
+    f.handler = async url => {
+      if (recoveredSession && url.endsWith('/profile')) return response(url, recovered);
+      if (!recoveredSession && new URL(url).pathname === '/api/' + stage) return response(url, {}, 401);
+      if (recoveredSession && url.includes('/todos')) return response(url, { todo_list: [] });
+    };
+    await f.learning.restore();
+    const before = f.learning.getSnapshot();
+    const refresh = f.learning.refresh();
+    await tick();
+    const page = f.schoolBrowser.getSnapshot();
+    assert.equal(page?.kind, 'recovery');
+    recoveredSession = true;
+    deliverRecoveryLanding(f, page);
+    assert.equal(await refresh, false, stage);
+    assert.equal(f.learning.getSnapshot().needsLogin, true);
+    assert.strictEqual(f.learning.getSnapshot().account, before.account);
+    assert.strictEqual(f.learning.getSnapshot().todos, before.todos);
+    assert.equal(f.files.get('school-learning.json'), raw);
+    assert.equal(f.calls.length, stage === 'profile' ? 2 : 3);
+    assert.deepEqual(f.cookieCalls, []);
+  }
+});
+
+test('history keeps its prior batch when recovery changes account and a peer finishes late', async () => {
+  const late = deferred();
+  const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '' }, todos: [todo], todosAt: 1000,
+    term: { id: 9, name: 'LNT 秋季' }, courses: [course, { ...course, id: 4 }, { ...course, id: 5 }], coursesAt: 1000 });
+  const f = fixture(new Map([['school-learning.json', raw]]));
+  let recoveredSession = false;
+  f.handler = async url => {
+    if (url.endsWith('/profile')) return response(url, { ...profile, user_no: '009999' });
+    if (url.includes('/course/5/')) { await late.promise; return response(url, {}, 401); }
+    if (url.includes('/student/') && !recoveredSession) return response(url, {}, 401);
+  };
+  await f.learning.restore();
+  const before = f.learning.getSnapshot();
+  const history = f.learning.refreshHistory();
+  await tick();
+  const page = f.schoolBrowser.getSnapshot();
+  assert.equal(page?.kind, 'recovery');
+  recoveredSession = true;
+  deliverRecoveryLanding(f, page);
+  await tick();
+  late.resolve();
+  await tick();
+  assert.equal(f.schoolBrowser.getSnapshot(), null);
+  assert.equal(f.calls.length, 4);
+  assert.equal(await history, false);
+  assert.equal(f.learning.getSnapshot().needsLogin, true);
+  assert.strictEqual(f.learning.getSnapshot().history, before.history);
+  assert.equal(f.files.get('school-learning.json'), raw);
+  assert.deepEqual(f.cookieCalls, []);
 });
 
 test('two-site login uses PKCE, waits for authentication and cookie saving, then reads and saves todos', async () => {
@@ -441,15 +524,42 @@ test('ordinary LNT failures and academic expiry do not start browser recovery', 
   }
 });
 
+test('realm errors, broad login markup, and resource 403 keep their original failure feedback', async () => {
+  const realm = IDENTITY.replace('/protocol/openid-connect', '');
+  for (const [target, body, status, contentType, code] of [
+    [realm + '/login-actions/authenticate', '<html>missing</html>', 404, 'text/html', 'HTTP_ERROR'],
+    [realm + '/login-actions/authenticate', 'limited', 429, 'text/plain', 'HTTP_ERROR'],
+    [realm + '/account', '<form>maintenance</form>', 200, 'text/html', 'INVALID_RESPONSE'],
+    ['https://ids.xmu.edu.cn/authserver/login', {}, 200, 'application/json', 'INVALID_RESPONSE'],
+    ['https://ids.xmu.edu.cn/authserver/login', '<form>maintenance</form>', 200, 'text/html', 'INVALID_RESPONSE'],
+    [null, '<form><input id="pwdEncryptSalt"></form>', 200, 'text/html', 'INVALID_RESPONSE'],
+    [null, {}, 403, 'application/json', 'HTTP_ERROR'],
+  ]) {
+    const f = fixture();
+    f.handler = async url => response(target ?? url, body, status, contentType);
+    const pending = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), {
+      code, ...(code === 'HTTP_ERROR' ? { httpStatus: status } : {}),
+    });
+    void pending.catch(() => {});
+    await tick();
+    const page = f.schoolBrowser.getSnapshot();
+    if (page) f.schoolBrowser.close();
+    assert.equal(page, null, `${status} ${target ?? 'LNT endpoint'}`);
+    await pending;
+    assert.equal(f.calls.length, 1);
+    assert.deepEqual(f.cookieCalls, []);
+  }
+});
+
 test('a failed shared recovery stays failed for a late school login redirect and keeps the saved session', async () => {
   const f = fixture(new Map([['school-learning.json', 'previous']])), late = deferred();
   f.handler = async url => {
-    if (url.includes('/todos')) return response(url, '<form><input id="pwdEncryptSalt"></form>', 200, 'text/html');
+    if (url.includes('/todos')) return response(url, {}, 401);
     await late.promise;
-    return response('https://ids.xmu.edu.cn/authserver/login', {});
+    return response('https://ids.xmu.edu.cn/authserver/login', '<form><input id="pwdEncryptSalt"></form>', 200, 'text/html');
   };
-  const first = assert.rejects(f.schoolDevice.read('todos'), { code: 'NETWORK' });
-  const second = assert.rejects(f.schoolDevice.read('rollcalls'), { code: 'NETWORK' });
+  const first = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'NETWORK' });
+  const second = assert.rejects(f.schoolDevice.read('rollcalls', undefined, recoveryAccount), { code: 'NETWORK' });
   await tick();
   f.schoolBrowser.fail(f.schoolBrowser.getSnapshot(), 'NETWORK');
   await first;
@@ -468,14 +578,14 @@ test('recovery requires an authenticated profile and successful Cookie persisten
     f.failFlush = phase === 'cookie failure';
     f.handler = async url => url.includes('/todos') || phase === 'unauthorized' ? response(url, {}, 401)
       : phase === 'invalid profile' ? response(url, { id: 42, user_no: {} }) : undefined;
-    const rejected = assert.rejects(f.schoolDevice.read('todos'), {
+    const rejected = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), {
       code: phase === 'unauthorized' ? 'AUTH_REQUIRED' : phase === 'invalid profile' ? 'INVALID_RESPONSE' : 'COOKIE_STORAGE',
     });
     await tick();
     const page = f.schoolBrowser.getSnapshot();
-    f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn.evil.test/user/index#/');
+    deliverRecoveryLanding(f, page, 'https://lnt.xmu.edu.cn.evil.test/user/index#/');
     assert.equal(f.schoolBrowser.getSnapshot(), page);
-    f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+    deliverRecoveryLanding(f, page);
     await rejected;
     assert.equal(f.calls.length, 2);
     assert.equal(f.schoolBrowser.getSnapshot(), null);
@@ -503,7 +613,7 @@ test('the full recovery deadline covers the page, session probe, and Cookie flus
     const refresh = f.learning.refresh();
     await tick();
     if (phase !== 'page') {
-      f.schoolBrowser.loaded(f.schoolBrowser.getSnapshot(), 'https://lnt.xmu.edu.cn/user/index#/');
+      deliverRecoveryLanding(f, f.schoolBrowser.getSnapshot());
       await tick();
     }
     const [deadline] = timers.values();
@@ -518,7 +628,7 @@ test('the full recovery deadline covers the page, session probe, and Cookie flus
     if (phase === 'probe') assert.equal(f.calls[1].options.signal.aborted, true);
     if (phase === 'flush') {
       f.handler = async url => url.includes('/todos') ? response(url, {}, 401) : undefined;
-      await assert.rejects(f.schoolDevice.read('todos'), { code: 'AUTH_REQUIRED' });
+      await assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'AUTH_REQUIRED' });
     }
     gate.resolve();
     await tick();
@@ -530,12 +640,12 @@ test('the full recovery deadline covers the page, session probe, and Cookie flus
       f.handler = async url => {
         if (url.includes('/todos') && expired) { expired = false; return response(url, {}, 401); }
       };
-      const next = f.schoolDevice.read('todos');
+      const next = f.schoolDevice.read('todos', undefined, recoveryAccount);
       void next.catch(() => {});
       await tick();
       const page = f.schoolBrowser.getSnapshot();
       assert.equal(page?.kind, 'recovery');
-      f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+      deliverRecoveryLanding(f, page);
       assert.deepEqual((await next).todo_list, [todo]);
     }
   }
@@ -545,17 +655,17 @@ test('logout closes hidden recovery and drains the browser, probe, or Cookie flu
   for (const phase of ['page', 'probe', 'flush']) {
     const f = fixture(new Map([['school-learning.json', 'previous']])), gate = deferred();
     f.handler = async url => {
-      if (url.includes('/todos')) return response(url, {}, 403);
+      if (url.includes('/todos')) return response(url, {}, 401);
       if (phase === 'probe') await gate.promise;
     };
     if (phase === 'flush') f.flushGate = gate;
-    const rejected = assert.rejects(f.schoolDevice.read('todos'), { code: 'CANCELLED' });
+    const rejected = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'CANCELLED' });
     await tick();
     const page = f.schoolBrowser.getSnapshot();
     assert.equal(page?.kind, 'recovery');
     const detach = phase === 'page' ? f.schoolBrowser.attach(page) : null;
     if (!detach) {
-      f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+      deliverRecoveryLanding(f, page);
       await tick();
     }
     const logout = f.learning.logout();
@@ -563,7 +673,7 @@ test('logout closes hidden recovery and drains the browser, probe, or Cookie flu
     assert.equal(f.schoolBrowser.getSnapshot(), null);
     assert.equal(f.cookieCalls.includes('clearAllStores'), false);
     if (phase === 'probe') assert.equal(f.calls[1].options.signal.aborted, true);
-    f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+    deliverRecoveryLanding(f, page);
     detach?.();
     gate.resolve();
     assert.equal(await logout, true);
@@ -990,10 +1100,86 @@ function browserHost(f) {
   return { ...host, disposed, detach: () => effects.splice(0).forEach(dispose => dispose()) };
 }
 
+test('Android synthetic finish before a main-frame load error cannot complete recovery', async () => {
+  const f = fixture(), host = browserHost(f);
+  f.handler = async url => response(url, {}, 401);
+  const pending = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'NETWORK' });
+  void pending.catch(() => {});
+  await tick();
+  const page = host.SchoolBrowserHost().props.children, web = page.type(page.props);
+  const navigation = androidNavigation('https://lnt.xmu.edu.cn/user/index#/');
+  web.props.onLoadStart({ nativeEvent: navigation });
+  web.props.onLoadEnd({ nativeEvent: navigation });
+  web.props.onError({ nativeEvent: { ...navigation, code: -2 } });
+  host.detach();
+  await pending;
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(f.cookieCalls, []);
+});
+
+test('legacy Android messages require a current top-document signal before recovery can proceed', async () => {
+  const f = fixture(), host = browserHost(f);
+  const landingUrl = 'https://lnt.xmu.edu.cn/user/index#/';
+  const loginUrl = 'https://ids.xmu.edu.cn/authserver/login?service=school';
+  let attempts = 0;
+  f.handler = async url => url.includes('/todos') && attempts++ < 2 ? response(url, {}, 401) : undefined;
+  const expired = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'NETWORK' });
+  const mount = async () => {
+    await tick();
+    const page = host.SchoolBrowserHost().props.children;
+    return page.type(page.props).props;
+  };
+  const first = await mount();
+  function signals(web, url, mainFrame = true, readyState = 'complete') {
+    const messages = [];
+    const location = new URL(url);
+    const window = { ReactNativeWebView: { postMessage: value => messages.push(value) } };
+    window.top = mainFrame ? window : {};
+    const form = { action: loginUrl, querySelector: () => ({}), querySelectorAll: () => [{ getClientRects: () => [{}] }] };
+    runInNewContext(web.injectedJavaScript, { location, window, URL, document: { readyState, forms: [form] }, getComputedStyle: () => ({ visibility: 'visible' }) });
+    return messages;
+  }
+  first.onLoadStart({ nativeEvent: androidNavigation(landingUrl) });
+  const previousLanding = signals(first, landingUrl)[0];
+  first.onError({ nativeEvent: { ...androidNavigation(landingUrl), code: -2 } });
+  host.detach();
+  await expired;
+
+  const pending = f.schoolDevice.read('todos', undefined, recoveryAccount);
+  void pending.catch(() => {});
+  const web = await mount();
+  const send = (data, url) => web.onMessage({ nativeEvent: { data, url } });
+  try {
+    web.onLoadStart({ nativeEvent: androidNavigation(loginUrl) });
+    send('school-interaction-required', loginUrl);
+    assert.equal(f.schoolBrowser.getSnapshot()?.kind, 'recovery', 'legacy bridge reports the top URL even for a subframe message');
+    assert.deepEqual(signals(web, loginUrl, false), []);
+    const [interaction] = signals(web, loginUrl);
+    assert.equal(typeof interaction, 'string');
+    web.onLoadStart({ nativeEvent: androidNavigation(landingUrl) });
+    const [landing] = signals(web, landingUrl);
+    assert.equal(typeof landing, 'string');
+    assert.notEqual(landing, previousLanding);
+    assert.deepEqual(signals(web, landingUrl, true, 'loading'), []);
+    send(previousLanding, landingUrl);
+    send(interaction, new URL(landingUrl).origin);
+    send(landing, 'https://lnt.xmu.edu.cn/app-redirect');
+    assert.equal(f.schoolBrowser.getSnapshot()?.kind, 'recovery');
+    send(landing, landingUrl);
+    assert.equal(f.schoolBrowser.getSnapshot(), null);
+  } finally {
+    f.schoolBrowser.close();
+    host.detach();
+    await pending.catch(() => {});
+  }
+  assert.deepEqual((await pending).todo_list, [todo]);
+  assert.deepEqual(f.cookieCalls, ['flush']);
+});
+
 test('hidden recovery preserves official navigation and hands the recognized login form back to manual login', async () => {
   const f = fixture(), host = browserHost(f);
   f.handler = async url => url.includes('/todos') ? response(url, {}, 401) : undefined;
-  const pending = assert.rejects(f.schoolDevice.read('todos'), { code: 'AUTH_REQUIRED' });
+  const pending = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'AUTH_REQUIRED' });
   await tick();
   const hidden = host.SchoolBrowserHost();
   assert.equal(hidden.type, 'View');
@@ -1009,7 +1195,9 @@ test('hidden recovery preserves official navigation and hands the recognized log
   const messages = [], location = new URL(loginUrl);
   let loginForm = [];
   const form = { action: loginUrl, querySelector: () => ({}), querySelectorAll: () => loginForm };
-  const globals = { location, document: { forms: [form] }, window: { ReactNativeWebView: { postMessage: value => messages.push(value) } },
+  const window = { ReactNativeWebView: { postMessage: value => messages.push(value) } };
+  window.top = window;
+  const globals = { location, document: { readyState: 'complete', forms: [form] }, window,
     getComputedStyle: () => ({ visibility: 'visible' }), URL };
   runInNewContext(web.props.injectedJavaScript, globals);
   assert.deepEqual(messages, [], 'passing through the identity URL alone does not require interaction');

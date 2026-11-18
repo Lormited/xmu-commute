@@ -1,8 +1,8 @@
 import * as Crypto from 'expo-crypto';
 import { File, Paths } from 'expo-file-system';
 import { moveAsync } from 'expo-file-system/legacy';
-import { CALLBACK, IDENTITY, LNT_HOME, createSchoolBrowser, identityPage, schoolUrl } from './school-browser';
-import type { SchoolDevice } from './learning';
+import { CALLBACK, CAS_LOGIN, IDENTITY, LNT_HOME, createSchoolBrowser, schoolUrl } from './school-browser';
+import type { Account, SchoolDevice } from './learning';
 import { numberReceipt } from './attendance.ts';
 import { isPosition } from './location-attendance.ts';
 import { qrReceipt } from './qr.ts';
@@ -25,8 +25,9 @@ let authenticating: Promise<void> | null = null;
 let clearing: Promise<void> | null = null;
 let mustClear = false;
 let verifiedTerms: unknown = null;
-let lntSession: { recovery?: Promise<void> } = {};
-let recovering: { abort(): void; browser: Promise<string>; drain: Promise<void>; result: Promise<void> } | null = null;
+type LntIdentity = { lntId: number; studentNumber: string };
+let lntSession: { recovery?: Promise<LntIdentity> } = {};
+let recovering: { abort(): void; browser: Promise<string>; drain: Promise<LntIdentity>; result: Promise<LntIdentity> } | null = null;
 const requests = new Map<AbortController, Promise<unknown>>();
 export const schoolBrowser = createSchoolBrowser(() => {
   generation++;
@@ -55,10 +56,10 @@ function request(url: string, version: number, init: RequestInit = {}, { signal,
         const expected = new URL(url);
         const final = schoolUrl(response.url) ? new URL(response.url) : null;
         const sameEndpoint = final?.origin === expected.origin && final.pathname === expected.pathname;
-        const loginForm = contentType.includes('html') && /<form\b/i.test(text)
-          && /pwdencryptsalt|\/auth\/realms\/xmu\/login-actions\/authenticate/i.test(text);
-        if (response.status < 500 && (identityPage(response.url)
-          || sameEndpoint && (response.status === 401 || response.status === 403 || response.status === 200 && loginForm))) {
+        const redirectedToLogin = response.status === 200 && final && final.origin + final.pathname === CAS_LOGIN
+          && /^text\/html(?:\s*;|$)/i.test(contentType) && /<form\b/i.test(text)
+          && /<input\b[^>]*\s+id\s*=\s*["']pwdEncryptSalt["']/i.test(text);
+        if ((sameEndpoint && response.status === 401) || redirectedToLogin) {
           throw fail('AUTH_REQUIRED', response.status);
         }
         if (response.status !== 200) throw fail('HTTP_ERROR', response.status);
@@ -79,12 +80,16 @@ function request(url: string, version: number, init: RequestInit = {}, { signal,
   void task.then(() => requests.delete(controller), () => requests.delete(controller));
   return task;
 }
-function recoverLnt(version: number) {
+function checkRecoveryAccount(account: Account, recovered: LntIdentity) {
+  if ((account.lntId !== null && account.lntId !== recovered.lntId)
+    || (account.studentNumber && account.studentNumber !== recovered.studentNumber)) throw fail('AUTH_REQUIRED');
+}
+function recoverLnt(version: number, account: Account) {
   if (authenticating) throw fail('AUTH_REQUIRED');
   if (recovering) return recovering.result;
   const controller = new AbortController();
   const { signal } = controller;
-  const browser = schoolBrowser.recover(signal);
+  const browser = schoolBrowser.recover(signal, Crypto.randomUUID());
   let interrupt!: (error: Error) => void;
   const interrupted = new Promise<never>((_, reject) => { interrupt = reject; });
   const abort = (code = 'CANCELLED') => { interrupt(fail(code)); controller.abort(); };
@@ -96,16 +101,19 @@ function recoverLnt(version: number) {
     if (profile?.success === false || !Number.isSafeInteger(profile?.id) || typeof profile?.user_no !== 'string' || !profile.user_no.trim()) {
       throw fail('INVALID_RESPONSE');
     }
+    const recovered = { lntId: profile.id as number, studentNumber: profile.user_no };
+    checkRecoveryAccount(account, recovered);
     const { default: cookies } = await import('@preeternal/react-native-cookie-manager');
     check(version, signal);
     try { await cookies.flush(); } catch { throw fail('COOKIE_STORAGE'); }
     check(version, signal);
+    return recovered;
   })().finally(() => { recovering = null; });
   const result = Promise.race([drain, interrupted]).finally(() => clearTimeout(timer));
   recovering = { abort, browser, drain, result };
   return result;
 }
-async function query(url: string, version: number, init: RequestInit) {
+async function query(url: string, version: number, init: RequestInit, account?: Account) {
   const lntQuery = new URL(url).origin === new URL(LNT_HOME).origin;
   const session = lntSession;
   const fetchQuery = async () => jsonResponse(await request(url, version, init, { lntQuery }));
@@ -113,14 +121,15 @@ async function query(url: string, version: number, init: RequestInit) {
   catch (error) {
     check(version);
     if (!lntQuery || (error as { code?: string } | null)?.code !== 'AUTH_REQUIRED') throw error;
-    session.recovery ??= recoverLnt(version).finally(() => {
+    if (!account || (account.lntId === null && !account.studentNumber.trim())) throw error;
+    session.recovery ??= recoverLnt(version, account).finally(() => {
       if (lntSession === session) lntSession = {};
     });
-    await session.recovery;
+    checkRecoveryAccount(account, await session.recovery);
     return fetchQuery();
   }
 }
-async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], version = generation): Promise<unknown> {
+async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], account?: Account, version = generation): Promise<unknown> {
   check(version);
   if (action === 'jwTerms' && verifiedTerms !== null) {
     const terms = verifiedTerms; verifiedTerms = null;
@@ -134,7 +143,7 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
       const result = await query(endpoints.courses, version, {
         method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify({ page, page_size: 100, fields: 'id,course_code,name,semester_id', conditions: { semester_id: [params!.semesterId] } }),
-      }) as { success?: unknown; courses?: unknown; pages?: unknown; total?: unknown } | null;
+      }, account) as { success?: unknown; courses?: unknown; pages?: unknown; total?: unknown } | null;
       if (result?.success === false || !Array.isArray(result?.courses) || !Number.isSafeInteger(result.pages) || (result.pages as number) < 0
         || !Number.isSafeInteger(result.total) || (result.total as number) < 0
         || page > 1 && (result.pages !== pages || result.total !== total)) throw fail('INVALID_RESPONSE');
@@ -158,7 +167,7 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
   return query(url, version, timetable ? {
     method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ XNXQDM: params!.jwTermCode!, XH: params?.studentNumber ?? '' }).toString(),
-  } : { headers: { Accept: 'application/json' } });
+  } : { headers: { Accept: 'application/json' } }, account);
 }
 function jsonResponse(response: { contentType: string; text: string }): unknown {
   if (!response.contentType.includes('json')) throw fail(response.contentType.includes('html') ? 'AUTH_REQUIRED' : 'INVALID_RESPONSE');
@@ -200,7 +209,7 @@ async function authenticate(onAuthorized?: () => void) {
     await schoolBrowser.initializeAcademic();
     check(version);
     stage = 'academic-probe';
-    const academic = await read('jwTerms', undefined, version) as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
+    const academic = await read('jwTerms', undefined, undefined, version) as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
     if (academic?.success === false || !Array.isArray(academic?.datas?.kfdxnxqcx?.rows)) throw fail('INVALID_ACADEMIC_SESSION');
     terms = academic;
     stage = 'lnt';
