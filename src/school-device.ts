@@ -109,23 +109,30 @@ function schoolResult(url: string, response: SchoolResponse, write = false) {
   return response;
 }
 function persistSession(session: BoundSession, version: number, admission?: { publish(): void; signal?: AbortSignal; deadline?: number }) {
+  const deadline = admission?.deadline;
   const guard = () => {
     check(version, admission?.signal);
-    if (admission?.deadline !== undefined && Date.now() >= admission.deadline) throw fail('AUTH_REQUIRED');
+    if (deadline !== undefined && Date.now() >= deadline) throw fail('AUTH_REQUIRED');
   };
   const serialized = JSON.stringify({ version: 1, account: session.account, cookies: session.jar.serializeSync() });
   const saved = persistence.then(async () => {
     guard();
     try {
       const store = await import('expo-secure-store');
+      const previous = deadline === undefined ? null : store.getItem(sessionKey);
       guard();
-      store.setItem(sessionKey, serialized, { keychainAccessible: store.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
-    } catch {
-      guard();
+      if (deadline !== undefined && previous === null) throw fail('COOKIE_STORAGE');
+      const options = { keychainAccessible: store.WHEN_UNLOCKED_THIS_DEVICE_ONLY };
+      store.setItem(sessionKey, serialized, options);
+      if (deadline !== undefined && Date.now() >= deadline) store.setItem(sessionKey, previous!, options);
+    } catch (error) {
+      check(version, admission?.signal);
+      if ((error as { code?: string } | null)?.code === 'AUTH_REQUIRED') throw error;
       active = null;
       sessionFailure = 'COOKIE_STORAGE';
       throw fail('COOKIE_STORAGE');
     }
+    guard();
     admission?.publish();
   });
   persistence = saved.catch(() => {});

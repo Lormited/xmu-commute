@@ -1,0 +1,27 @@
+diff --git a/android/src/main/java/expo/modules/securestore/SecureStoreModule.kt b/android/src/main/java/expo/modules/securestore/SecureStoreModule.kt
+--- a/android/src/main/java/expo/modules/securestore/SecureStoreModule.kt
++++ b/android/src/main/java/expo/modules/securestore/SecureStoreModule.kt
+@@ -208,4 +208,6 @@ open class SecureStoreModule : Module() {
+         authenticationHelper
+       )
+       encryptedItem.put(SCHEME_PROPERTY, AESEncryptor.NAME)
+-      saveEncryptedItem(encryptedItem, prefs, keychainAwareKey, options.requireAuthentication, options.keychainService)
++      if (!saveEncryptedItem(encryptedItem, prefs, keychainAwareKey, options.requireAuthentication, options.keychainService)) {
++        throw WriteException("Could not write the encrypted item to SecureStore", key, options.keychainService)
++      }
+diff --git a/expo-module.config.json b/expo-module.config.json
+--- a/expo-module.config.json
++++ b/expo-module.config.json
+@@ -4,11 +4,6 @@
+     "modules": ["SecureStoreModule"]
+   },
+   "android": {
+-    "modules": ["expo.modules.securestore.SecureStoreModule"],
+-    "publication": {
+-      "groupId": "host.exp.exponent",
+-      "artifactId": "expo.modules.securestore",
+-      "repository": "local-maven-repo"
+-    }
++    "modules": ["expo.modules.securestore.SecureStoreModule"]
+   }
+ }

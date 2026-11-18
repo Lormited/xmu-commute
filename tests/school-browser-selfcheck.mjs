@@ -105,6 +105,7 @@ function fixture(files = new Map(), { secure = new Map(), timers = {} } = {}) {
     get 'expo-secure-store'() {
       return {
         async getItemAsync(key) { assert.equal(key, sessionKey); return secure.get(key) ?? null; },
+        getItem(key) { assert.equal(key, sessionKey); return secure.get(key) ?? null; },
         setItem(key, value) {
           assert.equal(key, sessionKey);
           secureCalls.push('set');
@@ -447,6 +448,21 @@ test('recovery timeout retains the previous session on restart even after late v
     await reopened.schoolDevice.read('todos');
     assert.match(requestCookie(reopened.calls[0]), /lnt_session=web-lnt/);
   }
+});
+
+test('a renewal that crosses its deadline during storage keeps the prior session and skips replay', async () => {
+  let now = Date.now();
+  class Clock extends Date { static now() { return now; } }
+  const f = await boundFixture(new Map(), { timers: { Date: Clock } });
+  const previous = f.secure.get(sessionKey);
+  f.handler = async url => {
+    if (url.includes('/todos')) return response(url, {}, 401);
+    if (url === lntRoot) return redirect(url, '/user/index', [['Set-Cookie', 'lnt_session=late; Path=/; Secure']]);
+  };
+  f.onSecureSet = () => { now += 30_001; f.onSecureSet = null; };
+  await assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'AUTH_REQUIRED' });
+  assert.equal(f.calls.filter(call => call.url.includes('/todos')).length, 1);
+  assert.equal(f.secure.get(sessionKey), previous);
 });
 
 test('logout cancels recovery and drains pending navigation or verification before removing both stores', async () => {
