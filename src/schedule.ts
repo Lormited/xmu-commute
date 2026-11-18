@@ -3,8 +3,7 @@ import type { LearningSnapshot, SchoolDevice } from './learning.ts';
 
 export function currentCourseIndex(sessions: Session[], now = new Date()) {
   const time = now.toTimeString().slice(0, 5);
-  const index = sessions.findIndex(session => sessionTime(session).slice(-5) > time);
-  return index === -1 ? sessions.length - 1 : index;
+  return sessions.findIndex(session => sessionTime(session).slice(-5) > time);
 }
 
 export type SchoolScheduleRow = { WID: string; BJDM: string; KCMC: string; JASMC: string; JSXM: string;

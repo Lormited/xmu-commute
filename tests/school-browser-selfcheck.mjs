@@ -529,6 +529,7 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
   let context, cursor = 0;
   let preview = demoState.demoReducer(demoState.initialState(), { type: 'scenario', scenario: 'signed-out' });
   const slots = [], navigations = [], focusEffects = [], effects = [];
+  const todayEffects = [], todayFocusEffects = [];
   const todoClock = { now: Date.now(), timer: null, listener: null };
   class TodoDate extends Date {
     constructor(...args) { super(...(args.length ? args : [todoClock.now])); }
@@ -594,12 +595,28 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
   const pageMocks = { react, 'react-native': native, 'expo-router': { router, useFocusEffect: callback => focusEffects.push(callback) }, '@/demo-context': demo,
     '@/demo-state': demoState, '@/demo-data': demoData, '@/schedule': scheduleModule, '@/ui': ui,
     '@/today-course-card': todayCard };
-  const today = loadModule('../app/(tabs)/index.tsx', pageMocks, {
+  function todayMemo(factory, deps) {
+    const index = cursor++, slot = slots[index];
+    if (!slot || deps.some((value, position) => !Object.is(value, slot.deps[position]))) {
+      slots[index] = { deps, value: factory() };
+    }
+    return slots[index].value;
+  }
+  const today = loadModule('../app/(tabs)/index.tsx', { ...pageMocks,
+    react: { ...react, useCallback: (callback, deps) => todayMemo(() => callback, deps),
+      useEffect: (effect, deps) => todayMemo(() => todayEffects.push(effect), deps) },
+    'expo-router': { router, useFocusEffect: callback => todayFocusEffects.push(callback) },
+  }, {
     Date: TodayDate,
     setTimeout(callback, delay) { todayClock.timer = { callback, delay }; return todayClock.timer; },
     clearTimeout(timer) { if (todayClock.timer === timer) todayClock.timer = null; },
   });
-  function renderToday() { cursor = 50; return today.default(); }
+  function renderToday() {
+    cursor = 50; todayFocusEffects.length = 0;
+    const page = today.default();
+    todayEffects.splice(0).forEach(effect => effect());
+    return page;
+  }
   const profilePage = loadModule('../app/(tabs)/profile.tsx', pageMocks);
   const historyPage = loadModule('../app/history.tsx', { ...pageMocks, '@/swipe-pages': { SwipePages: 'SwipePages' } });
   const settingsPage = loadModule('../app/settings.tsx', { ...pageMocks, react, '@/style-options': styleOptions });
@@ -634,8 +651,7 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
   }
   return {
     navigations, find, todoClock, todayClock,
-    focusToday() { const cleanups = focusEffects.slice(-2).map(effect => effect()); return () => cleanups.forEach(cleanup => cleanup?.()); },
-    centerToday() { focusEffects.at(-1)?.(); },
+    focusToday() { const cleanups = todayFocusEffects.map(effect => effect()); return () => cleanups.forEach(cleanup => cleanup?.()); },
     historyPage() { cursor = 30; return historyPage.default(); },
     focusHistory() { focusEffects.at(-1)?.(); },
     pageTree(screen) { const page = screen.type(screen.props); return page.type(page.props); },
@@ -1002,11 +1018,16 @@ test('school timetable reaches today, selected weeks and conflict details throug
   const f = fixture(), app = pages(f, false, JSON.stringify({ version: 1, logs: [], events: [
     { id: 'trial-100-1', method: 'number', outcome: 'success', availableAt: 100, discoveredAt: 101, notifiedAt: 101 },
   ] })); app.render();
-  const weekday = (new Date().getDay() + 6) % 7 + 1;
+  const morning = new Date(); morning.setHours(7, 30, 0, 0);
+  const previousDay = new Date(morning); previousDay.setDate(previousDay.getDate() - 1); previousDay.setHours(23, 55);
+  app.todayClock.now = previousDay.getTime();
+  const weekday = (morning.getDay() + 6) % 7 + 1;
   const row = { WID: 'school-row', BJDM: '001-A', KCMC: '学校课程', JASMC: '学校教室 101', JSXM: '张老师', XQ: weekday, KSJCDM: 1, JSJCDM: 2, KSSJ: '0800', JSSJ: '0940', ZCMC: '8周', JCFADM: 'a' };
   f.handler = async url => url.includes('queryXspkjg.do') ? response(url, { success: true, pkjgList: [row, { ...row, WID: 'second-room', JASMC: '学校教室 102' }, { ...row, WID: 'overlap', BJDM: 'other-class', KCMC: '重叠课程', JSXM: '李老师', JASMC: '学校教室 202' }] })
     : url.includes('/todos') ? response(url, { todo_list: [] }) : undefined;
-  const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
+  const login = app.loginButton('today').props.onPress();
+  app.todoClock.now = app.todayClock.now = morning.getTime();
+  await authorize(f); await initialize(f); assert.equal(await login, true);
   await app.render().trial.restore();
   let context = app.render();
   assert.equal(context.state.load, 'empty', 'the timetable and local trial do not fabricate school todos');
@@ -1020,7 +1041,9 @@ test('school timetable reaches today, selected weeks and conflict details throug
   const today = app.today();
   assert.ok(app.attendanceEntry('模拟签到活动'));
   const attendanceGap = app.find(today, props => props?.style?.marginBottom === 22).props.style.marginTop;
-  const courseGap = app.find(today, props => props?.horizontal).props.contentContainerStyle.paddingBottom;
+  const carousel = app.find(today, props => props?.horizontal);
+  assert.ok(carousel, 'the first timetable after login uses the new day');
+  const courseGap = carousel.props.contentContainerStyle.paddingBottom;
   assert.equal(attendanceGap + courseGap, 22, 'real school courses retain their original separation even when ordinary load is empty');
   const card = app.find(today, props => props?.label === '查看学校课程课程详情');
   assert.ok(card, 'today displays school lessons even when there are no todos');
@@ -1061,8 +1084,8 @@ test('course list details retain the original fields and linked teacher outside 
   assert.equal(context.data.schedule.rows.length, 1);
   assert.equal(context.timetable.sessionsForWeek(context.timetable.currentWeek).length, 0);
   const schoolBlock = app.find(app.today(), props => props?.resource === 'jw' && props?.emptyTitle);
-  const empty = app.find(schoolBlock.type(schoolBlock.props), props => props?.children === '今天没有课程');
-  assert.ok(empty, 'a lesson-free today keeps the original empty message when the term has schedule rows');
+  const empty = app.find(schoolBlock.type(schoolBlock.props), props => props?.title === '今天没有课程');
+  assert.ok(empty, 'a lesson-free today shows the empty card when the term has schedule rows');
   const details = JSON.stringify(app.courseDetail('3'));
   assert.match(details, /请在周课表查看具体安排/);
   assert.doesNotMatch(details, /授课周|1-15周，单周|教学班代码|001-A/);
@@ -1218,7 +1241,9 @@ test('release provider keeps school mode and debug selections with isolated tria
 
 test('today renders school course cards by starting section', async () => {
   const f = fixture(), app = pages(f); app.render();
-  const now = new Date(app.todayClock.now), weekday = (now.getDay() + 6) % 7 + 1;
+  const now = new Date(); now.setHours(7, 30, 0, 0);
+  app.todayClock.now = now.getTime();
+  const weekday = (now.getDay() + 6) % 7 + 1;
   const rows = [
     { WID: 'section-2', BJDM: 'section-2', KCMC: '第二节课程', JASMC: '教室 2', JSXM: '张老师', XQ: weekday, KSJCDM: 2, JSJCDM: 2, KSSJ: '0800', JSSJ: '0845', ZCMC: '8周', JCFADM: 'a' },
     { WID: 'section-1', BJDM: 'section-1', KCMC: '第一节课程', JASMC: '教室 1', JSXM: '李老师', XQ: weekday, KSJCDM: 1, JSJCDM: 1, KSSJ: '1000', JSSJ: '1045', ZCMC: '8周', JCFADM: 'a' },
@@ -1230,15 +1255,16 @@ test('today renders school course cards by starting section', async () => {
   assert.deepEqual(React.Children.toArray(carousel.props.children).map(card => card.props.children.props.session.start), [0, 1]);
 });
 
-test('today centers the next lesson at dismissal, recalibrates on resume, and cleans up its clock', async () => {
+test('today keeps the initial lesson until an ordinary refresh, then uses the cached timetable', async () => {
   const f = fixture(), app = pages(f); app.render();
-  const now = new Date(); now.setHours(9, 39, 59, 0);
+  const now = new Date(); now.setHours(9, 30, 0, 0);
   app.todayClock.now = now.getTime();
-  const times = [['0800', '0940'], ['1010', '1150'], ['1430', '1610']];
+  const times = [['0800', '0940'], ['1010', '1150']];
   const rows = times.map(([start, end], index) => ({ WID: 'today-' + index, BJDM: '001-A', KCMC: '学校课程', JASMC: '学校教室', JSXM: '张老师', XQ: (now.getDay() + 6) % 7 + 1, KSJCDM: index + 1, JSJCDM: index + 1, KSSJ: start, JSSJ: end, ZCMC: '8周', JCFADM: 'a' }));
   f.handler = async url => url.includes('queryXspkjg.do') ? response(url, { success: true, pkjgList: rows }) : undefined;
   const login = f.learning.login(); await authorize(f); await initialize(f); assert.equal(await login, true);
-  app.render();
+  app.todoClock.now = now.getTime();
+  app.render(); app.runStartupEffects(); await tick(); app.render();
   const requests = f.calls.length, scrolls = [];
   const carousel = () => app.find(app.today(), props => props?.horizontal);
   let cards = carousel();
@@ -1248,28 +1274,37 @@ test('today centers the next lesson at dismissal, recalibrates on resume, and cl
   assert.equal(scrolls.at(-1).x, 0);
   assert.equal(scrolls.at(-1).animated, false);
   const leave = app.focusToday();
-  assert.equal(app.todayClock.timer.delay, 1000, 'the clock aligns to the next minute boundary');
-  now.setHours(9, 40, 0, 0); app.todayClock.now = now.getTime();
-  app.todayClock.timer.callback();
-  cards = carousel(); app.centerToday();
-  assert.equal(scrolls.at(-1).x, 312, 'the second card is centered as soon as the first ends, before the second starts');
-  assert.equal(app.todayClock.timer.delay, 60_000);
-  now.setHours(11, 50, 0, 0); app.todayClock.now = now.getTime();
-  app.todayClock.listener('active'); cards = carousel(); app.centerToday();
-  assert.equal(scrolls.at(-1).x, 624, 'foreground return immediately selects the next course');
+  const initialScrolls = scrolls.length;
+  now.setHours(9, 45, 0, 0); app.todoClock.now = app.todayClock.now = now.getTime();
+  app.todayClock.timer?.callback();
+  carousel();
+  assert.equal(scrolls.at(-1).x, 0, 'time passing does not advance the initial card');
+  leave(); app.focusToday();
+  app.todoClock.listener('active');
+  app.todayClock.listener?.('active');
+  app.render(); carousel();
+  assert.equal(scrolls.at(-1).x, 0, 'tab re-entry and foreground return keep the card');
+  assert.equal(scrolls.length, initialScrolls, 'returning to the tab leaves horizontal browsing where it was');
+  assert.equal(f.calls.length, requests, 'time, focus and resume do not query school services');
+
+  app.refreshButton('today').props.onPress();
+  assert.equal(f.learning.getSnapshot().refreshing, true);
+  assert.equal(await f.learning.refresh(), true);
+  app.render(); cards = carousel();
+  assert.equal(scrolls.at(-1).x, 312, 'refresh centers the next lesson before it starts');
   cards.props.onLayout({ nativeEvent: { layout: { width: 700 } } });
   cards = carousel(); cards.props.onContentSizeChange();
-  assert.equal(cards.props.contentContainerStyle.paddingHorizontal, 200, 'the last card also centers in a wide viewport');
-  now.setHours(23, 0, 0, 0); app.todayClock.now = now.getTime();
-  app.todayClock.listener('active'); cards = carousel(); app.centerToday();
-  assert.equal(scrolls.at(-1).x, 624, 'after the last course the last card stays centered');
-  now.setDate(now.getDate() + 1); now.setHours(0, 0, 0, 0); app.todayClock.now = now.getTime();
-  app.todayClock.listener('active');
-  assert.equal(carousel(), undefined, 'midnight changes to the new day instead of retaining yesterday cards');
-  assert.equal(f.calls.length, requests, 'clock changes never query school services');
-  leave();
-  assert.equal(app.todayClock.timer, null);
-  assert.equal(app.todayClock.listener, null);
+  assert.equal(cards.props.contentContainerStyle.paddingHorizontal, 200, 'the selected card also centers in a wide viewport');
+  now.setHours(11, 50, 0, 0); app.todoClock.now = app.todayClock.now = now.getTime();
+  app.pullToRefresh('profile');
+  assert.equal(f.learning.getSnapshot().refreshing, true);
+  assert.equal(await f.learning.refresh(), true);
+  app.render();
+  const courseBlock = app.find(app.today(), props => props?.resource === 'jw' && props?.emptyTitle);
+  const empty = app.find(courseBlock.type(courseBlock.props), props => props?.title === '今天没有课程');
+  assert.ok(empty, 'refresh after the last lesson displays the empty card');
+  assert.equal(carousel(), undefined);
+  assert.deepEqual(f.calls.slice(requests).map(call => new URL(call.url).pathname).sort(), [...ordinaryPaths, ...ordinaryPaths].sort());
 });
 
 test('shared todo dates update at midnight and resume; missing deadlines leave no placeholder or separator', async () => {

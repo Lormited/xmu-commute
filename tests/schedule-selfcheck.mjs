@@ -117,7 +117,7 @@ test('today advances at the actual lesson end, including gaps and overlapping le
   ];
   for (const [hour, minute, second, expected] of [
     [7, 0, 0, 0], [9, 39, 59, 0], [9, 40, 0, 1], [10, 0, 0, 1],
-    [10, 10, 0, 1], [11, 49, 59, 1], [11, 50, 0, 2], [16, 10, 0, 2], [23, 59, 59, 2],
+    [10, 10, 0, 1], [11, 49, 59, 1], [11, 50, 0, 2], [16, 10, 0, -1], [23, 59, 59, -1],
   ]) {
     assert.equal(scheduleModule.currentCourseIndex(sessions, new Date(2026, 10, 13, hour, minute, second)), expected);
   }
@@ -126,5 +126,5 @@ test('today advances at the actual lesson end, including gaps and overlapping le
   assert.equal(scheduleModule.currentCourseIndex([{ ...sessions[0], time: '08:00 — 10:40' }, sessions[2]], new Date(2026, 10, 13, 9, 40)), 0, 'school end times take precedence over demo periods');
   assert.equal(scheduleModule.currentCourseIndex([{ ...sessions[0], time: undefined }, sessions[2]], new Date(2026, 10, 13, 9, 40)), 1, 'preview sessions fall back to their existing period times');
   assert.equal(scheduleModule.currentCourseIndex([], new Date(at)), -1);
-  assert.equal(scheduleModule.currentCourseIndex([sessions[0]], new Date(2026, 10, 13, 23)), 0);
+  assert.equal(scheduleModule.currentCourseIndex([sessions[0]], new Date(2026, 10, 13, 23)), -1);
 });

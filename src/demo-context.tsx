@@ -10,7 +10,7 @@ import { isPosition, type Position } from './location-attendance.ts';
 import { createAttendanceTrial, type TrialSnapshot } from './attendance-trial';
 import { attendanceTrialDevice } from './attendance-trial-device';
 
-type Demo = { state: DemoState; dispatch: Dispatch<DemoEvent>; refresh: () => void; refreshHistory: () => void; refreshing: boolean; syncResult: 'success' | 'offline' | null; reducedMotion: boolean;
+type Demo = { state: DemoState; dispatch: Dispatch<DemoEvent>; refresh: () => void; refreshHistory: () => void; refreshing: boolean; homeRefreshAt: Date | null; syncResult: 'success' | 'offline' | null; reducedMotion: boolean;
   timetable: ReturnType<typeof schoolScheduleView>; real: boolean; data: LearningSnapshot; todos: Todo[]; login: () => Promise<boolean>; logout: () => Promise<boolean>;
   submitNumber: ReturnType<typeof createLearning>['submitNumber']; submitLocation: ReturnType<typeof createLearning>['submitLocation']; submitQr: ReturnType<typeof createLearning>['submitQr'];
 
@@ -65,6 +65,11 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     previewDispatch(event);
   }, [real, learning, trial, data.schedule, timetable.minWeek, timetable.weeks]);
   const [refreshing, setRefreshing] = useState(false);
+  const [homeRefreshAt, setHomeRefreshAt] = useState<Date | null>(null);
+  const refreshSchool = useCallback(() => {
+    setHomeRefreshAt(new Date());
+    return learning.refresh();
+  }, [learning]);
   const [syncResult, setSyncResult] = useState<Demo['syncResult']>(null);
   const [reducedMotion, setReducedMotion] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -82,8 +87,8 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     wasRefreshing.current = data.refreshing;
   }, [real, data.refreshing, data.message]);
   useEffect(() => {
-    if (real) void learning.restore().then(() => learning.refresh());
-  }, [learning, real]);
+    if (real) void learning.restore().then(refreshSchool);
+  }, [learning, real, refreshSchool]);
   useEffect(() => { void trial.restore(); }, [trial]);
   useEffect(() => {
     let alive = true;
@@ -93,7 +98,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
   }, []);
   function refresh() {
     if (real) {
-      void learning.refresh();
+      void refreshSchool();
       return;
     }
     if (timer.current || !state.loggedIn) return;
@@ -109,7 +114,11 @@ export function DemoProvider({ children }: { children: ReactNode }) {
   }
   const refreshHistory = useCallback(() => { void learning.refreshHistory(); }, [learning]);
   async function login() {
-    if (real) return learning.login();
+    if (real) {
+      const loggedIn = await learning.login();
+      if (loggedIn) setHomeRefreshAt(new Date());
+      return loggedIn;
+    }
     previewDispatch({ type: 'login' });
     return true;
   }
@@ -135,7 +144,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     return { result: 'failed' as const, message: '模拟定位活动或位置不可用' };
   }
   const todos = useMemo(() => real ? data.todos.map(item => todoView(item, now)) : todoFixtures(preview.longText), [real, data.todos, preview.longText, now]);
-  return <Context.Provider value={{ state, dispatch, refresh, refreshHistory, refreshing: real ? data.refreshing : refreshing,
+  return <Context.Provider value={{ state, dispatch, refresh, refreshHistory, refreshing: real ? data.refreshing : refreshing, homeRefreshAt,
     syncResult: real && data.message ? 'offline' : syncResult, reducedMotion, timetable, real, data, todos, login, logout,
     trial, trialData, isTrialRollcall: trial.isTrialRollcall,
     submitNumber: (id, code) => id.startsWith('trial-') ? trial.submitNumber(id, code) : learning.submitNumber(id, code), submitQr, submitLocation }}>{children}</Context.Provider>;

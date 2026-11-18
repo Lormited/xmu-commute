@@ -1,6 +1,6 @@
-import { useCallback, useRef, useState } from 'react';
-import { AppState, ScrollView, Text, View, useWindowDimensions, type ScrollViewInstance } from 'react-native';
-import { router, useFocusEffect } from 'expo-router';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ScrollView, Text, View, useWindowDimensions, type ScrollViewInstance } from 'react-native';
+import { router } from 'expo-router';
 import { useDemo } from '@/demo-context';
 import { courseFor, methodLabel } from '@/demo-data';
 import { currentCourseIndex, schoolScheduleView } from '@/schedule';
@@ -8,9 +8,10 @@ import { TodayCourseCard } from '@/today-course-card';
 import { Glass, Icon, ResourceBlock, RowGroup, Screen, Section, StateCard, Tap, TodoRow, c, s } from '@/ui';
 
 export default function Today() {
-  const { state, real, data, todos: list, login, timetable: savedTimetable, isTrialRollcall } = useDemo();
+  const { state, real, data, todos: list, login, timetable: savedTimetable, isTrialRollcall, homeRefreshAt } = useDemo();
   const { width } = useWindowDimensions();
-  const [now, setNow] = useState(() => new Date());
+  const [{ firstShownAt, previousRefreshAt }] = useState(() => ({ firstShownAt: new Date(), previousRefreshAt: homeRefreshAt }));
+  const now = homeRefreshAt && homeRefreshAt !== previousRefreshAt ? homeRefreshAt : firstShownAt;
   const [carouselWidth, setCarouselWidth] = useState(width);
   const carousel = useRef<ScrollViewInstance>(null);
   const timetable = real ? schoolScheduleView(data, now) : savedTimetable;
@@ -20,25 +21,12 @@ export default function Today() {
   const active = state.rollcalls.filter(item => !state.attendance[item.id]
     && (isTrialRollcall(item.id) || state.loggedIn && state.load === 'ready'));
   const cardWidth = Math.min(Math.min(carouselWidth, 440) - 84, 300);
-  const courseIndex = real ? currentCourseIndex(today, now) : 0;
+  const courseIndex = real ? currentCourseIndex(today, now) : today.length ? 0 : -1;
   const courseId = today[courseIndex]?.id;
   const offset = Math.max(0, courseIndex) * (cardWidth + 12);
   const centerCourse = useCallback(() => carousel.current?.scrollTo({ x: offset, animated: false }), [offset]);
-  useFocusEffect(useCallback(() => {
-    if (!real) return;
-    let timer: ReturnType<typeof setTimeout>;
-    const update = () => {
-      setNow(new Date());
-      timer = setTimeout(update, 60_000 - Date.now() % 60_000);
-    };
-    update();
-    const listener = AppState.addEventListener('change', status => {
-      if (status === 'active') { clearTimeout(timer); update(); }
-    });
-    return () => { clearTimeout(timer); listener.remove(); };
-  }, [real]));
-  useFocusEffect(useCallback(() => { centerCourse(); }, [centerCourse, courseId, state.loggedIn]));
-  const attendanceCards = active.length > 0 && <View style={{ marginHorizontal: 24, marginTop: state.loggedIn && today.length > 0 && (real || state.load === 'ready') ? 2 : 22, marginBottom: 22, gap: 10 }}>{active.map(item => {
+  useEffect(centerCourse, [centerCourse, courseId, now]);
+  const attendanceCards = active.length > 0 && <View style={{ marginHorizontal: 24, marginTop: state.loggedIn && courseId && (real || state.load === 'ready') ? 2 : 22, marginBottom: 22, gap: 10 }}>{active.map(item => {
     const course = real ? timetable.courseFor(item.courseId) : courseFor(item.courseId, state.longText);
     const name = item.title ?? course?.title ?? '签到活动';
     const method = item.method;
@@ -57,7 +45,7 @@ export default function Today() {
   return <Screen tab resource="jw" title={title}>
     <Section title="今日课程" action="全部课表" onPress={() => router.navigate('/schedule')} />
     <ResourceBlock resource="jw" emptyTitle="今天没有课程">
-      {today.length ? <ScrollView ref={carousel} onLayout={event => setCarouselWidth(event.nativeEvent.layout.width)} onContentSizeChange={centerCourse}
+      {courseId ? <ScrollView ref={carousel} onLayout={event => setCarouselWidth(event.nativeEvent.layout.width)} onContentSizeChange={centerCourse}
         horizontal directionalLockEnabled nestedScrollEnabled bounces overScrollMode="always" showsHorizontalScrollIndicator={false} snapToInterval={cardWidth + 12} decelerationRate="fast" contentContainerStyle={{ paddingHorizontal: (carouselWidth - cardWidth) / 2, gap: 12, paddingBottom: 20 }}>
         {today.map(session => {
           const course = timetable.courseFor(session.courseId, session)!;
@@ -65,7 +53,7 @@ export default function Today() {
             <TodayCourseCard session={session} width={cardWidth} />
           </Tap>;
         })}
-      </ScrollView> : <View style={{ marginHorizontal: 24, paddingVertical: 20 }}><Text style={s.body}>今天没有课程</Text></View>}
+      </ScrollView> : <StateCard icon="sunny-outline" title="今天没有课程" />}
     </ResourceBlock>
     {attendanceCards}
     <View style={{ marginTop: state.load === 'ready' ? 23 : 43 }}><Section title="作业" action="查看全部" onPress={() => router.navigate('/learning')} /></View>
