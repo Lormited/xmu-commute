@@ -1040,6 +1040,25 @@ test('number requests reject invalid input, login pages and malformed receipts',
   }
 });
 
+test('a school p scan sends one PUT with decoded opaque data and returns the school receipt', async () => {
+  const f = fixture();
+  const activity = { rollcall_id: 83, course_id: course.id, course_title: '扫码活动' };
+  f.handler = async (url, options) => url.endsWith('/radar/rollcalls') ? response(url, { rollcalls: [activity] })
+    : options.method === 'PUT' ? response(url, { status: 'on_call' }) : undefined;
+  const login = f.learning.login();
+  await authorize(f); await initialize(f);
+  assert.equal(await login, true);
+  const before = f.calls.length;
+  const receipt = await f.learning.submitQr('83', '/scanner-jumper?p=4~%102b!3~++opaque%2B%2F%3D%2525%1F%1E%0A%E7%A0%81++');
+  assert.deepEqual(receipt, { result: 'success', message: '签到成功' });
+  assert.equal(f.calls.length, before + 1);
+  const call = f.calls[before], { deviceId, ...body } = JSON.parse(call.options.body);
+  assert.equal(call.url, 'https://lnt.xmu.edu.cn/api/rollcall/83/answer_qr_rollcall');
+  assert.equal(call.options.method, 'PUT');
+  assert.deepEqual(body, { data: '  opaque+/=%25~!\n码  ' });
+  assert.match(deviceId, /^[0-9a-f-]{36}$/);
+});
+
 test('QR PUT preserves opaque data, shares the session and only accepts HTTP 200 with on_call', async () => {
   for (const [status, body, expected] of [
     [200, { status: 'on_call' }, 'success'], [200, { success: true }, 'failed'],

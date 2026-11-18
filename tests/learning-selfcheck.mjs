@@ -696,12 +696,13 @@ test('reauthentication keeps a confirmed receipt for the same account; old reads
   assert.equal(expired.learning.getSnapshot().refreshing, false);
 });
 
-test('QR scan submits opaque data only for its own activity and retains the reminder until dismissal', async () => {
+test('school p QR submits exact opaque data once and retains the reminder until dismissal', async () => {
   const f = await attendanceFixture(), gate = deferred();
   f.device.submitQr = async (id, data) => { f.answers.push({ id, data }); return gate.promise; };
-  const answer = f.learning.submitQr('83', '{"rollcallId":83,"data":"  opaque+/=%25\\n码  ","courseId":301}');
+  const answer = f.learning.submitQr('83', 'https://lnt.xmu.edu.cn/j?p=4~%102b%213~%20+opaque%2B%2F%3D%2525%1F%1E%0A%E7%A0%81++%21ignored~elsewhere');
+  assert.deepEqual(f.answers, [{ id: '83', data: '  opaque+/=%25~!\n码  ' }]);
   assert.strictEqual(f.learning.submitQr('83', '{"rollcallId":83,"data":"second scan"}'), answer);
-  assert.deepEqual(f.answers, [{ id: '83', data: '  opaque+/=%25\n码  ' }]);
+  assert.equal(f.answers.length, 1);
   gate.resolve({ result: 'success', message: '签到成功' });
   assert.equal((await answer).result, 'success');
   assert.deepEqual(f.learning.getSnapshot().pendingAttendance, { '83': 'success' });
@@ -712,24 +713,44 @@ test('QR scan submits opaque data only for its own activity and retains the remi
   assert.doesNotMatch(f.stored(), /opaque|second scan/);
 });
 
-test('QR accepts known JSON wrappers without interpreting data and rejects unverified or mismatched scans', async () => {
+test('QR keeps JSON and _p precedence, and decodes official p scalars without rewriting the data', async () => {
   const f = await attendanceFixture();
   f.device.submitQr = async (id, data) => { f.answers.push({ id, data }); return { result: 'failed', message: '学校返回待核对结果' }; };
-  for (const raw of [
-    'https://lnt.xmu.edu.cn/j?_p=%7B%22rollcallId%22%3A83%2C%22data%22%3A%22%252B%2B%2F%3D%22%7D',
-    '/scanner-jumper?_p=%7B%22rollcallId%22%3A%2283%22%2C%22data%22%3A%7B%22opaque%22%3A%5B%22%20x%20%22%2C7%5D%7D%7D',
-  ]) await f.learning.submitQr('83', raw);
-  assert.deepEqual(f.answers, [{ id: '83', data: '%2B+/=' }, { id: '83', data: { opaque: [' x ', 7] } }]);
+  for (const [raw, data] of [
+    ['{"rollcallId":83,"data":"  raw+/=  ","courseId":301}', '  raw+/=  '],
+    ['/j?_p=%7B%22rollcallId%22%3A83%2C%22data%22%3A%22%252B%2B%2F%3D%22%7D&p=4~83!3~ignored', '%2B+/='],
+    ['/scanner-jumper?_p=%7B%22rollcallId%22%3A%2283%22%2C%22data%22%3A%7B%22opaque%22%3A%5B%22%20x%20%22%2C7%5D%7D%7D', { opaque: [' x ', 7] }],
+    ['/scanner-jumper?_p=broken&p=rollcallId~83!data~%102b.3h!__proto__~ignored!unrelated', 83.125],
+    ['/j?p=4~83!3~', ''],
+    ['/j?p=4~83!3~%1A0', false],
+    ['/j?p=4~83!3~%1A1', true],
+    ['/j?p=4~83!3~%1A2', 'classroom-exam'],
+    ['/j?p=4~83!3~%1A3', 'feedback'],
+    ['/j?p=4~83!3~%1A4', 'vote'],
+    ['/j?p=4~83!3~%1AX%1F', '\x1aX\x1f'],
+  ]) {
+    assert.equal((await f.learning.submitQr('83', raw)).message, '学校返回待核对结果');
+    assert.deepEqual(f.answers.pop(), { id: '83', data });
+  }
+});
+
+test('QR rejects malformed or mismatched scans without a school submission', async () => {
+  const f = await attendanceFixture();
+  f.device.submitQr = async (id, data) => { f.answers.push({ id, data }); throw Error('unexpected submission'); };
   for (const raw of ['plain text', '{}', '[]', '{"rollcallId":83}', '{"rollcallId":true,"data":"secret"}',
-    '{"rollcallId":82,"data":"wrong activity"}', '/j?p=unknown-school-encoding',
+    '/j?p=unknown-school-encoding', '/j?p=4~83', '/j?p=3~x', '/j?p=4~83!3', '/j?p=4~83!3~x~y',
+    '/j?p=4~83!rollcallId~82!3~x', '/j?p=4~83!3~x!data~y', '/j?p=4~83!3~x&p=4~82!3~y',
+    '/j?p=4~%102b%3F!3~x', '/j?p=4~%102b%0A!3~x', '/j?p=4~%102b.1!3~x', '/j?p=4~%1A1!3~x',
+    '/j?p=4~83!3~%102b.1.0', '/j?_p=%7B%7D&p=4~83!3~x',
     'https://lnt.xmu.edu.cn/elsewhere?_p=%7B%22rollcallId%22%3A83%2C%22data%22%3A%22x%22%7D']) {
-    assert.equal((await f.learning.submitQr('83', raw)).result, 'failed');
+    assert.deepEqual(await f.learning.submitQr('83', raw), { result: 'failed', message: '二维码无效，请扫描当前活动的学校二维码' }, raw);
+  }
+  for (const raw of ['{"rollcallId":82,"data":"secret"}', '/j?p=4~%102a!3~x']) {
+    assert.deepEqual(await f.learning.submitQr('83', raw), { result: 'failed', message: '二维码与当前签到活动不符' });
   }
   for (const id of ['missing', '81', '82']) await f.learning.submitQr(id, JSON.stringify({ rollcallId: id, data: 'wrong method' }));
-  assert.equal(f.answers.length, 2, 'invalid scans never reach the school');
+  assert.deepEqual(f.answers, [], 'invalid scans never reach the school');
   assert.deepEqual(f.learning.getSnapshot().attendance, {});
-  assert.match((await f.learning.submitQr('83', '/j?p=unknown')).message, /暂不支持/);
-  assert.match((await f.learning.submitQr('83', '{"rollcallId":82,"data":"secret"}')).message, /当前签到活动不符/);
 });
 
 test('timetable refresh setting defaults off and reopens without authenticating a signed-out device', async () => {

@@ -449,8 +449,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       try { data = qrData(rawScanText, id); }
       catch (error) {
         return Promise.resolve({ result: 'failed', message: (error as Error).message === 'QR_ACTIVITY_MISMATCH'
-          ? '二维码与当前签到活动不符' : (error as Error).message === 'UNSUPPORTED_QR_WRAPPER'
-            ? '此二维码包装暂不支持，请使用学校客户端签到' : '二维码无效，请扫描当前活动的学校二维码' });
+          ? '二维码与当前签到活动不符' : '二维码无效，请扫描当前活动的学校二维码' });
       }
       return submitAttendance(id, 'qr', true, account => device.submitQr(id, data, account));
     },

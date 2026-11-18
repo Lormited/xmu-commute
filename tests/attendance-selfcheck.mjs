@@ -567,11 +567,11 @@ test('preview location keeps simulated permission, receipt and dismissal usable 
 test('QR camera result submits once, shows school feedback and removes only its entry after closing', async () => {
   const { app, answers } = await realScreen(undefined, 'qr');
   const scan = app.find(node => node.type === 'QrAttendance').props.onScan;
-  scan('{"rollcallId":81,"data":"  opaque+/=  "}');
+  scan('/j?p=4~%1029!3~++opaque%2B%2F%3D%1F%1E++');
   scan('{"rollcallId":81,"data":"duplicate frame"}');
   app.rerender();
   assert.equal(app.find(node => node.type === 'QrAttendance'), undefined, 'camera stops while the request is pending');
-  assert.deepEqual(answers, [{ id: '81', data: '  opaque+/=  ' }]);
+  assert.deepEqual(answers, [{ id: '81', data: '  opaque+/=~!  ' }]);
   await app.flush();
   assert.ok(app.find(node => node.type === 'Text' && node.props.children === '学校确认签到成功'));
   assert.equal(activeRollcalls(app.state).length, 2);
