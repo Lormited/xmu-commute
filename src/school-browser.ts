@@ -1,6 +1,7 @@
 export const IDENTITY = 'https://c-identity.xmu.edu.cn/auth/realms/xmu/protocol/openid-connect';
 export const CALLBACK = 'https://c-mobile.xmu.edu.cn/identity-web-login-callback?_h5=true';
 export const JW_APP = 'https://jw.xmu.edu.cn/appShow?appId=4979568947762216';
+export const LNT_HOME = 'https://lnt.xmu.edu.cn/';
 export function schoolUrl(value: string) {
   try {
     const url = new URL(value);
@@ -8,7 +9,13 @@ export function schoolUrl(value: string) {
       && (url.hostname === 'xmu.edu.cn' || url.hostname.endsWith('.xmu.edu.cn'));
   } catch { return false; }
 }
-export type BrowserRequest = { url: string; kind: 'authorize' | 'academic' };
+export function identityPage(value: string) {
+  if (!schoolUrl(value)) return false;
+  const { origin, pathname } = new URL(value);
+  return origin === 'https://ids.xmu.edu.cn' && pathname === '/authserver/login'
+    || origin === new URL(IDENTITY).origin && pathname.startsWith('/auth/realms/xmu/');
+}
+export type BrowserRequest = { url: string; kind: 'authorize' | 'academic' | 'recovery' };
 type BrowserState = BrowserRequest | { kind: 'pending' };
 type BrowserFailure = { nativeCode?: number; httpStatus?: number };
 export function createSchoolBrowser(onCancel?: () => void) {
@@ -22,14 +29,15 @@ export function createSchoolBrowser(onCancel?: () => void) {
     if (request !== expected) return;
     const pending = result;
     // Keep the modal open while each completed WebView is disposed and API work continues.
-    request = code ? null : { kind: 'pending' }; result = null;
+    request = code || expected.kind === 'recovery' ? null : { kind: 'pending' }; result = null;
     const settle = () => { if (code) pending?.reject(Object.assign(error(code), detail)); else pending?.resolve(value); };
     const waitForUnmount = mounted === expected;
     if (waitForUnmount) afterUnmount = settle;
     listeners.forEach(listener => listener());
     if (!waitForUnmount) settle();
   }
-  function start(url: string, kind: BrowserRequest['kind']) {
+  function start(url: string, kind: BrowserRequest['kind'], signal?: AbortSignal) {
+    if (signal?.aborted) return Promise.reject(error('CANCELLED'));
     if ((request && request.kind !== 'pending') || afterUnmount) return Promise.reject(error('BUSY'));
     if (!schoolUrl(url)) return Promise.reject(error('UNTRUSTED_LINK'));
     if (kind === 'authorize') {
@@ -38,7 +46,14 @@ export function createSchoolBrowser(onCancel?: () => void) {
         || !auth.searchParams.get('state')) return Promise.reject(error('INVALID_AUTHORIZATION'));
     }
     return new Promise<string>((resolve, reject) => {
-      request = { url, kind }; result = { resolve, reject };
+      const page = { url, kind };
+      const abort = () => finish(page, '', 'CANCELLED');
+      signal?.addEventListener('abort', abort, { once: true });
+      request = page;
+      result = {
+        resolve(value) { signal?.removeEventListener('abort', abort); resolve(value); },
+        reject(cause) { signal?.removeEventListener('abort', abort); reject(cause); },
+      };
       listeners.forEach(listener => listener());
     });
   }
@@ -58,6 +73,7 @@ export function createSchoolBrowser(onCancel?: () => void) {
     },
     authenticate: (url: string) => start(url, 'authorize'),
     initializeAcademic: () => start(JW_APP, 'academic'),
+    recover: (signal: AbortSignal) => start(LNT_HOME, 'recovery', signal),
     navigating(expected: BrowserRequest, value: string) {
       if (request !== expected) return true;
       if (expected.kind !== 'authorize' || !schoolUrl(value)) return false;
@@ -74,9 +90,10 @@ export function createSchoolBrowser(onCancel?: () => void) {
       return true;
     },
     loaded(expected: BrowserRequest, value: string) {
-      if (request !== expected || expected.kind !== 'academic' || !schoolUrl(value)) return;
+      if (request !== expected || !schoolUrl(value)) return;
       const url = new URL(value);
-      if (url.origin === 'https://jw.xmu.edu.cn' && url.pathname.startsWith('/gsapp/sys/wdkbapp/')) finish(expected);
+      if (expected.kind === 'academic' && url.origin === 'https://jw.xmu.edu.cn' && url.pathname.startsWith('/gsapp/sys/wdkbapp/')) finish(expected);
+      if (expected.kind === 'recovery' && url.origin === new URL(LNT_HOME).origin && url.pathname === '/user/index') finish(expected);
     },
     fail(expected: BrowserRequest, code: string, detail?: BrowserFailure) { finish(expected, '', code, detail); },
     close,

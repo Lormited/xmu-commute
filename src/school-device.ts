@@ -1,7 +1,7 @@
 import * as Crypto from 'expo-crypto';
 import { File, Paths } from 'expo-file-system';
 import { moveAsync } from 'expo-file-system/legacy';
-import { CALLBACK, IDENTITY, createSchoolBrowser, schoolUrl } from './school-browser';
+import { CALLBACK, IDENTITY, LNT_HOME, createSchoolBrowser, identityPage, schoolUrl } from './school-browser';
 import type { SchoolDevice } from './learning';
 import { numberReceipt } from './attendance.ts';
 import { isPosition } from './location-attendance.ts';
@@ -11,6 +11,7 @@ const fail = (code: string, httpStatus?: number) => Object.assign(Error(code), {
 const cache = () => new File(Paths.document, 'school-learning.json');
 const temporary = () => new File(Paths.document, 'school-learning.tmp');
 const logoutMarker = () => new File(Paths.document, 'school-logout');
+const requestTimeout = 30000;
 const endpoints = {
   profile: 'https://lnt.xmu.edu.cn/api/profile',
   todos: 'https://lnt.xmu.edu.cn/api/todos?no-intercept=true',
@@ -24,37 +25,100 @@ let authenticating: Promise<void> | null = null;
 let clearing: Promise<void> | null = null;
 let mustClear = false;
 let verifiedTerms: unknown = null;
+let lntSession: { recovery?: Promise<void> } = {};
+let recovering: { abort(): void; browser: Promise<string>; drain: Promise<void>; result: Promise<void> } | null = null;
 const requests = new Map<AbortController, Promise<unknown>>();
 export const schoolBrowser = createSchoolBrowser(() => {
   generation++;
   for (const controller of requests.keys()) controller.abort();
 });
-function check(version: number) {
-  if (generation !== version || mustClear) throw fail('CANCELLED');
+function check(version: number, signal?: AbortSignal) {
+  if (generation !== version || mustClear || signal?.aborted) throw fail('CANCELLED');
 }
-function request(url: string, version: number, init: RequestInit = {}) {
-  check(version);
+function request(url: string, version: number, init: RequestInit = {}, { signal, lntQuery = false }: { signal?: AbortSignal; lntQuery?: boolean } = {}) {
+  check(version, signal);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 30000);
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, requestTimeout);
   const task = (async () => {
     try {
       // Android's React Native fetch shares WebView's CookieManager, including HttpOnly cookies.
       const response = await fetch(url, { ...init, credentials: 'include', signal: controller.signal }).catch(() => {
-        check(version);
+        check(version, signal);
         throw fail(controller.signal.aborted ? 'TIMEOUT' : 'NETWORK');
       });
       const text = await response.text();
-      check(version);
+      check(version, signal);
+      const contentType = response.headers.get('content-type') ?? '';
+      if (lntQuery) {
+        const expected = new URL(url);
+        const final = schoolUrl(response.url) ? new URL(response.url) : null;
+        const sameEndpoint = final?.origin === expected.origin && final.pathname === expected.pathname;
+        const loginForm = contentType.includes('html') && /<form\b/i.test(text)
+          && /pwdencryptsalt|\/auth\/realms\/xmu\/login-actions\/authenticate/i.test(text);
+        if (response.status < 500 && (identityPage(response.url)
+          || sameEndpoint && (response.status === 401 || response.status === 403 || response.status === 200 && loginForm))) {
+          throw fail('AUTH_REQUIRED', response.status);
+        }
+        if (response.status !== 200) throw fail('HTTP_ERROR', response.status);
+        if (!sameEndpoint || contentType.includes('html')) throw fail('INVALID_RESPONSE');
+        return { text, contentType, httpStatus: response.status };
+      }
       if (response.status === 401 || (response.status === 403 && init.method !== 'PUT')) throw fail('AUTH_REQUIRED', response.status);
       const final = new URL(response.url), expected = new URL(url);
       if (!schoolUrl(response.url) || final.origin !== expected.origin || final.pathname !== expected.pathname) throw fail('AUTH_REQUIRED', response.status);
       if (response.status !== 200 && init.method !== 'PUT') throw fail('HTTP_ERROR', response.status);
-      return { text, contentType: response.headers.get('content-type') ?? '', httpStatus: response.status };
-    } finally { clearTimeout(timer); }
+      return { text, contentType, httpStatus: response.status };
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+    }
   })();
   requests.set(controller, task);
   void task.then(() => requests.delete(controller), () => requests.delete(controller));
   return task;
+}
+function recoverLnt(version: number) {
+  if (authenticating) throw fail('AUTH_REQUIRED');
+  if (recovering) return recovering.result;
+  const controller = new AbortController();
+  const { signal } = controller;
+  const browser = schoolBrowser.recover(signal);
+  let interrupt!: (error: Error) => void;
+  const interrupted = new Promise<never>((_, reject) => { interrupt = reject; });
+  const abort = (code = 'CANCELLED') => { interrupt(fail(code)); controller.abort(); };
+  const timer = setTimeout(() => abort('AUTH_REQUIRED'), requestTimeout);
+  const drain = (async () => {
+    await browser;
+    const response = await request(endpoints.profile, version, { headers: { Accept: 'application/json' } }, { signal, lntQuery: true });
+    const profile = jsonResponse(response) as { id?: unknown; user_no?: unknown; success?: boolean } | null;
+    if (profile?.success === false || !Number.isSafeInteger(profile?.id) || typeof profile?.user_no !== 'string' || !profile.user_no.trim()) {
+      throw fail('INVALID_RESPONSE');
+    }
+    const { default: cookies } = await import('@preeternal/react-native-cookie-manager');
+    check(version, signal);
+    try { await cookies.flush(); } catch { throw fail('COOKIE_STORAGE'); }
+    check(version, signal);
+  })().finally(() => { recovering = null; });
+  const result = Promise.race([drain, interrupted]).finally(() => clearTimeout(timer));
+  recovering = { abort, browser, drain, result };
+  return result;
+}
+async function query(url: string, version: number, init: RequestInit) {
+  const lntQuery = new URL(url).origin === new URL(LNT_HOME).origin;
+  const session = lntSession;
+  const fetchQuery = async () => jsonResponse(await request(url, version, init, { lntQuery }));
+  try { return await fetchQuery(); }
+  catch (error) {
+    check(version);
+    if (!lntQuery || (error as { code?: string } | null)?.code !== 'AUTH_REQUIRED') throw error;
+    session.recovery ??= recoverLnt(version).finally(() => {
+      if (lntSession === session) lntSession = {};
+    });
+    await session.recovery;
+    return fetchQuery();
+  }
 }
 async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], version = generation): Promise<unknown> {
   check(version);
@@ -67,11 +131,10 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
     const courses: unknown[] = [];
     let pages = 1, total = 0;
     for (let page = 1; page <= pages; page++) {
-      const response = await request(endpoints.courses, version, {
+      const result = await query(endpoints.courses, version, {
         method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify({ page, page_size: 100, fields: 'id,course_code,name,semester_id', conditions: { semester_id: [params!.semesterId] } }),
-      });
-      const result = jsonResponse(response) as { success?: unknown; courses?: unknown; pages?: unknown; total?: unknown } | null;
+      }) as { success?: unknown; courses?: unknown; pages?: unknown; total?: unknown } | null;
       if (result?.success === false || !Array.isArray(result?.courses) || !Number.isSafeInteger(result.pages) || (result.pages as number) < 0
         || !Number.isSafeInteger(result.total) || (result.total as number) < 0
         || page > 1 && (result.pages !== pages || result.total !== total)) throw fail('INVALID_RESPONSE');
@@ -92,11 +155,10 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
     ? `https://lnt.xmu.edu.cn/api/course/${params!.courseId}/student/${params!.studentId}/rollcalls?page=1&page_size=100`
     : action === 'jwWeek'
     ? 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/wdkcb/getZcxx.do?' + new URLSearchParams({ XNXQDM: params!.jwTermCode! }) : timetable ? 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/wdkcb/queryXspkjg.do' : endpoints[action as keyof typeof endpoints];
-  const response = await request(url, version, timetable ? {
+  return query(url, version, timetable ? {
     method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ XNXQDM: params!.jwTermCode!, XH: params?.studentNumber ?? '' }).toString(),
   } : { headers: { Accept: 'application/json' } });
-  return jsonResponse(response);
 }
 function jsonResponse(response: { contentType: string; text: string }): unknown {
   if (!response.contentType.includes('json')) throw fail(response.contentType.includes('html') ? 'AUTH_REQUIRED' : 'INVALID_RESPONSE');
@@ -176,10 +238,13 @@ async function authenticate(onAuthorized?: () => void) {
 function clear(): Promise<void> {
   if (clearing) return clearing;
   generation++; mustClear = true;
+  lntSession = {};
   verifiedTerms = null;
+  const recovery = recovering;
+  recovery?.abort();
   schoolBrowser.close();
   for (const controller of requests.keys()) controller.abort();
-  const pending = [...requests.values(), authenticating];
+  const pending = [...requests.values(), authenticating, recovery?.drain];
   clearing = (async () => {
     const marker = logoutMarker();
     // An interrupted logout must never restore the previous account on the next launch.
@@ -239,7 +304,15 @@ export const schoolDevice: SchoolDevice = {
   },
   authenticate(onAuthorized) {
     if (clearing || mustClear) return Promise.reject(fail('CLEANUP_REQUIRED'));
-    authenticating ??= authenticate(onAuthorized).finally(() => { authenticating = null; });
+    authenticating ??= (async () => {
+      const version = ++generation;
+      lntSession = {};
+      const recovery = recovering;
+      recovery?.abort();
+      if (recovery) await recovery.browser.catch(() => {});
+      check(version);
+      await authenticate(onAuthorized);
+    })().finally(() => { authenticating = null; });
     return authenticating;
   },
 };

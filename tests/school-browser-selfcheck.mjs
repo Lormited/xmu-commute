@@ -45,7 +45,7 @@ function response(url, body, status = 200, contentType = 'application/json') {
   Object.defineProperty(result, 'url', { value: url });
   return result;
 }
-function fixture(files = new Map()) {
+function fixture(files = new Map(), timers = {}) {
   const calls = [], cookieCalls = [], logs = [], cookies = new Map([['sso', 'test-session']]);
   const f = { files, calls, cookieCalls, cookies, logs, cookieLoads: 0, cookieUnavailable: false,
     failWrite: false, failMove: false, failClear: false, failFlush: false, failDelete: false, failCrypto: false, flushGate: null, handler: null,
@@ -99,7 +99,7 @@ function fixture(files = new Map()) {
     './attendance.ts': attendanceModule,
     './location-attendance.ts': locationModule,
     './qr.ts': qrModule,
-  }, { fetch, console: f.console });
+  }, { fetch, console: f.console, ...timers });
   return Object.assign(f, deviceModule, { learning: createLearning(deviceModule.schoolDevice) });
 }
 async function authorize(f) {
@@ -141,6 +141,57 @@ test('LNT courses use the selected semester and collect every page before return
   const result = await f.schoolDevice.read('courses', { semesterId: 9 });
   assert.deepEqual(Array.from(result.courses, item => item.id), [1, 2]);
   assert.deepEqual(f.calls.map(call => JSON.parse(call.options.body).page), [1, 2]);
+});
+
+test('expired LNT course POST waits for official browser recovery and Cookie flush before replay', async () => {
+  const f = fixture();
+  f.flushGate = deferred();
+  let attempts = 0;
+  f.handler = async url => {
+    if (url.endsWith('/my-courses') && attempts++ === 0) return response(url, {}, 401);
+  };
+  const result = f.schoolDevice.read('courses', { semesterId: 9 });
+  void result.catch(() => {});
+  await tick();
+  const page = f.schoolBrowser.getSnapshot();
+  assert.equal(page?.url, 'https://lnt.xmu.edu.cn/');
+  assert.equal(page.kind, 'recovery');
+  f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/app-redirect');
+  assert.equal(f.schoolBrowser.getSnapshot(), page);
+  f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+  await tick();
+  assert.deepEqual(f.cookieCalls, ['flush']);
+  assert.equal(attempts, 1);
+  f.flushGate.resolve();
+  assert.deepEqual(Array.from((await result).courses), [course]);
+  assert.deepEqual(f.calls.map(call => new URL(call.url).pathname), ['/api/my-courses', '/api/profile', '/api/my-courses']);
+  assert.equal(f.calls[2].options.method, 'POST');
+  assert.equal(f.calls[2].options.body, f.calls[0].options.body);
+  assert.equal(JSON.parse(f.calls[2].options.body).conditions.semester_id[0], 9);
+});
+
+test('simultaneous and late stale history responses share one recovery and each retry once', async () => {
+  const f = fixture(), late = deferred(), sent = new Map();
+  f.handler = async url => {
+    if (!url.includes('/student/')) return;
+    const courseId = Number(new URL(url).pathname.split('/')[3]);
+    const count = (sent.get(courseId) ?? 0) + 1;
+    sent.set(courseId, count);
+    if (count === 1 && courseId === 5) await late.promise;
+    if (count === 1 || courseId === 5) return response(url, {}, 401);
+  };
+  const requests = [3, 4, 5].map(courseId => f.schoolDevice.read('history', { courseId, studentId: 42 }));
+  const rejected = assert.rejects(requests[2], { code: 'AUTH_REQUIRED' });
+  await tick();
+  const page = f.schoolBrowser.getSnapshot();
+  assert.equal(page?.kind, 'recovery');
+  f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+  await Promise.all(requests.slice(0, 2));
+  late.resolve();
+  await rejected;
+  assert.deepEqual([...sent.values()], [2, 2, 2]);
+  assert.deepEqual(f.cookieCalls, ['flush']);
+  assert.equal(f.schoolBrowser.getSnapshot(), null);
 });
 
 test('invalid or failed later course pages retain the entire saved learning batch', async () => {
@@ -372,16 +423,155 @@ test('authentication or cookie failure keeps login retry available and preserves
   }
 });
 
-test('HTTP errors, login redirects, HTML and malformed JSON do not become school data', async () => {
-  for (const kind of ['unauthorized', 'redirect', 'html', 'json', 'server']) {
+test('ordinary LNT failures and academic expiry do not start browser recovery', async () => {
+  for (const kind of ['academic', 'redirect', 'html', 'json', 'server', 'network']) {
     const f = fixture();
-    f.handler = async url => kind === 'unauthorized' ? response(url, {}, 401)
-      : kind === 'redirect' ? response('https://ids.xmu.edu.cn/authserver/login', {})
-      : kind === 'html' ? response(url, '<html>login</html>', 200, 'text/html')
-      : kind === 'json' ? response(url, '{broken') : response(url, {}, 503);
-    await assert.rejects(f.schoolDevice.read('todos'), { code: ['unauthorized', 'redirect', 'html'].includes(kind) ? 'AUTH_REQUIRED' : kind === 'json' ? 'INVALID_RESPONSE' : 'HTTP_ERROR' });
+    f.handler = async url => {
+      if (kind === 'network') throw Error('network');
+      return kind === 'academic' ? response(url, {}, 401)
+        : kind === 'redirect' ? response('https://lnt.xmu.edu.cn/maintenance', {})
+        : kind === 'html' ? response(url, '<html>gateway</html>', 200, 'text/html')
+        : kind === 'json' ? response(url, '{broken') : response(url, {}, 503);
+    };
+    await assert.rejects(f.schoolDevice.read(kind === 'academic' ? 'jwTerms' : 'todos'), {
+      code: kind === 'academic' ? 'AUTH_REQUIRED' : kind === 'server' ? 'HTTP_ERROR' : kind === 'network' ? 'NETWORK' : 'INVALID_RESPONSE',
+    });
     assert.equal(f.schoolBrowser.getSnapshot(), null);
     assert.equal(f.calls.length, 1);
+  }
+});
+
+test('a failed shared recovery stays failed for a late school login redirect and keeps the saved session', async () => {
+  const f = fixture(new Map([['school-learning.json', 'previous']])), late = deferred();
+  f.handler = async url => {
+    if (url.includes('/todos')) return response(url, '<form><input id="pwdEncryptSalt"></form>', 200, 'text/html');
+    await late.promise;
+    return response('https://ids.xmu.edu.cn/authserver/login', {});
+  };
+  const first = assert.rejects(f.schoolDevice.read('todos'), { code: 'NETWORK' });
+  const second = assert.rejects(f.schoolDevice.read('rollcalls'), { code: 'NETWORK' });
+  await tick();
+  f.schoolBrowser.fail(f.schoolBrowser.getSnapshot(), 'NETWORK');
+  await first;
+  late.resolve();
+  await second;
+  assert.equal(f.schoolBrowser.getSnapshot(), null);
+  assert.equal(f.calls.length, 2);
+  assert.equal(await f.schoolDevice.load(), 'previous');
+  assert.equal(f.cookies.get('sso'), 'test-session');
+  assert.deepEqual(f.cookieCalls, []);
+});
+
+test('recovery requires an authenticated profile and successful Cookie persistence before replay', async () => {
+  for (const phase of ['unauthorized', 'invalid profile', 'cookie failure']) {
+    const f = fixture();
+    f.failFlush = phase === 'cookie failure';
+    f.handler = async url => url.includes('/todos') || phase === 'unauthorized' ? response(url, {}, 401)
+      : phase === 'invalid profile' ? response(url, { id: 42, user_no: {} }) : undefined;
+    const rejected = assert.rejects(f.schoolDevice.read('todos'), {
+      code: phase === 'unauthorized' ? 'AUTH_REQUIRED' : phase === 'invalid profile' ? 'INVALID_RESPONSE' : 'COOKIE_STORAGE',
+    });
+    await tick();
+    const page = f.schoolBrowser.getSnapshot();
+    f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn.evil.test/user/index#/');
+    assert.equal(f.schoolBrowser.getSnapshot(), page);
+    f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+    await rejected;
+    assert.equal(f.calls.length, 2);
+    assert.equal(f.schoolBrowser.getSnapshot(), null);
+    assert.deepEqual(f.cookieCalls, phase === 'cookie failure' ? ['flush'] : []);
+    assert.equal(f.cookies.get('sso'), 'test-session');
+  }
+});
+
+test('the full recovery deadline covers the page, session probe, and Cookie flush', async () => {
+  for (const phase of ['page', 'probe', 'flush']) {
+    const timers = new Map(), gate = deferred();
+    const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: [todo], todosAt: 1000 });
+    const f = fixture(new Map([['school-learning.json', raw]]), {
+      setTimeout(fn, delay) { const key = Symbol(); timers.set(key, { fn, delay }); return key; },
+      clearTimeout(key) { timers.delete(key); },
+    });
+    let profileReads = 0;
+    f.handler = async url => {
+      if (!url.endsWith('/profile')) return;
+      if (profileReads++ === 0) return response(url, {}, 401);
+      if (phase === 'probe') await gate.promise;
+    };
+    if (phase === 'flush') f.flushGate = gate;
+    await f.learning.restore();
+    const refresh = f.learning.refresh();
+    await tick();
+    if (phase !== 'page') {
+      f.schoolBrowser.loaded(f.schoolBrowser.getSnapshot(), 'https://lnt.xmu.edu.cn/user/index#/');
+      await tick();
+    }
+    const [deadline] = timers.values();
+    assert.equal(deadline.delay, 30_000);
+    assert.equal(f.learning.getSnapshot().refreshing, true);
+    deadline.fn();
+    assert.equal(await refresh, false, phase);
+    assert.equal(f.learning.getSnapshot().needsLogin, true);
+    assert.equal(f.schoolBrowser.getSnapshot(), null);
+    assert.equal(await f.schoolDevice.load(), raw);
+    assert.equal(f.cookies.get('sso'), 'test-session');
+    if (phase === 'probe') assert.equal(f.calls[1].options.signal.aborted, true);
+    if (phase === 'flush') {
+      f.handler = async url => url.includes('/todos') ? response(url, {}, 401) : undefined;
+      await assert.rejects(f.schoolDevice.read('todos'), { code: 'AUTH_REQUIRED' });
+    }
+    gate.resolve();
+    await tick();
+    assert.equal(profileReads, phase === 'page' ? 1 : 2, 'no late replay');
+    assert.deepEqual(f.cookieCalls, phase === 'flush' ? ['flush'] : []);
+    assert.equal(timers.size, 0);
+    if (phase === 'flush') {
+      let expired = true;
+      f.handler = async url => {
+        if (url.includes('/todos') && expired) { expired = false; return response(url, {}, 401); }
+      };
+      const next = f.schoolDevice.read('todos');
+      void next.catch(() => {});
+      await tick();
+      const page = f.schoolBrowser.getSnapshot();
+      assert.equal(page?.kind, 'recovery');
+      f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+      assert.deepEqual((await next).todo_list, [todo]);
+    }
+  }
+});
+
+test('logout closes hidden recovery and drains the browser, probe, or Cookie flush before clearing', async () => {
+  for (const phase of ['page', 'probe', 'flush']) {
+    const f = fixture(new Map([['school-learning.json', 'previous']])), gate = deferred();
+    f.handler = async url => {
+      if (url.includes('/todos')) return response(url, {}, 403);
+      if (phase === 'probe') await gate.promise;
+    };
+    if (phase === 'flush') f.flushGate = gate;
+    const rejected = assert.rejects(f.schoolDevice.read('todos'), { code: 'CANCELLED' });
+    await tick();
+    const page = f.schoolBrowser.getSnapshot();
+    assert.equal(page?.kind, 'recovery');
+    const detach = phase === 'page' ? f.schoolBrowser.attach(page) : null;
+    if (!detach) {
+      f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+      await tick();
+    }
+    const logout = f.learning.logout();
+    await rejected;
+    assert.equal(f.schoolBrowser.getSnapshot(), null);
+    assert.equal(f.cookieCalls.includes('clearAllStores'), false);
+    if (phase === 'probe') assert.equal(f.calls[1].options.signal.aborted, true);
+    f.schoolBrowser.loaded(page, 'https://lnt.xmu.edu.cn/user/index#/');
+    detach?.();
+    gate.resolve();
+    assert.equal(await logout, true);
+    assert.deepEqual(f.cookieCalls, phase === 'flush' ? ['flush', 'clearAllStores'] : ['clearAllStores']);
+    assert.equal(f.cookies.size, 0);
+    assert.equal(f.files.size, 0);
+    assert.equal(f.calls.length, phase === 'page' ? 1 : 2);
+    assert.equal(f.learning.getSnapshot().authenticated, false);
   }
 });
 
@@ -799,6 +989,47 @@ function browserHost(f) {
   }, { console: f.console });
   return { ...host, disposed, detach: () => effects.splice(0).forEach(dispose => dispose()) };
 }
+
+test('hidden recovery preserves official navigation and hands the recognized login form back to manual login', async () => {
+  const f = fixture(), host = browserHost(f);
+  f.handler = async url => url.includes('/todos') ? response(url, {}, 401) : undefined;
+  const pending = assert.rejects(f.schoolDevice.read('todos'), { code: 'AUTH_REQUIRED' });
+  await tick();
+  const hidden = host.SchoolBrowserHost();
+  assert.equal(hidden.type, 'View');
+  assert.equal(hidden.props.pointerEvents, 'none');
+  assert.equal(hidden.props.importantForAccessibility, 'no-hide-descendants');
+  const page = hidden.props.children, web = page.type(page.props);
+  assert.equal(web.props.source.uri, 'https://lnt.xmu.edu.cn/');
+  assert.equal(web.props.onShouldStartLoadWithRequest({ url: 'https://lnt.xmu.edu.cn/app-redirect' }), true);
+  assert.equal(web.props.onShouldStartLoadWithRequest({ url: 'https://evil.test/app-redirect' }), false);
+  const loginUrl = 'https://ids.xmu.edu.cn/authserver/login?service=school';
+  web.props.onLoadStart({ nativeEvent: androidNavigation(loginUrl) });
+  web.props.onLoadEnd({ nativeEvent: androidNavigation(loginUrl) });
+  const messages = [], location = new URL(loginUrl);
+  let loginForm = [];
+  const form = { action: loginUrl, querySelector: () => ({}), querySelectorAll: () => loginForm };
+  const globals = { location, document: { forms: [form] }, window: { ReactNativeWebView: { postMessage: value => messages.push(value) } },
+    getComputedStyle: () => ({ visibility: 'visible' }), URL };
+  runInNewContext(web.props.injectedJavaScript, globals);
+  assert.deepEqual(messages, [], 'passing through the identity URL alone does not require interaction');
+  loginForm = [{ getClientRects: () => [{}] }];
+  runInNewContext(web.props.injectedJavaScript, globals);
+  assert.equal(messages.length, 1);
+  web.props.onMessage({ nativeEvent: { data: messages[0], url: 'https://evil.test' } });
+  assert.equal(f.schoolBrowser.getSnapshot(), page.props.request);
+  web.props.onMessage({ nativeEvent: { data: messages[0], url: location.origin } });
+  assert.equal(host.SchoolBrowserHost(), null);
+  host.detach();
+  await pending;
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(f.cookieCalls, []);
+  const retry = f.schoolDevice.authenticate();
+  await tick();
+  assert.equal(host.SchoolBrowserHost().type, 'Modal');
+  f.schoolBrowser.cancel();
+  await assert.rejects(retry, { code: 'CANCELLED' });
+});
 
 test('one modal stays open across both pages, token exchange, LNT login and cookie persistence', async () => {
   const f = fixture(), host = browserHost(f), token = deferred(), lnt = deferred();
