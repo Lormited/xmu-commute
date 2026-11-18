@@ -5,6 +5,7 @@ import { numberReceipt, rollcallsFrom } from '../src/attendance.ts';
 import { schoolScheduleView } from '../src/schedule.ts';
 
 const profile = { id: 42, user_no: '001234', name: '测试同学' };
+const boundAccount = { lntId: 42, studentNumber: '001234', name: '测试同学' };
 const todo = { id: 7, course_id: 3, course_name: '测试课程', title: '学校待办', type: 'homework', end_time: '2026-11-10T12:00:00Z', is_locked: false };
 const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9, extra: 'preserved' };
 const terms = { datas: { kfdxnxqcx: { rows: [{ XNXQDM: '20261', XNXQDM_DISPLAY: '2026 秋季学期' }] } } };
@@ -13,15 +14,15 @@ const weeks = { success: true, currentZc: '8', zcList: Array.from({ length: 18 }
 const scheduleRow = { WID: 'row-1', BJDM: '001-A', KCMC: '学校课程', JASMC: '教学楼 101', JSXM: '张老师', XQ: '1', KSJCDM: '1', JSJCDM: '2', KSSJ: '0800', JSSJ: '0940', ZCMC: '1-2,7-9周', JCFADM: 'plan-a' };
 const schedulePeriods = [{ DM: '1', MC: '第一节', KSSJ: '0800', JSSJ: '0845', JCFADM: 'plan-a' }, { DM: '2', MC: '第二节', KSSJ: '0855', JSSJ: '0940', JCFADM: 'plan-a' }];
 const schoolData = action => ({ profile, todos: { todo_list: [todo] }, rollcalls: { rollcalls: [] }, lntTerms, jwTerms: terms, jwWeek: weeks, courses: { courses: [course] }, history: { rollcalls: [] }, jwSchedule: { success: true, pkjgList: [scheduleRow] } })[action];
-const previous = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [todo], todosAt: 1000 });
+const previous = JSON.stringify({ version: 1, account: boundAccount, todos: [todo], todosAt: 1000 });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
-function fixture(raw = null) {
+function fixture(raw = null, account = raw ? boundAccount : null) {
   const calls = [];
   const device = {
-    load: async () => { calls.push('load'); return raw; },
+    load: async () => { calls.push('load'); return { raw, account }; },
     save: async value => { calls.push('save'); raw = value; },
-    clear: async () => { calls.push('clear'); raw = null; },
+    clear: async () => { calls.push('clear'); raw = null; account = null; },
     authenticate: async callback => { calls.push('authenticate'); callback?.(); },
     read: async action => { calls.push(action); return schoolData(action); },
   };
@@ -88,15 +89,45 @@ test('reopen publishes cache before one refresh; old test formats are discarded'
   assert.deepEqual(f.learning.getSnapshot().todos, []);
   assert.equal(f.calls.filter(x => x === 'load').length, 1, 'saving does not read the file back');
   for (const raw of ['{}', JSON.stringify({ accounts: {}, activeStudentNumber: '001234' }), JSON.stringify({ account: { studentNumber: '001234' }, todos: [] })]) {
-    const old = fixture(raw); await old.learning.restore();
+    const old = fixture(raw, null); await old.learning.restore();
     assert.equal(old.learning.getSnapshot().account, null);
     assert.equal(old.learning.getSnapshot().authenticated, false);
     assert.equal(old.learning.getSnapshot().ready, true);
   }
-  const malformed = fixture(JSON.stringify({ ...JSON.parse(previous), account: 'invalid' }));
+  const malformed = fixture(JSON.stringify({ ...JSON.parse(previous), account: 'invalid' }), null);
   await malformed.learning.restore();
   assert.equal(malformed.learning.getSnapshot().account, null);
   assert.match(malformed.learning.getSnapshot().message, /读取失败/);
+});
+test('legacy cache without a bound account remains visible and requires manual login', async () => {
+  const f = fixture(previous, null); await f.learning.restore();
+  const restored = f.learning.getSnapshot();
+  assert.deepEqual(restored.todos, [todo]);
+  assert.equal(restored.todosAt, 1000);
+  assert.equal(restored.authenticated, false);
+  assert.equal(restored.needsLogin, true);
+  assert.equal(await f.learning.refresh(), false);
+  assert.equal(await f.learning.refreshHistory(), false);
+  assert.deepEqual(f.calls, ['load']);
+  assert.equal(f.stored(), previous);
+  assert.equal(await f.learning.login(), true);
+});
+test('a bound account without a business batch can refresh without inventing cache timestamps', async () => {
+  const f = fixture(null, boundAccount); await f.learning.restore();
+  const restored = f.learning.getSnapshot();
+  assert.deepEqual(f.calls, ['load']);
+  assert.equal(restored.authenticated, true);
+  assert.equal(restored.needsLogin, false);
+  assert.deepEqual([restored.todosAt, restored.coursesAt, restored.scheduleAt, restored.historyAt], [null, null, null, null]);
+  assert.equal(f.stored(), null);
+  const read = f.device.read;
+  f.device.read = (action, params, account) => {
+    assert.deepEqual(account, boundAccount);
+    return read(action, params);
+  };
+  assert.equal(await f.learning.refresh(), true);
+  assert.deepEqual(f.calls, ['load', 'profile', 'todos', 'rollcalls', 'lntTerms', 'courses', 'save']);
+  assert.equal(f.learning.getSnapshot().todosAt, 2000);
 });
 test('first business read or save failure keeps authentication and ordinary refresh recovers', async () => {
   for (const failure of ['profile', 'todos', 'rollcalls', 'jwTerms', 'jwWeek', 'courses', 'jwSchedule', 'history', 'save']) {
@@ -152,7 +183,7 @@ test('late authentication, reads, saves, and restores cannot undo logout', async
     if (phase !== 'load') await f.learning.restore();
     if (phase === 'read') f.device.read = async () => { await gate.promise; return profile; };
     if (phase === 'save') { const save = f.device.save; f.device.save = async value => { await gate.promise; await save(value); }; }
-    if (phase === 'load') f.device.load = async () => { await gate.promise; return previous; };
+    if (phase === 'load') f.device.load = async () => { await gate.promise; return { raw: previous, account: boundAccount }; };
     if (phase === 'authenticate') f.device.authenticate = async callback => { await gate.promise; callback?.(); };
     const pending = phase === 'load' ? f.learning.restore() : phase === 'authenticate' ? f.learning.login() : f.learning.refresh();
     await tick();
@@ -313,7 +344,8 @@ test('empty school courses and todos are saved independently and damaged course 
   ]) {
     const raw = JSON.stringify({ ...saved, ...patch }), broken = fixture(raw);
     await broken.learning.restore();
-    assert.equal(broken.learning.getSnapshot().authenticated, false);
+    assert.equal(broken.learning.getSnapshot().authenticated, true, 'a damaged cache does not invalidate the bound account');
+    assert.equal(broken.learning.getSnapshot().account, null);
     assert.match(broken.learning.getSnapshot().message, /读取失败/);
     assert.equal(broken.stored(), raw);
   }
@@ -509,6 +541,34 @@ async function attendanceFixture() {
   assert.equal(await f.learning.refresh(), true);
   return f;
 }
+
+test('a different bound account can refresh without using another account’s saved scope', async () => {
+  const initial = await attendanceFixture();
+  assert.equal(await initial.learning.login(), true);
+  const saved = initial.stored();
+  const account = { lntId: 99, studentNumber: '009999', name: '另一同学' };
+  const f = fixture(saved, account); await f.learning.restore();
+  assert.deepEqual(f.learning.getSnapshot().account, boundAccount);
+  assert.equal(f.learning.getSnapshot().authenticated, true);
+  assert.ok(f.learning.getSnapshot().schedule);
+  assert.equal(await f.learning.refreshHistory(), false);
+  f.device.answerNumber = async () => { f.calls.push('answerNumber'); return { result: 'success' }; };
+  assert.equal((await f.learning.submitNumber('81', '0007')).result, 'failed');
+  assert.equal(await f.learning.setRefreshSchedule(true), false);
+  assert.deepEqual(f.calls, ['load']);
+  assert.equal(f.stored(), saved);
+  const read = f.device.read;
+  f.device.read = async (action, params, expected) => {
+    assert.deepEqual(expected, account);
+    return action === 'profile' ? { id: 99, user_no: '009999', name: '另一同学' } : read(action, params);
+  };
+  assert.equal(await f.learning.refresh(), true);
+  const refreshed = f.learning.getSnapshot();
+  assert.deepEqual(refreshed.account, account);
+  assert.deepEqual([refreshed.scheduleAt, refreshed.historyAt], [null, null]);
+  assert.equal(refreshed.schedule, null);
+  assert.deepEqual(refreshed.rollcalls, []);
+});
 
 test('school activities preserve identities, names and methods; malformed collections cannot clear the batch', async () => {
   assert.deepEqual(rollcallsFrom({ rollcalls: schoolRollcalls }).map(({ id, courseId, title, method }) => ({ id, courseId, title, method })), [
@@ -760,12 +820,12 @@ test('timetable refresh setting defaults off and reopens without authenticating 
   assert.equal(f.learning.getSnapshot().refreshSchedule, false);
   assert.equal(await f.learning.setRefreshSchedule(true), true);
   assert.deepEqual(JSON.parse(f.stored()), { version: 1, refreshSchedule: true });
-  const reopened = fixture(f.stored()); await reopened.learning.restore();
+  const reopened = fixture(f.stored(), null); await reopened.learning.restore();
   assert.equal(reopened.learning.getSnapshot().refreshSchedule, true);
   assert.equal(reopened.learning.getSnapshot().authenticated, false);
   assert.deepEqual(reopened.calls, ['load']);
   assert.equal(await reopened.learning.setRefreshSchedule(false), true);
-  const disabled = fixture(reopened.stored()); await disabled.learning.restore();
+  const disabled = fixture(reopened.stored(), null); await disabled.learning.restore();
   assert.equal(disabled.learning.getSnapshot().refreshSchedule, false);
   const existing = fixture(previous); await existing.learning.restore();
   assert.equal(existing.learning.getSnapshot().refreshSchedule, false);
@@ -865,7 +925,8 @@ test('legacy cache keeps timetable dates, history and update time across ordinar
       courses: [{ ...course, semester: { code: '2026-1' } }] }), reopened = fixture(raw);
     await reopened.learning.restore();
     const data = reopened.learning.getSnapshot();
-    assert.equal(data.authenticated, schedule === null, 'only a timetable needs a valid calendar');
+    assert.equal(data.authenticated, true);
+    assert.equal(!!data.account, schedule === null, 'only a timetable needs a valid calendar');
     if (schedule === null) {
       assert.deepEqual(data.term, { id: 9, name: legacy.term.name });
       assert.deepEqual(data.history, legacy.history);

@@ -282,7 +282,7 @@ async function realScreen(reply = async () => ({ result: 'success', message: '�
     { rollcall_id: 82, course_id: 301, course_title: '同课另一个活动', is_number: true },
   ];
   const device = {
-    load: async () => null, save: async () => {}, clear: async () => {}, authenticate: async callback => callback?.(),
+    load: async () => ({ raw: null, account: null }), save: async () => {}, clear: async () => {}, authenticate: async callback => callback?.(),
     read: async action => ({
       profile: { id: 42, user_no: '001234' }, todos: { todo_list: [] }, rollcalls: { rollcalls: activities },
       lntTerms: { semesters: [{ id: 9, name: 'LNT 当前学期', is_active: true }] },

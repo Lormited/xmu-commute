@@ -8,7 +8,7 @@
     "start": "node --dns-result-order=ipv4first ./node_modules/expo/bin/cli start --localhost --port 1100",
     "web": "node --dns-result-order=ipv4first ./node_modules/expo/bin/cli start --web --host localhost --port 1100",
     "phone": "node --dns-result-order=ipv4first ./node_modules/expo/bin/cli start --go --lan --port 1100",
-    "check": "tsc --noEmit && node --experimental-strip-types tests/selfcheck.mjs && node --experimental-strip-types tests/attendance-selfcheck.mjs && node --experimental-strip-types tests/learning-selfcheck.mjs && node --experimental-strip-types tests/schedule-selfcheck.mjs && node --experimental-strip-types tests/history-selfcheck.mjs && node --experimental-strip-types tests/school-browser-selfcheck.mjs && node --experimental-strip-types tests/qr-camera-selfcheck.mjs && node --experimental-strip-types tests/notifications-selfcheck.mjs",
+    "check": "tsc --noEmit && node --experimental-strip-types tests/selfcheck.mjs && node --experimental-strip-types tests/attendance-selfcheck.mjs && node --experimental-strip-types tests/learning-selfcheck.mjs && node --experimental-strip-types tests/schedule-selfcheck.mjs && node --experimental-strip-types tests/history-selfcheck.mjs && node --experimental-strip-types tests/school-cookies-selfcheck.mjs && node --experimental-strip-types tests/school-browser-selfcheck.mjs && node --experimental-strip-types tests/qr-camera-selfcheck.mjs && node --experimental-strip-types tests/notifications-selfcheck.mjs",
     "export:web": "expo export --platform web",
     "export:all": "expo export --platform all --output-dir dist"
   },
@@ -28,6 +28,7 @@
     "expo-location": "~58.0.20",
     "expo-notifications": "~58.1.8",
     "expo-router": "~58.0.29",
+    "expo-secure-store": "~58.0.2",
     "expo-status-bar": "~58.0.4",
     "react": "19.3.0",
     "react-dom": "19.3.0",
@@ -40,7 +41,8 @@
     "react-native-svg": "15.16.0",
     "react-native-web": "^0.21.4",
     "react-native-webview": "14.0.1",
-    "react-native-worklets": "0.13.0"
+    "react-native-worklets": "0.13.0",
+    "tough-cookie": "6.1.0"
   },
   "devDependencies": {
     "@types/react": "^19.3.0",

@@ -14,7 +14,7 @@ const deferred = () => { let resolve; const promise = new Promise(r => { resolve
 function fixture(raw = JSON.stringify(saved)) {
   const calls = [];
   const device = {
-    load: async () => raw, save: async value => { raw = value; }, clear: async () => { raw = null; }, authenticate: async callback => callback?.(),
+    load: async () => ({ raw, account: raw ? saved.account : null }), save: async value => { raw = value; }, clear: async () => { raw = null; }, authenticate: async callback => callback?.(),
     read: async (action, params) => {
       calls.push([action, params]);
       if (action === 'history') return { rollcalls: params.courseId === 3 ? [record] : [{ ...record, rollcall_id: 12, student_rollcall_id: 112, rollcall_time: '2026-11-08T01:00:00Z', student_status: 'absent', status: 'absent', student_status_detail: '未到课堂', is_number: false, type: 'qr_rollcall' }] };
@@ -148,10 +148,10 @@ test('login history read, parse, and save failures retain the entire old batch, 
   }
 });
 
-test('history reads the current courses with the profile id, merges by time, and survives reopen and ordinary refresh', async () => {
+test('history reads the current courses with the bound account id, merges by time, and survives reopen and ordinary refresh', async () => {
   const f = fixture(); await f.learning.restore();
   assert.equal(await f.learning.refreshHistory(), true);
-  assert.deepEqual(f.calls, [['profile', undefined], ['history', { courseId: 3, studentId: 42 }], ['history', { courseId: 4, studentId: 42 }]]);
+  assert.deepEqual(f.calls, [['history', { courseId: 3, studentId: 42 }], ['history', { courseId: 4, studentId: 42 }]]);
   const snapshot = f.learning.getSnapshot();
   assert.deepEqual(snapshot.history.map(item => [item.course_id, item.rollcall_id, item.status, item.student_status_detail]), [[4, 12, 'absent', '未到课堂'], [3, 11, 'on_call_fine', null]]);
   assert.equal(snapshot.historyAt, 2000);

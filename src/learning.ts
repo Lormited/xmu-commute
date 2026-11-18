@@ -29,7 +29,7 @@ export type LearningSnapshot = {
   authenticated: boolean; ready: boolean; refreshing: boolean; loggingIn: boolean; message: string | null; needsLogin: boolean;
 };
 export type SchoolDevice = {
-  load(): Promise<string | null>;
+  load(): Promise<{ raw: string | null; account: Account | null }>;
   save(value: string): Promise<void>;
   clear(): Promise<void>;
   authenticate(onAuthorized?: () => void): Promise<void>;
@@ -193,7 +193,7 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
 export function createLearning(device: SchoolDevice, now = Date.now) {
   const empty = { account: null, todos: [], todosAt: null, term: null, courses: [], coursesAt: null, schedule: null, scheduleAt: null, history: [], historyAt: null, historyRefreshing: false, historyMessage: null, refreshSchedule: false, rollcalls: [], attendance: {}, pendingAttendance: {}, authenticated: false, ready: true, refreshing: false, loggingIn: false, message: null, needsLogin: false };
   let state: LearningSnapshot = { ...empty, ready: false };
-  let sessionAccount: Account | null | undefined;
+  let sessionAccount: Account | null = null;
   const listeners = new Set<() => void>();
   const publish = (patch: Partial<LearningSnapshot>) => { state = { ...state, ...patch }; listeners.forEach(listener => listener()); };
   let generation = 0;
@@ -207,7 +207,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
   let cleanupFailed = false;
   let restoreFailed = false;
   const current = (version: number) => generation === version;
-  const cacheMatches = (account: Account | null | undefined) => !!(state.account && account
+  const cacheMatches = (account: Account | null) => !!(state.account && account
     && (state.account.lntId !== null || state.account.studentNumber.trim()) && matchesLntAccount(state.account, account));
   const completed = () => ({ ...state.attendance, ...state.pendingAttendance });
   function rememberAttendance() {
@@ -226,11 +226,12 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     const version = generation;
     restoring = (async () => {
       try {
-        const raw = await device.load();
+        const { raw, account } = await device.load();
         if (!current(version)) return;
+        sessionAccount = account;
         const saved = raw ? cacheFrom(raw) : null;
-        if (saved) publish({ ...saved, authenticated: 'account' in saved });
-      } catch { if (current(version)) { restoreFailed = true; publish({ message: '学校本机数据读取失败，请重试或退出清理' }); } }
+        publish({ ...saved, authenticated: !!account, needsLogin: !account && !!saved && 'account' in saved });
+      } catch { if (current(version)) { restoreFailed = true; publish({ authenticated: !!sessionAccount, message: '学校本机数据读取失败，请重试或退出清理' }); } }
       if (current(version)) publish({ ready: true });
     })();
     return restoring;
@@ -266,7 +267,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         if (!current(version)) return false;
         publish({ refreshing: true });
         failure = 'LNT 个人资料读取失败，已保留原数据';
-        const expected = (sessionAccount === undefined ? state.account : sessionAccount) ?? undefined;
+        const expected = sessionAccount ?? undefined;
         const account = accountFrom(await device.read('profile', undefined, expected));
         if (!current(version)) return false;
         if (expected) assertLntAccount(expected, account);
@@ -369,7 +370,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     if (historyOperation) return historyOperation;
     if (!state.authenticated) return Promise.resolve(false);
     const { account, term, courses } = state;
-    if (!account || !Number.isSafeInteger(account.lntId) || !term || (sessionAccount !== undefined && !cacheMatches(sessionAccount))) {
+    const bound = sessionAccount;
+    if (!account || !Number.isSafeInteger(account.lntId) || !term || !bound || !cacheMatches(bound)) {
       publish({ historyMessage: '请先刷新个人资料和当前学期课程' });
       return Promise.resolve(false);
     }
@@ -378,13 +380,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     const task = (async () => {
       let failure = '历史签到读取失败，已保留原数据';
       try {
-        if (sessionAccount === undefined) {
-          const actual = accountFrom(await device.read('profile', undefined, account));
-          if (!current(version)) return false;
-          assertLntAccount(account, actual);
-          sessionAccount = actual;
-        }
-        const history = await readHistory(courses, sessionAccount ?? account);
+        const history = await readHistory(courses, bound);
         if (!current(version)) return false;
         const historyAt = now();
         failure = '历史签到保存失败，已保留原数据';
@@ -427,6 +423,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       const saved = writing.then(async () => {
         if (version !== identity || clearing || cleanupFailed || restoreFailed) return false;
         const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, rollcalls, history, historyAt } = state;
+        if (account && sessionAccount && !cacheMatches(sessionAccount)) return false;
         const data = account && todosAt !== null
           ? { version: 1, account, todos, todosAt, ...(term ? { term, courses, coursesAt, schedule, scheduleAt, history, historyAt } : {}), rollcalls, attendance: completed(), refreshSchedule: enabled }
           : { version: 1, refreshSchedule: enabled };
@@ -472,7 +469,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       const version = ++generation;
       identity++; submissions.clear();
       operation = null; historyOperation = null; restoring = null;
-      sessionAccount = undefined;
+      sessionAccount = null;
       publish(empty);
       const task = writing.then(() => device.clear());
       writing = task.catch(() => {});

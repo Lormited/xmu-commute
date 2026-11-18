@@ -3,7 +3,6 @@ export const CAS_LOGIN = 'https://ids.xmu.edu.cn/authserver/login';
 export const CALLBACK = 'https://c-mobile.xmu.edu.cn/identity-web-login-callback?_h5=true';
 export const JW_APP = 'https://jw.xmu.edu.cn/appShow?appId=4979568947762216';
 export const LNT_HOME = 'https://lnt.xmu.edu.cn/';
-export const LNT_LANDING = LNT_HOME + 'user/index';
 export function schoolUrl(value: string) {
   try {
     const url = new URL(value);
@@ -11,13 +10,7 @@ export function schoolUrl(value: string) {
       && (url.hostname === 'xmu.edu.cn' || url.hostname.endsWith('.xmu.edu.cn'));
   } catch { return false; }
 }
-export function identityPage(value: string) {
-  if (!schoolUrl(value)) return false;
-  const { origin, pathname } = new URL(value);
-  return origin + pathname === CAS_LOGIN
-    || origin === new URL(IDENTITY).origin && pathname.startsWith('/auth/realms/xmu/');
-}
-export type BrowserRequest = { url: string } & ({ kind: 'authorize' | 'academic' } | { kind: 'recovery'; challenge: string });
+export type BrowserRequest = { url: string; kind: 'authorize' | 'academic' };
 type BrowserState = BrowserRequest | { kind: 'pending' };
 type BrowserFailure = { nativeCode?: number; httpStatus?: number };
 export function createSchoolBrowser(onCancel?: () => void) {
@@ -31,16 +24,15 @@ export function createSchoolBrowser(onCancel?: () => void) {
     if (request !== expected) return;
     const pending = result;
     // Keep the modal open while each completed WebView is disposed and API work continues.
-    request = code || expected.kind === 'recovery' ? null : { kind: 'pending' }; result = null;
+    request = code ? null : { kind: 'pending' }; result = null;
     const settle = () => { if (code) pending?.reject(Object.assign(error(code), detail)); else pending?.resolve(value); };
     const waitForUnmount = mounted === expected;
     if (waitForUnmount) afterUnmount = settle;
     listeners.forEach(listener => listener());
     if (!waitForUnmount) settle();
   }
-  function start(page: BrowserRequest, signal?: AbortSignal) {
+  function start(page: BrowserRequest) {
     const { url, kind } = page;
-    if (signal?.aborted) return Promise.reject(error('CANCELLED'));
     if ((request && request.kind !== 'pending') || afterUnmount) return Promise.reject(error('BUSY'));
     if (!schoolUrl(url)) return Promise.reject(error('UNTRUSTED_LINK'));
     if (kind === 'authorize') {
@@ -49,13 +41,8 @@ export function createSchoolBrowser(onCancel?: () => void) {
         || !auth.searchParams.get('state')) return Promise.reject(error('INVALID_AUTHORIZATION'));
     }
     return new Promise<string>((resolve, reject) => {
-      const abort = () => finish(page, '', 'CANCELLED');
-      signal?.addEventListener('abort', abort, { once: true });
       request = page;
-      result = {
-        resolve(value) { signal?.removeEventListener('abort', abort); resolve(value); },
-        reject(cause) { signal?.removeEventListener('abort', abort); reject(cause); },
-      };
+      result = { resolve, reject };
       listeners.forEach(listener => listener());
     });
   }
@@ -75,7 +62,6 @@ export function createSchoolBrowser(onCancel?: () => void) {
     },
     authenticate: (url: string) => start({ url, kind: 'authorize' }),
     initializeAcademic: () => start({ url: JW_APP, kind: 'academic' }),
-    recover: (signal: AbortSignal, challenge: string) => start({ url: LNT_HOME, kind: 'recovery', challenge }, signal),
     navigating(expected: BrowserRequest, value: string) {
       if (request !== expected) return true;
       if (expected.kind !== 'authorize' || !schoolUrl(value)) return false;
@@ -95,18 +81,6 @@ export function createSchoolBrowser(onCancel?: () => void) {
       if (request !== expected || !schoolUrl(value)) return;
       const url = new URL(value);
       if (expected.kind === 'academic' && url.origin === 'https://jw.xmu.edu.cn' && url.pathname.startsWith('/gsapp/sys/wdkbapp/')) finish(expected);
-    },
-    recoveryDocument(expected: BrowserRequest, topUrl: string, { data, url: source }: { data: string; url: string }, confirm?: () => void) {
-      if (request !== expected || expected.kind !== 'recovery' || !schoolUrl(topUrl) || !schoolUrl(source)) return;
-      const top = new URL(topUrl);
-      const documentUrl = top.origin + top.pathname + top.search;
-      const bridgeUrl = new URL(source);
-      if (source !== top.origin && bridgeUrl.origin + bridgeUrl.pathname + bridgeUrl.search !== documentUrl) return;
-      const landing = top.origin + top.pathname === LNT_LANDING && data === JSON.stringify([expected.challenge, 'landing', documentUrl]);
-      const interaction = identityPage(topUrl) && data === JSON.stringify([expected.challenge, 'interaction', documentUrl]);
-      if (!landing && !interaction) return;
-      if (confirm) confirm();
-      else finish(expected, '', interaction ? 'AUTH_REQUIRED' : undefined);
     },
     fail(expected: BrowserRequest, code: string, detail?: BrowserFailure) { finish(expected, '', code, detail); },
     close,
