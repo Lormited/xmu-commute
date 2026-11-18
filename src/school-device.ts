@@ -2,7 +2,7 @@ import * as Crypto from 'expo-crypto';
 import { File, Paths } from 'expo-file-system';
 import { moveAsync } from 'expo-file-system/legacy';
 import { CALLBACK, CAS_LOGIN, IDENTITY, LNT_HOME, createSchoolBrowser, schoolUrl } from './school-browser';
-import type { Account, SchoolDevice } from './learning';
+import { assertLntAccount, type Account, type SchoolDevice } from './learning';
 import { numberReceipt } from './attendance.ts';
 import { isPosition } from './location-attendance.ts';
 import { qrReceipt } from './qr.ts';
@@ -80,10 +80,6 @@ function request(url: string, version: number, init: RequestInit = {}, { signal,
   void task.then(() => requests.delete(controller), () => requests.delete(controller));
   return task;
 }
-function checkRecoveryAccount(account: Account, recovered: LntIdentity) {
-  if ((account.lntId !== null && account.lntId !== recovered.lntId)
-    || (account.studentNumber && account.studentNumber !== recovered.studentNumber)) throw fail('AUTH_REQUIRED');
-}
 function recoverLnt(version: number, account: Account) {
   if (authenticating) throw fail('AUTH_REQUIRED');
   if (recovering) return recovering.result;
@@ -102,7 +98,7 @@ function recoverLnt(version: number, account: Account) {
       throw fail('INVALID_RESPONSE');
     }
     const recovered = { lntId: profile.id as number, studentNumber: profile.user_no };
-    checkRecoveryAccount(account, recovered);
+    assertLntAccount(account, recovered);
     const { default: cookies } = await import('@preeternal/react-native-cookie-manager');
     check(version, signal);
     try { await cookies.flush(); } catch { throw fail('COOKIE_STORAGE'); }
@@ -125,7 +121,7 @@ async function query(url: string, version: number, init: RequestInit, account?: 
     session.recovery ??= recoverLnt(version, account).finally(() => {
       if (lntSession === session) lntSession = {};
     });
-    checkRecoveryAccount(account, await session.recovery);
+    assertLntAccount(account, await session.recovery);
     return fetchQuery();
   }
 }

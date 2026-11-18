@@ -449,7 +449,7 @@ test('enabled timetable refresh isolates same-term accounts and failed reads ret
     { id: 99, user_no: '009999', name: '新账号' },
     { ...profile, user_no: '009999' },
     { ...profile, id: 99 },
-  ]) for (const initialFailure of [null, 'profile', 'jwSchedule']) {
+  ]) for (const initialFailure of ['profile', 'jwSchedule']) {
     const f = fixture(savedA); await f.learning.restore();
     let failedAction = initialFailure;
     const scheduleCalls = [];
@@ -467,14 +467,12 @@ test('enabled timetable refresh isolates same-term accounts and failed reads ret
         assert.deepEqual(f.learning.getSnapshot()[key], value, key);
       }
     };
-    if (initialFailure) {
-      assert.equal(await f.learning.login(), false);
-      assert.equal(f.learning.getSnapshot().authenticated, true);
-      assert.equal(f.learning.getSnapshot().needsLogin, false);
-      assertOldBatch();
-      assert.equal(await f.learning.refresh(), false, initialFailure);
-      assertOldBatch();
-    }
+    assert.equal(await f.learning.login(), false);
+    assert.equal(f.learning.getSnapshot().authenticated, true);
+    assert.equal(f.learning.getSnapshot().needsLogin, false);
+    assertOldBatch();
+    assert.equal(await f.learning.refresh(), false, initialFailure);
+    assertOldBatch();
     failedAction = null; scheduleCalls.length = 0; f.calls.length = 0;
     assert.equal(await f.learning.refresh(), true);
     assert.deepEqual(scheduleCalls, [
@@ -787,7 +785,7 @@ test('disabled ordinary refresh reads the core batch without timetable requests 
 });
 
 
-test('disabled refresh preserves a same-account timetable across LNT terms and clears it only for another account', async () => {
+test('disabled refresh preserves the timetable across terms and rejects another account', async () => {
   const initial = fixture(); initial.learning = createLearning(initial.device, () => 1000);
   assert.equal(await initial.learning.login(), true);
   const saved = initial.stored();
@@ -812,12 +810,16 @@ test('disabled refresh preserves a same-account timetable across LNT terms and c
     assert.equal(await f.learning.refresh(), false);
     assert.equal(f.stored(), saved);
     for (const key of ['account', 'term', 'courses', 'todos', 'rollcalls', 'schedule', 'scheduleAt']) assert.strictEqual(f.learning.getSnapshot()[key], before[key], key);
+    if (scenario.account !== profile) {
+      assert.equal(f.learning.getSnapshot().needsLogin, true);
+      assert.deepEqual(f.calls, ['load', 'profile']);
+      continue;
+    }
     failCourses = false;
     assert.equal(await f.learning.refresh(), true);
     const next = f.learning.getSnapshot();
-    const preserved = scenario.account === profile;
-    assert.deepEqual(next.schedule, preserved ? before.schedule : null);
-    assert.equal(next.scheduleAt, preserved ? before.scheduleAt : null);
+    assert.deepEqual(next.schedule, before.schedule);
+    assert.equal(next.scheduleAt, before.scheduleAt);
     assert.equal(next.todos[0].title, '新批待办');
     assert.equal(next.courses[0].name, '新批课程');
     assert.equal(next.account.lntId, scenario.account.id);
@@ -825,7 +827,7 @@ test('disabled refresh preserves a same-account timetable across LNT terms and c
     assert.equal(next.term.id, scenario.semesterId);
     const reopened = fixture(f.stored()); await reopened.learning.restore();
     assert.equal(reopened.learning.getSnapshot().authenticated, true);
-    assert.deepEqual(reopened.learning.getSnapshot().schedule, preserved ? before.schedule : null);
+    assert.deepEqual(reopened.learning.getSnapshot().schedule, before.schedule);
   }
 });
 

@@ -3,10 +3,10 @@ import { test } from 'node:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, webcrypto } from 'node:crypto';
 import React from 'react';
 import ts from 'typescript';
-import { createLearning, historyView, todoView } from '../src/learning.ts';
+import { assertLntAccount, createLearning, historyView, todoView } from '../src/learning.ts';
 import * as demoData from '../src/demo-data.ts';
 import * as demoState from '../src/demo-state.ts';
 import * as styleOptions from '../src/style-options.ts';
@@ -97,6 +97,7 @@ function fixture(files = new Map(), timers = {}) {
       digestStringAsync: async (_algorithm, text) => createHash('sha256').update(text).digest('base64'),
       CryptoDigestAlgorithm: { SHA256: 'SHA-256' }, CryptoEncoding: { BASE64: 'base64' } },
     './school-browser': browserModule,
+    './learning': { assertLntAccount },
     './attendance.ts': attendanceModule,
     './location-attendance.ts': locationModule,
     './qr.ts': qrModule,
@@ -264,6 +265,15 @@ test('a different recovery account cannot replace the cached or in-flight refres
     assert.equal(f.files.get('school-learning.json'), raw);
     assert.equal(f.calls.length, stage === 'profile' ? 2 : 3);
     assert.deepEqual(f.cookieCalls, []);
+
+    const reopened = fixture(f.files);
+    reopened.handler = f.handler;
+    await reopened.learning.restore();
+    assert.equal(await reopened.learning.refresh(), false, 'the next launch still requires explicit login');
+    assert.equal(reopened.learning.getSnapshot().needsLogin, true);
+    assert.deepEqual(reopened.learning.getSnapshot().account, before.account);
+    assert.equal(reopened.files.get('school-learning.json'), raw);
+    assert.deepEqual(reopened.calls.map(call => new URL(call.url).pathname), ['/api/profile']);
   }
 });
 
@@ -1087,8 +1097,8 @@ test('the real homepage refresh renders separate school activities and opens eac
 });
 
 function browserHost(f) {
-  const disposed = [], effects = [];
-  const pageRef = { stopLoading: () => disposed.push('stop'), clearHistory: () => disposed.push('history'),
+  const disposed = [], effects = [], probes = [];
+  const pageRef = { injectJavaScript: script => probes.push(script), stopLoading: () => disposed.push('stop'), clearHistory: () => disposed.push('history'),
     clearFormData: () => disposed.push('form'), clearCache: () => disposed.push('cache') };
   const host = loadModule('../src/school-browser-view.tsx', {
     react: { ...React, useRef: value => ({ current: value === null ? pageRef : value }),
@@ -1097,7 +1107,7 @@ function browserHost(f) {
     'react-native-webview': { __esModule: true, default: 'WebView' },
     './school-device': f, './school-browser': browserModule,
   }, { console: f.console });
-  return { ...host, disposed, detach: () => effects.splice(0).forEach(dispose => dispose()) };
+  return { ...host, disposed, probes, detach: () => effects.splice(0).forEach(dispose => dispose()) };
 }
 
 test('Android synthetic finish before a main-frame load error cannot complete recovery', async () => {
@@ -1110,6 +1120,7 @@ test('Android synthetic finish before a main-frame load error cannot complete re
   const navigation = androidNavigation('https://lnt.xmu.edu.cn/user/index#/');
   web.props.onLoadStart({ nativeEvent: navigation });
   web.props.onLoadEnd({ nativeEvent: navigation });
+  assert.deepEqual(host.probes, []);
   web.props.onError({ nativeEvent: { ...navigation, code: -2 } });
   host.detach();
   await pending;
@@ -1130,17 +1141,19 @@ test('legacy Android messages require a current top-document signal before recov
     return page.type(page.props).props;
   };
   const first = await mount();
-  function signals(web, url, mainFrame = true, readyState = 'complete') {
+  function documentAt(web, url, mainFrame = true, readyState = 'complete') {
     const messages = [];
     const location = new URL(url);
     const window = { ReactNativeWebView: { postMessage: value => messages.push(value) } };
     window.top = mainFrame ? window : {};
     const form = { action: loginUrl, querySelector: () => ({}), querySelectorAll: () => [{ getClientRects: () => [{}] }] };
-    runInNewContext(web.injectedJavaScript, { location, window, URL, document: { readyState, forms: [form] }, getComputedStyle: () => ({ visibility: 'visible' }) });
-    return messages;
+    const document = { readyState, forms: [form] };
+    const evaluate = script => runInNewContext(script, { location, window, URL, document, crypto: webcrypto, getComputedStyle: () => ({ visibility: 'visible' }) });
+    evaluate(web.injectedJavaScript);
+    return { messages, evaluate };
   }
   first.onLoadStart({ nativeEvent: androidNavigation(landingUrl) });
-  const previousLanding = signals(first, landingUrl)[0];
+  const previousLanding = documentAt(first, landingUrl).messages[0];
   first.onError({ nativeEvent: { ...androidNavigation(landingUrl), code: -2 } });
   host.detach();
   await expired;
@@ -1153,19 +1166,39 @@ test('legacy Android messages require a current top-document signal before recov
     web.onLoadStart({ nativeEvent: androidNavigation(loginUrl) });
     send('school-interaction-required', loginUrl);
     assert.equal(f.schoolBrowser.getSnapshot()?.kind, 'recovery', 'legacy bridge reports the top URL even for a subframe message');
-    assert.deepEqual(signals(web, loginUrl, false), []);
-    const [interaction] = signals(web, loginUrl);
+    assert.deepEqual(documentAt(web, loginUrl, false).messages, []);
+    const [interaction] = documentAt(web, loginUrl).messages;
     assert.equal(typeof interaction, 'string');
     web.onLoadStart({ nativeEvent: androidNavigation(landingUrl) });
-    const [landing] = signals(web, landingUrl);
+    const oldDocument = documentAt(web, landingUrl);
+    const [beforeReload] = oldDocument.messages;
+    send(beforeReload, landingUrl);
+    assert.equal(host.probes.length, 1);
+    oldDocument.evaluate(host.probes.shift());
+    const oldConfirmation = oldDocument.messages[1];
+    assert.equal(typeof oldConfirmation, 'string');
+    web.onLoadStart({ nativeEvent: androidNavigation(landingUrl) });
+    const currentDocument = documentAt(web, landingUrl);
+    const [landing] = currentDocument.messages;
     assert.equal(typeof landing, 'string');
     assert.notEqual(landing, previousLanding);
-    assert.deepEqual(signals(web, landingUrl, true, 'loading'), []);
+    assert.deepEqual(documentAt(web, landingUrl, true, 'loading').messages, []);
     send(previousLanding, landingUrl);
     send(interaction, new URL(landingUrl).origin);
     send(landing, 'https://lnt.xmu.edu.cn/app-redirect');
     assert.equal(f.schoolBrowser.getSnapshot()?.kind, 'recovery');
+    assert.deepEqual(host.probes, []);
+    send(oldConfirmation, landingUrl);
+    assert.equal(f.schoolBrowser.getSnapshot()?.kind, 'recovery', 'a reply queued before the reload cannot settle it');
+    send(beforeReload, landingUrl);
+    assert.equal(f.schoolBrowser.getSnapshot()?.kind, 'recovery', 'a same-URL reload invalidates the previous document report');
+    assert.equal(host.probes.length, 1);
+    currentDocument.evaluate(host.probes.shift());
+    assert.deepEqual(currentDocument.messages, [landing], 'the replacement document cannot confirm the old report');
     send(landing, landingUrl);
+    assert.equal(host.probes.length, 1);
+    currentDocument.evaluate(host.probes.shift());
+    send(currentDocument.messages[1], new URL(landingUrl).origin);
     assert.equal(f.schoolBrowser.getSnapshot(), null);
   } finally {
     f.schoolBrowser.close();
@@ -1197,7 +1230,7 @@ test('hidden recovery preserves official navigation and hands the recognized log
   const form = { action: loginUrl, querySelector: () => ({}), querySelectorAll: () => loginForm };
   const window = { ReactNativeWebView: { postMessage: value => messages.push(value) } };
   window.top = window;
-  const globals = { location, document: { readyState: 'complete', forms: [form] }, window,
+  const globals = { location, document: { readyState: 'complete', forms: [form] }, window, crypto: webcrypto,
     getComputedStyle: () => ({ visibility: 'visible' }), URL };
   runInNewContext(web.props.injectedJavaScript, globals);
   assert.deepEqual(messages, [], 'passing through the identity URL alone does not require interaction');
@@ -1207,6 +1240,10 @@ test('hidden recovery preserves official navigation and hands the recognized log
   web.props.onMessage({ nativeEvent: { data: messages[0], url: 'https://evil.test' } });
   assert.equal(f.schoolBrowser.getSnapshot(), page.props.request);
   web.props.onMessage({ nativeEvent: { data: messages[0], url: location.origin } });
+  assert.equal(host.probes.length, 1);
+  runInNewContext(host.probes.shift(), globals);
+  assert.equal(messages.length, 2);
+  web.props.onMessage({ nativeEvent: { data: messages[1], url: location.origin } });
   assert.equal(host.SchoolBrowserHost(), null);
   host.detach();
   await pending;

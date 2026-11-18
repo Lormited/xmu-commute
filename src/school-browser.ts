@@ -96,14 +96,17 @@ export function createSchoolBrowser(onCancel?: () => void) {
       const url = new URL(value);
       if (expected.kind === 'academic' && url.origin === 'https://jw.xmu.edu.cn' && url.pathname.startsWith('/gsapp/sys/wdkbapp/')) finish(expected);
     },
-    recoveryDocument(expected: BrowserRequest, topUrl: string, { data, url: source }: { data: string; url: string }) {
+    recoveryDocument(expected: BrowserRequest, topUrl: string, { data, url: source }: { data: string; url: string }, confirm?: () => void) {
       if (request !== expected || expected.kind !== 'recovery' || !schoolUrl(topUrl) || !schoolUrl(source)) return;
       const top = new URL(topUrl);
       const documentUrl = top.origin + top.pathname + top.search;
       const bridgeUrl = new URL(source);
       if (source !== top.origin && bridgeUrl.origin + bridgeUrl.pathname + bridgeUrl.search !== documentUrl) return;
-      if (top.origin + top.pathname === LNT_LANDING && data === JSON.stringify([expected.challenge, 'landing', documentUrl])) finish(expected);
-      if (identityPage(topUrl) && data === JSON.stringify([expected.challenge, 'interaction', documentUrl])) finish(expected, '', 'AUTH_REQUIRED');
+      const landing = top.origin + top.pathname === LNT_LANDING && data === JSON.stringify([expected.challenge, 'landing', documentUrl]);
+      const interaction = identityPage(topUrl) && data === JSON.stringify([expected.challenge, 'interaction', documentUrl]);
+      if (!landing && !interaction) return;
+      if (confirm) confirm();
+      else finish(expected, '', interaction ? 'AUTH_REQUIRED' : undefined);
     },
     fail(expected: BrowserRequest, code: string, detail?: BrowserFailure) { finish(expected, '', code, detail); },
     close,

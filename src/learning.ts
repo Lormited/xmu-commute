@@ -65,6 +65,12 @@ function accountFrom(value: unknown): Account {
   if (!p || typeof p !== 'object' || Array.isArray(p) || p.success === false) throw Error('INVALID_PROFILE');
   return { lntId: Number.isSafeInteger(p.id) ? p.id as number : null, studentNumber: typeof p.user_no === 'string' ? p.user_no : '', name: typeof p.name === 'string' ? p.name : '' };
 }
+export function assertLntAccount(expected: Account, actual: Pick<Account, 'lntId' | 'studentNumber'>) {
+  if ((expected.lntId !== null && expected.lntId !== actual.lntId)
+    || (expected.studentNumber && expected.studentNumber !== actual.studentNumber)) {
+    throw Object.assign(Error('AUTH_REQUIRED'), { code: 'AUTH_REQUIRED' });
+  }
+}
 function todosFrom(value: unknown): SchoolTodo[] {
   const list = (value as { todo_list?: unknown } | null)?.todo_list;
   if ((value as { success?: unknown } | null)?.success === false || !Array.isArray(list) || !list.every(item => item && Number.isSafeInteger(item.id) && Number.isSafeInteger(item.course_id)
@@ -181,6 +187,7 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
 export function createLearning(device: SchoolDevice, now = Date.now) {
   const empty = { account: null, todos: [], todosAt: null, term: null, courses: [], coursesAt: null, schedule: null, scheduleAt: null, history: [], historyAt: null, historyRefreshing: false, historyMessage: null, refreshSchedule: false, rollcalls: [], attendance: {}, pendingAttendance: {}, authenticated: false, ready: true, refreshing: false, loggingIn: false, message: null, needsLogin: false };
   let state: LearningSnapshot = { ...empty, ready: false };
+  let sessionAccount: Account | null | undefined;
   const listeners = new Set<() => void>();
   const publish = (patch: Partial<LearningSnapshot>) => { state = { ...state, ...patch }; listeners.forEach(listener => listener()); };
   let generation = 0;
@@ -244,14 +251,18 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         if (login) await device.authenticate(() => {
           if (!current(version)) return;
           authorized = true;
+          sessionAccount = null;
           publish({ authenticated: true, needsLogin: false });
           onAuthorized?.();
         });
         if (!current(version)) return false;
         publish({ refreshing: true });
         failure = 'LNT 个人资料读取失败，已保留原数据';
-        const account = accountFrom(await device.read('profile', undefined, login ? undefined : state.account ?? undefined));
+        const expected = (sessionAccount === undefined ? state.account : sessionAccount) ?? undefined;
+        const account = accountFrom(await device.read('profile', undefined, expected));
         if (!current(version)) return false;
+        if (expected) assertLntAccount(expected, account);
+        sessionAccount = account;
         failure = 'LNT 待办更新失败，已保留原数据';
         const todos = todosFrom(await device.read('todos', undefined, account));
         if (!current(version)) return false;
@@ -443,6 +454,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       const version = ++generation;
       identity++; submissions.clear();
       operation = null; historyOperation = null; restoring = null;
+      sessionAccount = undefined;
       publish(empty);
       const task = writing.then(() => device.clear());
       writing = task.catch(() => {});
