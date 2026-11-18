@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { posix } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import React from 'react';
@@ -30,6 +31,7 @@ const academicTerms = { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '测试�
 const profile = { id: 42, user_no: '001234', name: '测试同学' };
 const recoveryAccount = { lntId: 42, studentNumber: '001234', name: '测试同学' };
 const cacheName = 'school-learning.json';
+const retiredPrefs = '../shared_prefs/SecureStore.xml';
 const savedSession = f => JSON.parse(f.files.get(cacheName) ?? 'null')?.session;
 const lntRoot = 'https://lnt.xmu.edu.cn/';
 const rollcallsUrl = lntRoot + 'api/radar/rollcalls?api_version=1.1.0';
@@ -65,15 +67,16 @@ function response(url, body, status = 200, contentType = 'application/json', hea
 const redirect = (url, location, headers = []) => response(url, '', 302, 'text/html', [['location', location], ...headers]);
 const requestCookie = call => new Headers(call.options.headers).get('cookie') ?? '';
 const requestPaths = f => f.calls.map(call => new URL(call.url).pathname);
-function fixture(files = new Map(), { timers = {} } = {}) {
+function fixture(files = new Map(), { timers = {}, platform = 'android' } = {}) {
   const calls = [], cookieCalls = [], cacheMoves = [], logs = [];
   const cookies = new Map(webCookies.map(cookie => [cookie.name, cookie]));
+  const document = '/private/app/files';
   const f = { files, calls, cookieCalls, cacheMoves, cookies, logs, cookieLoads: 0, cookieUnavailable: false,
-    failWrite: false, failMove: false, failClear: false, failFlush: false, failCapture: false, failDelete: false,
+    failWrite: false, failMove: false, failClear: false, failFlush: false, failCapture: false, failDelete: null,
     failCrypto: false, flushGate: null, writeGate: null, moveGate: null, beforeMove: null, handler: null,
     console: Object.fromEntries(['info', 'warn'].map(level => [level, (...args) => logs.push([level, ...args])])) };
   class File {
-    constructor(_root, name) { this.name = name; }
+    constructor(root, name) { this.name = posix.relative(document, posix.resolve(root, name)); }
     get uri() { return this.name; }
     get exists() { return files.has(this.name); }
     async text() { return files.get(this.name); }
@@ -82,7 +85,7 @@ function fixture(files = new Map(), { timers = {} } = {}) {
       if (f.failWrite) throw Error('DISK');
       files.set(this.name, value);
     }
-    delete() { if (f.failDelete && this.name === 'school-learning.json') throw Error('DISK'); files.delete(this.name); }
+    delete() { if (f.failDelete === this.name) throw Error('DISK'); files.delete(this.name); }
   }
   const fetch = async (url, options) => {
     url = String(url);
@@ -122,7 +125,8 @@ function fixture(files = new Map(), { timers = {} } = {}) {
         clearAllStores: async () => { cookieCalls.push('clearAllStores'); if (f.failClear) throw Error('COOKIE_STORAGE'); cookies.clear(); return true; },
       } };
     },
-    'expo-file-system': { File, Paths: { document: '/private/app' } },
+    'react-native': { Platform: { OS: platform } },
+    'expo-file-system': { File, Paths: { document } },
     'expo-file-system/legacy': { moveAsync: async ({ from, to }) => {
       f.beforeMove?.();
       if (f.moveGate) await f.moveGate.promise;
@@ -512,18 +516,24 @@ test('recovery timeout retains the previous session on restart after a late scho
   }
 });
 
-test('a renewal that crosses its deadline during storage keeps the prior session and skips replay', async () => {
+test('a renewal that crosses its deadline during staging keeps the prior session and skips replay', async () => {
   let now = Date.now();
   class Clock extends Date { static now() { return now; } }
   const f = await boundFixture(new Map(), { timers: { Date: Clock } });
   const previous = f.files.get(cacheName);
+  const stage = deferred();
+  f.writeGate = stage;
   f.handler = async url => {
     if (url.includes('/todos')) return response(url, {}, 401);
     if (url === lntRoot) return redirect(url, '/user/index', [['Set-Cookie', 'lnt_session=late; Path=/; Secure']]);
   };
-  f.beforeMove = () => { now += 30_001; };
-  await assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'AUTH_REQUIRED' });
+  const read = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'AUTH_REQUIRED' });
+  await tick();
+  now += 30_001;
+  stage.resolve();
+  await read;
   assert.equal(f.calls.filter(call => call.url.includes('/todos')).length, 1);
+  assert.deepEqual(f.cacheMoves, []);
   assert.equal(f.files.get(cacheName), previous);
   assert.equal(f.files.has('school-learning.tmp'), false);
   const reopened = fixture(f.files);
@@ -532,27 +542,49 @@ test('a renewal that crosses its deadline during storage keeps the prior session
   assert.match(requestCookie(reopened.calls[0]), /lnt_session=web-lnt/);
 });
 
-test('a failed cache replacement leaves the previous account session restorable', async () => {
-  const f = await boundFixture();
-  f.handler = async url => {
-    if (url.includes('/todos')) return response(url, {}, 401);
-    if (url === lntRoot) return redirect(url, '/user/index', [['Set-Cookie', 'lnt_session=replacement; Path=/; Secure']]);
-  };
-  f.failMove = true;
-  await assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'COOKIE_STORAGE' });
-  assert.equal(f.calls.filter(call => call.url.includes('/todos')).length, 1);
-  const reopened = fixture(f.files);
-  await reopened.schoolDevice.load();
-  await reopened.schoolDevice.read('todos');
-  assert.match(requestCookie(reopened.calls[0]), /lnt_session=web-lnt/);
-  await reopened.schoolDevice.clear();
-  assert.equal(f.files.size, 0);
+test('a dispatched renewal replacement settles past the deadline before retrying or reporting disk failure', async () => {
+  for (const failMove of [false, true]) {
+    let now = Date.now();
+    class Clock extends Date { static now() { return now; } }
+    const timers = new Map(), gate = deferred();
+    const f = await boundFixture(undefined, { timers: {
+      Date: Clock,
+      setTimeout(fn) { const key = Symbol(); timers.set(key, fn); return key; },
+      clearTimeout(key) { timers.delete(key); },
+    } });
+    f.moveGate = gate;
+    f.failMove = failMove;
+    let attempts = 0;
+    f.handler = async url => {
+      if (url.includes('/todos') && ++attempts === 1) return response(url, {}, 401);
+      if (url === lntRoot) return redirect(url, '/user/index', [['Set-Cookie', 'lnt_session=renewed; Path=/; Secure']]);
+    };
+    const read = f.schoolDevice.read('todos', undefined, recoveryAccount);
+    const outcome = failMove ? assert.rejects(read, { code: 'COOKIE_STORAGE' }) : read;
+    void outcome.catch(() => {});
+    await tick();
+    try {
+      assert.equal(f.files.has('school-learning.tmp'), true);
+      assert.equal(timers.size, 0, 'the renew deadline ends at dispatch');
+      now += 30_001;
+      assert.equal(attempts, 1);
+    } finally { gate.resolve(); }
+    await outcome;
+    assert.equal(attempts, failMove ? 1 : 2);
+    assert.deepEqual(f.cacheMoves, failMove ? [] : [cacheName]);
+    assert.equal(f.files.has('school-learning.tmp'), false);
+    const reopened = fixture(f.files);
+    await reopened.schoolDevice.load();
+    await reopened.schoolDevice.read('todos');
+    assert.equal(requestCookie(reopened.calls[0]), `lnt_session=${failMove ? 'web-lnt' : 'renewed'}`);
+  }
 });
 
-test('logout cancels recovery and drains pending navigation before removing the cache and WebView cookies', async () => {
-  for (const stalledUrl of [lntRoot, lntRoot + 'user/index']) {
+test('logout cancels recovery and drains pending navigation or replacement before clearing the cache and WebView cookies', async () => {
+  for (const stalledUrl of [lntRoot, lntRoot + 'user/index', null]) {
     const gate = deferred();
     const f = await boundFixture();
+    if (!stalledUrl) f.moveGate = gate;
     f.handler = async url => {
       if (url.includes('/todos')) return response(url, {}, 401);
       if (url === stalledUrl) await gate.promise;
@@ -568,10 +600,12 @@ test('logout cancels recovery and drains pending navigation before removing the 
       assert.deepEqual(f.cacheMoves, []);
       assert.equal(f.cookieCalls.includes('clearAllStores'), false);
       assert.equal(f.files.get('school-logout'), 'pending');
-      assert.equal(f.calls.at(-1).options.signal.aborted, true);
+      if (stalledUrl) assert.equal(f.calls.at(-1).options.signal.aborted, true);
+      else assert.equal(f.files.has('school-learning.tmp'), true);
     } finally { gate.resolve(); }
     await Promise.all([read, answer]);
     assert.equal(await logout, true);
+    assert.deepEqual(f.cacheMoves, stalledUrl ? [] : [cacheName]);
     assert.equal(f.files.size, 0);
     assert.equal(f.cookies.size, 0);
     assert.deepEqual(f.cookieCalls, ['clearAllStores']);
@@ -1072,6 +1106,21 @@ test('QR PUT preserves opaque data, shares the session and only accepts HTTP 200
     assert.equal(f.calls.length, 1); assert.equal(f.logs.length, 0);
   }
 });
+test('Android logout removes only the retired SecureStore preferences and their backup', async () => {
+  for (const platform of ['android', 'web']) {
+    const files = new Map([[retiredPrefs, 'legacy'], [retiredPrefs + '.bak', 'backup'], ['../shared_prefs/other.xml', 'other'], ['SecureStore.xml', 'unrelated']]);
+    const f = await boundFixture(files, { platform });
+    await f.schoolDevice.clear();
+    assert.equal(files.has(retiredPrefs), platform !== 'android');
+    assert.equal(files.has(retiredPrefs + '.bak'), platform !== 'android');
+    assert.equal(files.get('../shared_prefs/other.xml'), 'other');
+    assert.equal(files.get('SecureStore.xml'), 'unrelated');
+    assert.equal(files.has(cacheName), false);
+    assert.equal(files.has('school-logout'), false);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
 test('logout drains late requests before removing both sessions; pending logout survives reopen', async () => {
   const f = fixture(), gate = deferred();
   f.handler = async url => { if (url.endsWith('/token')) { await gate.promise; f.cookies.set('late', 'late-session'); return response(url, { access_token: 'late-token' }); } };
@@ -1085,8 +1134,10 @@ test('logout drains late requests before removing both sessions; pending logout 
   assert.equal(f.cookies.size, 0, 'a late response cannot restore cookies after logout');
   assert.equal(f.schoolBrowser.getSnapshot(), null);
   assert.equal(f.calls.length, 1);
-  for (const failed of ['failClear', 'failDelete']) {
-    const broken = await boundFixture(); broken[failed] = true;
+  for (const blockedFile of [null, cacheName, retiredPrefs]) {
+    const broken = await boundFixture(new Map([[retiredPrefs, 'legacy']]));
+    broken.failClear = blockedFile === null;
+    broken.failDelete = blockedFile;
     await assert.rejects(broken.schoolDevice.clear(), { code: 'CLEANUP_FAILED' });
     assert.equal(broken.files.get('school-logout'), 'pending');
     assert.equal(broken.cookieCalls.includes('clearAllStores'), true, 'file errors do not skip session removal');
@@ -1481,28 +1532,38 @@ test('cancelling manual verification preserves the previous session on restart',
   assert.match(requestCookie(reopened.calls[0]), /lnt_session=web-lnt/);
 });
 
-test('cancelling manual login during staging or replacement never admits the candidate', async () => {
-  for (const phase of ['writeGate', 'moveGate']) {
+test('Android Back cancels login staging but waits for a dispatched replacement to settle', async () => {
+  for (const [phase, failMove] of [['writeGate', false], ['moveGate', false], ['moveGate', true]]) {
     const f = await boundFixture(), gate = deferred();
+    const host = browserHost(f);
     const previous = f.files.get(cacheName);
+    const committing = phase === 'moveGate';
+    const succeeds = committing && !failMove;
     let authorized = 0;
     f[phase] = gate;
+    f.failMove = failMove;
     const login = f.learning.login(() => authorized++);
     await authorize(f); await initialize(f);
     try {
-      assert.equal(f.schoolBrowser.getSnapshot()?.kind, 'pending');
-      assert.equal(f.files.has('school-learning.tmp'), phase === 'moveGate');
+      const modal = host.SchoolBrowserHost();
+      assert.equal(modal.type, 'Modal');
+      assert.equal(f.files.has('school-learning.tmp'), committing);
       assert.equal(f.files.get(cacheName), previous);
-      f.schoolBrowser.cancel();
+      modal.props.onRequestClose();
+      assert.equal(host.SchoolBrowserHost()?.type ?? null, committing ? modal.type : null);
+      assert.equal(authorized, 0);
     } finally { gate.resolve(); }
-    assert.equal(await login, false);
-    assert.equal(authorized, 0);
-    assert.equal(f.files.get(cacheName), previous);
+    assert.equal(await login, succeeds);
+    assert.equal(authorized, Number(succeeds));
+    assert.deepEqual(f.cacheMoves, succeeds ? [cacheName, cacheName] : []);
+    if (!succeeds) assert.equal(f.files.get(cacheName), previous);
+    if (failMove) assert.equal(f.logs.find(([, tag]) => tag === '[school-login]')?.[2].code, 'COOKIE_STORAGE');
+    assert.equal(host.SchoolBrowserHost(), null);
     assert.equal(f.files.has('school-learning.tmp'), false);
     const reopened = fixture(f.files);
     await reopened.schoolDevice.load();
     await reopened.schoolDevice.read('todos');
-    assert.equal(requestCookie(reopened.calls[0]), 'lnt_session=web-lnt');
+    assert.equal(requestCookie(reopened.calls[0]), `lnt_session=${succeeds ? 'manual-lnt' : 'web-lnt'}`);
   }
 });
 

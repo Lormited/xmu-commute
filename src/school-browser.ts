@@ -18,6 +18,7 @@ export function createSchoolBrowser(onCancel?: () => void) {
   let result: { resolve(value: string): void; reject(error: Error): void } | null = null;
   let mounted: BrowserRequest | null = null;
   let afterUnmount: (() => void) | null = null;
+  let committing = false;
   const listeners = new Set<() => void>();
   const error = (code: string) => Object.assign(Error(code), { code });
   function finish(expected: BrowserState, value = '', code?: string, detail?: BrowserFailure) {
@@ -33,7 +34,7 @@ export function createSchoolBrowser(onCancel?: () => void) {
   }
   function start(page: BrowserRequest) {
     const { url, kind } = page;
-    if ((request && request.kind !== 'pending') || afterUnmount) return Promise.reject(error('BUSY'));
+    if (committing || (request && request.kind !== 'pending') || afterUnmount) return Promise.reject(error('BUSY'));
     if (!schoolUrl(url)) return Promise.reject(error('UNTRUSTED_LINK'));
     if (kind === 'authorize') {
       const auth = new URL(url);
@@ -46,7 +47,10 @@ export function createSchoolBrowser(onCancel?: () => void) {
       listeners.forEach(listener => listener());
     });
   }
-  function close() { if (request) finish(request, '', 'CANCELLED'); }
+  function close() {
+    committing = false;
+    if (request) finish(request, '', 'CANCELLED');
+  }
   return {
     getSnapshot: () => request,
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
@@ -83,7 +87,8 @@ export function createSchoolBrowser(onCancel?: () => void) {
       if (expected.kind === 'academic' && url.origin === 'https://jw.xmu.edu.cn' && url.pathname.startsWith('/gsapp/sys/wdkbapp/')) finish(expected);
     },
     fail(expected: BrowserRequest, code: string, detail?: BrowserFailure) { finish(expected, '', code, detail); },
+    beginCommit() { if (request?.kind === 'pending') committing = true; },
     close,
-    cancel() { if (request) { onCancel?.(); close(); } },
+    cancel() { if (request && !committing) { onCancel?.(); close(); } },
   };
 }

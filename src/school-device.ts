@@ -1,6 +1,7 @@
 import * as Crypto from 'expo-crypto';
 import { File, Paths } from 'expo-file-system';
 import { moveAsync } from 'expo-file-system/legacy';
+import { Platform } from 'react-native';
 import { CALLBACK, CAS_LOGIN, IDENTITY, LNT_HOME, createSchoolBrowser } from './school-browser';
 import type { Account, SchoolDevice } from './learning';
 import { captureSchoolCookies, schoolHttpUrl, schoolJarFrom, setSchoolCookies } from './school-cookies';
@@ -112,14 +113,13 @@ function schoolResult(url: string, response: SchoolResponse, write = false) {
   if (httpStatus !== 200 && (!write || redirects.has(httpStatus))) throw fail('HTTP_ERROR', httpStatus);
   return response;
 }
-async function persistSession(session: BoundSession, version: number, signal?: AbortSignal, deadline?: number) {
+async function persistSession(session: BoundSession, version: number, signal?: AbortSignal, beforeCommit?: () => void) {
   try {
     await persistCache(({ learning }) => {
       const expected = learningAccount(learning);
       if (expected) assertLntAccount(expected, session.account);
       return { learning, session: { account: session.account, cookies: session.jar.serializeSync() } };
-    }, version, signal, deadline);
-    check(version, signal);
+    }, version, signal, beforeCommit);
   } catch (error) {
     check(version, signal);
     if ((error as { code?: string } | null)?.code === 'AUTH_REQUIRED') throw error;
@@ -163,7 +163,11 @@ function recoverLnt(previous: BoundSession, version: number, expiredUrl: string,
         if (response.httpStatus !== 200) throw fail('HTTP_ERROR', response.httpStatus);
         if (new URL(url).origin !== lntOrigin) throw fail('AUTH_REQUIRED');
         const next = { account: previous.account, jar };
-        await persistSession(next, version, signal, deadline);
+        await persistSession(next, version, signal, () => {
+          if (Date.now() >= deadline) throw fail('AUTH_REQUIRED');
+          clearTimeout(timer);
+        });
+        check(version);
         active = next;
         return;
       }
@@ -322,7 +326,8 @@ async function authenticate(expected: Account | undefined, onAuthorized?: () => 
     setSchoolCookies(jar, academicProfileUrl, identityResponse.headers);
     stage = 'flush';
     const session = { account, jar };
-    await persistSession(session, version);
+    await persistSession(session, version, undefined, schoolBrowser.beginCommit);
+    check(version);
     active = session;
     restored = true;
     sessionFailure = 'AUTH_REQUIRED';
@@ -351,16 +356,16 @@ function learningAccount(learning: CachedLearning | null) {
   if (account && typeof account.studentNumber === 'string'
     && (validId(account.lntId) || account.lntId === null && account.studentNumber.trim())) return account;
 }
-async function readCache(): Promise<LocalCache & { contents: string | null }> {
+async function readCache(): Promise<LocalCache> {
   const file = cache();
   const contents = file.exists ? await file.text() : null;
   try {
     const data = JSON.parse(contents ?? 'null');
-    if (data?.version === 1) return { contents, learning: data, session: null };
+    if (data?.version === 1) return { learning: data, session: null };
     if (data?.version === 2) {
       const id = data.activeAccountId;
       if (validId(id) && Object.hasOwn(data.accounts ?? {}, String(id)) && data.accounts[id]?.version === 1
-        && data.accounts[id]?.account?.lntId === id) return { contents, learning: data.accounts[id], session: null };
+        && data.accounts[id]?.account?.lntId === id) return { learning: data.accounts[id], session: null };
     }
     if (data?.version === 3 && (data.learning === null || data.learning?.version === 1)) {
       const { learning } = data;
@@ -373,40 +378,30 @@ async function readCache(): Promise<LocalCache & { contents: string | null }> {
         else if (learning && Object.hasOwn(learning, 'account')) throw fail('INVALID_CACHE');
         session = { account, cookies: saved.cookies };
       } catch { /* Invalid sessions leave learning data available for manual login. */ }
-      return { contents, learning, session };
+      return { learning, session };
     }
   } catch {
     throw fail('INVALID_CACHE');
   }
   if (contents !== null) throw fail('INVALID_CACHE');
-  return { contents, learning: null, session: null };
+  return { learning: null, session: null };
 }
-async function replaceCache(value: string, beforeMove?: () => void) {
-  const file = temporary();
-  // File.move deletes the destination first; legacy moveAsync uses Android's same-directory renameTo.
-  try {
-    try { await file.write(value); } catch { throw fail('CACHE_STORAGE'); }
-    beforeMove?.();
-    try { await moveAsync({ from: file.uri, to: cache().uri }); } catch { throw fail('CACHE_STORAGE'); }
-  } finally { if (file.exists) file.delete(); }
-}
-function persistCache(update: (previous: LocalCache) => LocalCache, version: number, signal?: AbortSignal, deadline?: number) {
-  const guard = () => {
-    check(version, signal);
-    if (deadline !== undefined && Date.now() >= deadline) throw fail('AUTH_REQUIRED');
-  };
+function persistCache(update: (previous: LocalCache) => LocalCache, version: number, signal?: AbortSignal, beforeCommit?: () => void) {
   const saved = persistence.then(async () => {
-    guard();
+    check(version, signal);
     const previous = await readCache();
-    guard();
+    check(version, signal);
     const { learning, session } = update(previous);
-    await replaceCache(JSON.stringify(session ? { version: 3, learning, session } : learning), guard);
-    try { guard(); }
-    catch (error) {
-      if (previous.contents === null) cache().delete();
-      else await replaceCache(previous.contents);
-      throw error;
-    }
+    const value = JSON.stringify(session ? { version: 3, learning, session } : learning);
+    const file = temporary();
+    try {
+      try { await file.write(value); } catch { throw fail('CACHE_STORAGE'); }
+      const move = { from: file.uri, to: cache().uri };
+      check(version, signal);
+      beforeCommit?.();
+      // File.move deletes the destination first; legacy moveAsync uses Android's same-directory renameTo.
+      try { await moveAsync(move); } catch { throw fail('CACHE_STORAGE'); }
+    } finally { if (file.exists) file.delete(); }
   });
   persistence = saved.catch(() => {});
   return saved;
@@ -429,7 +424,14 @@ function clear(): Promise<void> {
     try { await marker.write('pending'); } catch { /* Still attempt cache and WebView removal. */ }
     await Promise.allSettled(pending);
     const results = await Promise.allSettled([
-      (async () => { for (const file of [cache(), temporary()]) if (file.exists) file.delete(); })(),
+      (async () => {
+        const files = [cache(), temporary()];
+        if (Platform.OS === 'android') files.push(
+          new File(Paths.document, '../shared_prefs/SecureStore.xml.bak'),
+          new File(Paths.document, '../shared_prefs/SecureStore.xml'),
+        );
+        for (const file of files) if (file.exists) file.delete();
+      })(),
       // shortcut: Site storage and HTTP auth data are not covered; revisit library support if full erasure is required.
       import('@preeternal/react-native-cookie-manager').then(({ default: cookies }) => cookies.clearAllStores()),
     ]);
