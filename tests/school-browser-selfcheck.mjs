@@ -1307,6 +1307,31 @@ test('today keeps the initial lesson until an ordinary refresh, then uses the ca
   assert.deepEqual(f.calls.slice(requests).map(call => new URL(call.url).pathname).sort(), [...ordinaryPaths, ...ordinaryPaths].sort());
 });
 
+test('today advances the heading across days on resume and keeps the course card until refresh', async () => {
+  const monday = new Date(2026, 10, 16, 9, 30).getTime();
+  const row = { WID: 'monday', BJDM: '001-A', KCMC: '周一课程', JASMC: '教室', JSXM: '张老师', XQ: 1, KSJCDM: 1, JSJCDM: 2, KSSJ: '0800', JSSJ: '0940', ZCMC: '8周', JCFADM: 'a' };
+  const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: [todo], todosAt: monday,
+    schedule: { jwTermCode: '20261', name: '测试学期', currentWeek: 8, weeks: [8], weekAt: monday, rows: [row] }, scheduleAt: monday });
+  const f = fixture(new Map([['school-learning.json', raw]])), app = pages(f);
+  app.todoClock.now = app.todayClock.now = monday;
+  app.render(); app.runStartupEffects(); await tick(); await f.learning.refresh(); app.render();
+  const carousel = page => app.find(page, props => props?.horizontal);
+  const home = app.today(), scrolls = [];
+  assert.equal(home.props.title, '11月16日 · 星期一');
+  assert.ok(app.find(carousel(home), props => props?.label === '查看周一课程课程详情'));
+  carousel(home).props.ref.current = { scrollTo: value => scrolls.push(value) };
+  const requests = f.calls.length;
+
+  app.todoClock.now = app.todayClock.now = new Date(2026, 10, 17, 9).getTime();
+  app.todoClock.listener('active');
+  app.render();
+  const resumed = app.today();
+  assert.equal(resumed.props.title, '11月17日 · 星期二');
+  assert.ok(app.find(carousel(resumed), props => props?.label === '查看周一课程课程详情'));
+  assert.deepEqual(scrolls, [], 'the date change does not recenter the carousel');
+  assert.equal(f.calls.length, requests);
+});
+
 test('shared todo dates update at midnight and resume; missing deadlines leave no placeholder or separator', async () => {
   const items = [
     { ...todo, id: 1, end_time: new Date(2026, 10, 17, 18).toISOString() },

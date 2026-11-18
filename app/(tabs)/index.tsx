@@ -8,24 +8,24 @@ import { TodayCourseCard } from '@/today-course-card';
 import { Glass, Icon, ResourceBlock, RowGroup, Screen, Section, StateCard, Tap, TodoRow, c, s } from '@/ui';
 
 export default function Today() {
-  const { state, real, data, todos: list, login, timetable: savedTimetable, isTrialRollcall, homeRefreshAt } = useDemo();
+  const { state, real, data, todayDate, todos: list, login, timetable: savedTimetable, isTrialRollcall, homeRefreshAt } = useDemo();
   const { width } = useWindowDimensions();
   const [{ firstShownAt, previousRefreshAt }] = useState(() => ({ firstShownAt: new Date(), previousRefreshAt: homeRefreshAt }));
-  const now = homeRefreshAt && homeRefreshAt !== previousRefreshAt ? homeRefreshAt : firstShownAt;
+  const courseAt = homeRefreshAt && homeRefreshAt !== previousRefreshAt ? homeRefreshAt : firstShownAt;
   const [carouselWidth, setCarouselWidth] = useState(width);
   const carousel = useRef<ScrollViewInstance>(null);
-  const timetable = real ? schoolScheduleView(data, now) : savedTimetable;
-  const today = timetable.sessionsForWeek(timetable.currentWeek).filter(item => item.day === (real ? (now.getDay() + 6) % 7 : 0))
+  const timetable = real ? schoolScheduleView(data, courseAt) : savedTimetable;
+  const today = timetable.sessionsForWeek(timetable.currentWeek).filter(item => item.day === (real ? (courseAt.getDay() + 6) % 7 : 0))
     .sort((a, b) => a.start - b.start);
-  const title = real ? now.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).replace('星期', ' · 星期') : '10月26日 · 星期一';
+  const title = real ? todayDate.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).replace('星期', ' · 星期') : '10月26日 · 星期一';
   const active = state.rollcalls.filter(item => !state.attendance[item.id]
     && (isTrialRollcall(item.id) || state.loggedIn && state.load === 'ready'));
   const cardWidth = Math.min(Math.min(carouselWidth, 440) - 84, 300);
-  const courseIndex = real ? currentCourseIndex(today, now) : today.length ? 0 : -1;
+  const courseIndex = real ? currentCourseIndex(today, courseAt) : today.length ? 0 : -1;
   const courseId = today[courseIndex]?.id;
   const offset = Math.max(0, courseIndex) * (cardWidth + 12);
   const centerCourse = useCallback(() => carousel.current?.scrollTo({ x: offset, animated: false }), [offset]);
-  useEffect(centerCourse, [centerCourse, courseId, now]);
+  useEffect(centerCourse, [centerCourse, courseId, courseAt]);
   const attendanceCards = active.length > 0 && <View style={{ marginHorizontal: 24, marginTop: state.loggedIn && courseId && (real || state.load === 'ready') ? 2 : 22, marginBottom: 22, gap: 10 }}>{active.map(item => {
     const course = real ? timetable.courseFor(item.courseId) : courseFor(item.courseId, state.longText);
     const name = item.title ?? course?.title ?? '签到活动';

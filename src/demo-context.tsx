@@ -11,7 +11,7 @@ import { createAttendanceTrial, type TrialSnapshot } from './attendance-trial';
 import { attendanceTrialDevice } from './attendance-trial-device';
 
 type Demo = { state: DemoState; dispatch: Dispatch<DemoEvent>; refresh: () => void; refreshHistory: () => void; refreshing: boolean; homeRefreshAt: Date | null; syncResult: 'success' | 'offline' | null; reducedMotion: boolean;
-  timetable: ReturnType<typeof schoolScheduleView>; real: boolean; data: LearningSnapshot; todos: Todo[]; login: () => Promise<boolean>; logout: () => Promise<boolean>;
+  timetable: ReturnType<typeof schoolScheduleView>; real: boolean; data: LearningSnapshot; todayDate: Date; todos: Todo[]; login: () => Promise<boolean>; logout: () => Promise<boolean>;
   submitNumber: ReturnType<typeof createLearning>['submitNumber']; submitLocation: ReturnType<typeof createLearning>['submitLocation']; submitQr: ReturnType<typeof createLearning>['submitQr'];
 
   trial: ReturnType<typeof createAttendanceTrial>; trialData: TrialSnapshot; isTrialRollcall: (id: string) => boolean };
@@ -145,7 +145,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
   }
   const todos = useMemo(() => real ? data.todos.map(item => todoView(item, now)) : todoFixtures(preview.longText), [real, data.todos, preview.longText, now]);
   return <Context.Provider value={{ state, dispatch, refresh, refreshHistory, refreshing: real ? data.refreshing : refreshing, homeRefreshAt,
-    syncResult: real && data.message ? 'offline' : syncResult, reducedMotion, timetable, real, data, todos, login, logout,
+    syncResult: real && data.message ? 'offline' : syncResult, reducedMotion, timetable, real, data, todayDate: now, todos, login, logout,
     trial, trialData, isTrialRollcall: trial.isTrialRollcall,
     submitNumber: (id, code) => id.startsWith('trial-') ? trial.submitNumber(id, code) : learning.submitNumber(id, code), submitQr, submitLocation }}>{children}</Context.Provider>;
 }
