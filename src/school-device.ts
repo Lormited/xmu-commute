@@ -27,8 +27,11 @@ let mustClear = false;
 let verifiedTerms: unknown = null;
 type LntIdentity = { lntId: number; studentNumber: string };
 let lntSession: { recovery?: Promise<LntIdentity> } = {};
-let recovering: { abort(): void; browser: Promise<string>; drain: Promise<LntIdentity>; result: Promise<LntIdentity> } | null = null;
+let recoveredLntIdentity: LntIdentity | null | undefined;
+let cookieStorageFailed = false;
+let recovering: { abort(): void; drain: Promise<LntIdentity>; result: Promise<LntIdentity> } | null = null;
 const requests = new Map<AbortController, Promise<unknown>>();
+const writes = new Set<Promise<unknown>>();
 export const schoolBrowser = createSchoolBrowser(() => {
   generation++;
   for (const controller of requests.keys()) controller.abort();
@@ -52,10 +55,12 @@ function request(url: string, version: number, init: RequestInit = {}, { signal,
       const text = await response.text();
       check(version, signal);
       const contentType = response.headers.get('content-type') ?? '';
+      if (!lntQuery && (response.status === 401 || (response.status === 403 && init.method !== 'PUT'))) throw fail('AUTH_REQUIRED', response.status);
+      const trusted = schoolUrl(response.url);
+      const final = lntQuery && !trusted ? null : new URL(response.url);
+      const expected = new URL(url);
+      const sameEndpoint = trusted && final?.origin === expected.origin && final.pathname === expected.pathname;
       if (lntQuery) {
-        const expected = new URL(url);
-        const final = schoolUrl(response.url) ? new URL(response.url) : null;
-        const sameEndpoint = final?.origin === expected.origin && final.pathname === expected.pathname;
         const redirectedToLogin = response.status === 200 && final && final.origin + final.pathname === CAS_LOGIN
           && /^text\/html(?:\s*;|$)/i.test(contentType) && /<form\b/i.test(text)
           && /<input\b[^>]*\s+id\s*=\s*["']pwdEncryptSalt["']/i.test(text);
@@ -66,9 +71,7 @@ function request(url: string, version: number, init: RequestInit = {}, { signal,
         if (!sameEndpoint || contentType.includes('html')) throw fail('INVALID_RESPONSE');
         return { text, contentType, httpStatus: response.status };
       }
-      if (response.status === 401 || (response.status === 403 && init.method !== 'PUT')) throw fail('AUTH_REQUIRED', response.status);
-      const final = new URL(response.url), expected = new URL(url);
-      if (!schoolUrl(response.url) || final.origin !== expected.origin || final.pathname !== expected.pathname) throw fail('AUTH_REQUIRED', response.status);
+      if (!sameEndpoint) throw fail('AUTH_REQUIRED', response.status);
       if (response.status !== 200 && init.method !== 'PUT') throw fail('HTTP_ERROR', response.status);
       return { text, contentType, httpStatus: response.status };
     } finally {
@@ -77,21 +80,25 @@ function request(url: string, version: number, init: RequestInit = {}, { signal,
     }
   })();
   requests.set(controller, task);
-  void task.then(() => requests.delete(controller), () => requests.delete(controller));
+  if (init.method === 'PUT') writes.add(task);
+  const finished = () => { requests.delete(controller); writes.delete(task); };
+  void task.then(finished, finished);
   return task;
 }
 function recoverLnt(version: number, account: Account) {
   if (authenticating) throw fail('AUTH_REQUIRED');
   if (recovering) return recovering.result;
+  recoveredLntIdentity = null;
   const controller = new AbortController();
   const { signal } = controller;
-  const browser = schoolBrowser.recover(signal, Crypto.randomUUID());
   let interrupt!: (error: Error) => void;
   const interrupted = new Promise<never>((_, reject) => { interrupt = reject; });
   const abort = (code = 'CANCELLED') => { interrupt(fail(code)); controller.abort(); };
   const timer = setTimeout(() => abort('AUTH_REQUIRED'), requestTimeout);
   const drain = (async () => {
-    await browser;
+    if (writes.size) await Promise.allSettled(writes);
+    check(version, signal);
+    await schoolBrowser.recover(signal, Crypto.randomUUID());
     const response = await request(endpoints.profile, version, { headers: { Accept: 'application/json' } }, { signal, lntQuery: true });
     const profile = jsonResponse(response) as { id?: unknown; user_no?: unknown; success?: boolean } | null;
     if (profile?.success === false || !Number.isSafeInteger(profile?.id) || typeof profile?.user_no !== 'string' || !profile.user_no.trim()) {
@@ -99,31 +106,61 @@ function recoverLnt(version: number, account: Account) {
     }
     const recovered = { lntId: profile.id as number, studentNumber: profile.user_no };
     assertLntAccount(account, recovered);
-    const { default: cookies } = await import('@preeternal/react-native-cookie-manager');
+    try {
+      const { default: cookies } = await import('@preeternal/react-native-cookie-manager');
+      check(version, signal);
+      await cookies.flush();
+    } catch {
+      check(version, signal);
+      cookieStorageFailed = true;
+      throw fail('COOKIE_STORAGE');
+    }
     check(version, signal);
-    try { await cookies.flush(); } catch { throw fail('COOKIE_STORAGE'); }
-    check(version, signal);
+    recoveredLntIdentity = recovered;
     return recovered;
   })().finally(() => { recovering = null; });
   const result = Promise.race([drain, interrupted]).finally(() => clearTimeout(timer));
-  recovering = { abort, browser, drain, result };
+  recovering = { abort, drain, result };
   return result;
 }
 async function query(url: string, version: number, init: RequestInit, account?: Account) {
   const lntQuery = new URL(url).origin === new URL(LNT_HOME).origin;
   const session = lntSession;
   const fetchQuery = async () => jsonResponse(await request(url, version, init, { lntQuery }));
-  try { return await fetchQuery(); }
+  if (!lntQuery) return fetchQuery();
+  check(version);
+  if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
+  if (authenticating) throw fail('AUTH_REQUIRED');
+  const verifyRecovery = async (recovery: Promise<LntIdentity>) => {
+    const recovered = await recovery;
+    check(version);
+    if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
+    if (recovering || recoveredLntIdentity === null) throw fail('AUTH_REQUIRED');
+    if (account) assertLntAccount(account, recovered);
+    if (account && recoveredLntIdentity) assertLntAccount(account, recoveredLntIdentity);
+  };
+  const pending = recovering?.result;
+  if (pending) {
+    await verifyRecovery(pending);
+    return fetchQuery();
+  }
+  if (account && recoveredLntIdentity) assertLntAccount(account, recoveredLntIdentity);
+  let data: unknown;
+  try { data = await fetchQuery(); }
   catch (error) {
     check(version);
-    if (!lntQuery || (error as { code?: string } | null)?.code !== 'AUTH_REQUIRED') throw error;
+    if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
+    if ((error as { code?: string } | null)?.code !== 'AUTH_REQUIRED') throw error;
     if (!account || (account.lntId === null && !account.studentNumber.trim())) throw error;
     session.recovery ??= recoverLnt(version, account).finally(() => {
       if (lntSession === session) lntSession = {};
     });
-    assertLntAccount(account, await session.recovery);
+    await verifyRecovery(session.recovery);
     return fetchQuery();
   }
+  if (session.recovery) await verifyRecovery(session.recovery);
+  if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
+  return data;
 }
 async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], account?: Account, version = generation): Promise<unknown> {
   check(version);
@@ -244,6 +281,8 @@ function clear(): Promise<void> {
   if (clearing) return clearing;
   generation++; mustClear = true;
   lntSession = {};
+  recoveredLntIdentity = undefined;
+  cookieStorageFailed = false;
   verifiedTerms = null;
   const recovery = recovering;
   recovery?.abort();
@@ -266,9 +305,17 @@ function clear(): Promise<void> {
   })().finally(() => { clearing = null; });
   return clearing;
 }
-async function answerRollcall(rollcallId: string, kind: 'number' | 'qr' | 'location', payload: Record<string, unknown>, receipt: typeof numberReceipt) {
+async function answerRollcall(rollcallId: string, kind: 'number' | 'qr' | 'location', payload: Record<string, unknown>, receipt: typeof numberReceipt, account: Account) {
   if (typeof rollcallId !== 'string' || !rollcallId.trim()) throw fail('INVALID_ATTENDANCE');
-  const response = await request(`https://lnt.xmu.edu.cn/api/rollcall/${encodeURIComponent(rollcallId)}/${kind === 'location' ? 'answer' : `answer_${kind}_rollcall`}`, generation, {
+  const version = generation;
+  if (!account || (account.lntId === null && !account.studentNumber.trim()) || authenticating) throw fail('AUTH_REQUIRED');
+  const recovery = recovering;
+  if (recovery) await recovery.result;
+  check(version);
+  if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
+  if (recovering || recoveredLntIdentity === null) throw fail('AUTH_REQUIRED');
+  if (recoveredLntIdentity) assertLntAccount(account, recoveredLntIdentity);
+  const response = await request(`https://lnt.xmu.edu.cn/api/rollcall/${encodeURIComponent(rollcallId)}/${kind === 'location' ? 'answer' : `answer_${kind}_rollcall`}`, version, {
     method: 'PUT', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
     body: JSON.stringify({ deviceId: Crypto.randomUUID(), ...payload }),
   });
@@ -294,29 +341,34 @@ export const schoolDevice: SchoolDevice = {
     finally { const leftover = temporary(); if (leftover.exists) leftover.delete(); }
   },
   clear, read,
-  async answerNumber(rollcallId, numberCode) {
+  async answerNumber(rollcallId, numberCode, account) {
     if (typeof numberCode !== 'string' || !/^\d{4}$/.test(numberCode)) throw fail('INVALID_ATTENDANCE');
-    return answerRollcall(rollcallId, 'number', { numberCode }, numberReceipt);
+    return answerRollcall(rollcallId, 'number', { numberCode }, numberReceipt, account);
   },
-  async submitLocation(rollcallId, position) {
+  async submitLocation(rollcallId, position, account) {
     if (!isPosition(position)) throw fail('INVALID_ATTENDANCE');
     const { latitude, longitude, accuracy, altitude, altitudeAccuracy, heading, speed } = position;
-    return answerRollcall(rollcallId, 'location', { latitude, longitude, accuracy, altitude, altitudeAccuracy, heading, speed }, numberReceipt);
+    return answerRollcall(rollcallId, 'location', { latitude, longitude, accuracy, altitude, altitudeAccuracy, heading, speed }, numberReceipt, account);
   },
-  async submitQr(rollcallId, data) {
+  async submitQr(rollcallId, data, account) {
     if (data === undefined) throw fail('INVALID_ATTENDANCE');
-    return answerRollcall(rollcallId, 'qr', { data }, qrReceipt);
+    return answerRollcall(rollcallId, 'qr', { data }, qrReceipt, account);
   },
   authenticate(onAuthorized) {
     if (clearing || mustClear) return Promise.reject(fail('CLEANUP_REQUIRED'));
     authenticating ??= (async () => {
       const version = ++generation;
       lntSession = {};
+      recoveredLntIdentity = null;
       const recovery = recovering;
       recovery?.abort();
-      if (recovery) await recovery.browser.catch(() => {});
+      for (const controller of requests.keys()) controller.abort();
+      await Promise.allSettled([recovery?.drain, ...requests.values()]);
       check(version);
       await authenticate(onAuthorized);
+      check(version);
+      cookieStorageFailed = false;
+      recoveredLntIdentity = undefined;
     })().finally(() => { authenticating = null; });
     return authenticating;
   },

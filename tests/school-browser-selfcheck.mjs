@@ -176,6 +176,65 @@ test('expired LNT course POST waits for official browser recovery and Cookie flu
   assert.equal(JSON.parse(f.calls[2].options.body).conditions.semester_id[0], 9);
 });
 
+test('every attendance method waits for verified recovery and sends at most one PUT', async () => {
+  const position = { latitude: 24.441, longitude: 118.103, accuracy: 7, altitude: null, altitudeAccuracy: null, heading: 0, speed: 0 };
+  for (const submit of [
+    device => device.answerNumber('81', '0007', recoveryAccount),
+    device => device.submitQr('83', 'opaque', recoveryAccount),
+    device => device.submitLocation('82', position, recoveryAccount),
+  ]) {
+    for (const sameAccount of [true, false]) {
+      const f = fixture();
+      f.flushGate = deferred();
+      let expired = true;
+      f.handler = async (url, options) => {
+        if (url.includes('/todos') && expired) { expired = false; return response(url, {}, 401); }
+        if (url.endsWith('/profile') && !sameAccount) return response(url, { ...profile, id: 43 });
+        if (options.method === 'PUT') return response(url, {}, 401);
+      };
+      const read = f.schoolDevice.read('todos', undefined, recoveryAccount);
+      void read.catch(() => {});
+      await tick();
+      const page = f.schoolBrowser.getSnapshot();
+      const answer = assert.rejects(submit(f.schoolDevice), { code: 'AUTH_REQUIRED' });
+      const writes = () => f.calls.filter(call => call.options.method === 'PUT').length;
+      await tick();
+      assert.equal(writes(), 0, 'the hidden browser still owns the shared session');
+      deliverRecoveryLanding(f, page);
+      await tick();
+      assert.equal(writes(), 0, 'identity and persistence must both be confirmed');
+      f.flushGate.resolve();
+      await answer;
+      if (sameAccount) await read;
+      else await assert.rejects(read, { code: 'AUTH_REQUIRED' });
+      assert.equal(writes(), sameAccount ? 1 : 0);
+      await assert.rejects(f.schoolDevice.answerNumber('81', '0007', { ...recoveryAccount, lntId: 99 }), { code: 'AUTH_REQUIRED' });
+      assert.equal(writes(), sameAccount ? 1 : 0, 'later writes must still match the recovered session');
+      assert.equal(f.schoolBrowser.getSnapshot(), null, 'the PUT does not trigger recovery');
+    }
+  }
+});
+
+test('hidden recovery waits for an already-sent attendance PUT to settle', async () => {
+  const f = fixture(), gate = deferred();
+  let expired = true;
+  f.handler = async (url, options) => {
+    if (options.method === 'PUT') { await gate.promise; return response(url, {}); }
+    if (url.includes('/todos') && expired) { expired = false; return response(url, {}, 401); }
+  };
+  const answer = f.schoolDevice.answerNumber('81', '0007', recoveryAccount);
+  const read = f.schoolDevice.read('todos', undefined, recoveryAccount);
+  await tick();
+  assert.equal(f.schoolBrowser.getSnapshot(), null);
+  gate.resolve();
+  await answer; await tick();
+  const page = f.schoolBrowser.getSnapshot();
+  assert.equal(page?.kind, 'recovery');
+  deliverRecoveryLanding(f, page);
+  await read;
+  assert.equal(f.calls.filter(call => call.options.method === 'PUT').length, 1);
+});
+
 test('simultaneous and late stale history responses share one recovery and each retry once', async () => {
   const f = fixture(), late = deferred(), sent = new Map();
   f.handler = async url => {
@@ -284,7 +343,7 @@ test('history keeps its prior batch when recovery changes account and a peer fin
   const f = fixture(new Map([['school-learning.json', raw]]));
   let recoveredSession = false;
   f.handler = async url => {
-    if (url.endsWith('/profile')) return response(url, { ...profile, user_no: '009999' });
+    if (url.endsWith('/profile') && recoveredSession) return response(url, { ...profile, user_no: '009999' });
     if (url.includes('/course/5/')) { await late.promise; return response(url, {}, 401); }
     if (url.includes('/student/') && !recoveredSession) return response(url, {}, 401);
   };
@@ -300,7 +359,7 @@ test('history keeps its prior batch when recovery changes account and a peer fin
   late.resolve();
   await tick();
   assert.equal(f.schoolBrowser.getSnapshot(), null);
-  assert.equal(f.calls.length, 4);
+  assert.equal(f.calls.length, 5);
   assert.equal(await history, false);
   assert.equal(f.learning.getSnapshot().needsLogin, true);
   assert.strictEqual(f.learning.getSnapshot().history, before.history);
@@ -604,6 +663,94 @@ test('recovery requires an authenticated profile and successful Cookie persisten
   }
 });
 
+test('a partial manual account switch keeps cache visible without using its history or activities', async () => {
+  for (const failedRead of ['profile', 'todos']) {
+    const f = fixture(), firstLogin = f.learning.login();
+    const activity = { rollcall_id: 81, course_id: course.id, course_title: '旧活动', is_number: true };
+    f.handler = async url => url.endsWith('/radar/rollcalls') ? response(url, { rollcalls: [activity] }) : undefined;
+    await authorize(f); await initialize(f);
+    assert.equal(await firstLogin, true);
+    const raw = f.files.get('school-learning.json'), before = f.learning.getSnapshot();
+    const nextProfile = { id: 43, user_no: '004321', name: '当前账号' };
+    let offline = true;
+    f.handler = async (url, options) => {
+      if (options.method === 'PUT') return response(url, { success: true });
+      if (offline && new URL(url).pathname === '/api/' + failedRead) throw Error('offline');
+      if (url.endsWith('/profile')) return response(url, nextProfile);
+    };
+    const login = f.learning.login();
+    await authorize(f); await initialize(f);
+    assert.equal(await login, false);
+    assert.equal(f.learning.getSnapshot().authenticated, true);
+    assert.equal(f.learning.getSnapshot().needsLogin, false);
+    const count = f.calls.length;
+    assert.equal(await f.learning.refreshHistory(), false);
+    assert.equal((await f.learning.submitNumber('81', '0007')).result, 'failed');
+    assert.equal(f.calls.length, count, 'the old scope never reaches the new session');
+    for (const key of ['account', 'history', 'rollcalls']) assert.strictEqual(f.learning.getSnapshot()[key], before[key]);
+    assert.equal(f.files.get('school-learning.json'), raw);
+
+    offline = false;
+    const reopened = fixture(new Map(f.files));
+    reopened.handler = f.handler;
+    await reopened.learning.restore();
+    assert.equal((await reopened.learning.submitNumber('81', '0007')).result, 'failed');
+    assert.equal(await reopened.learning.refreshHistory(), false);
+    assert.deepEqual(reopened.calls.map(call => new URL(call.url).pathname), ['/api/profile']);
+    assert.equal(reopened.files.get('school-learning.json'), raw);
+
+    assert.equal(await f.learning.refresh(), true, 'ordinary refresh binds to the explicit login');
+    assert.equal(f.learning.getSnapshot().account.lntId, 43);
+    assert.equal(await f.learning.refreshHistory(), true);
+    assert.match(f.calls.at(-1).url, /\/student\/43\/rollcalls/);
+  }
+});
+
+test('a recovery Cookie failure keeps cached data and requires explicit login from refresh or history', async () => {
+  for (const trigger of ['refresh', 'refreshHistory']) {
+    const f = fixture(), login = f.learning.login();
+    await authorize(f); await initialize(f);
+    assert.equal(await login, true);
+    const saved = f.files.get('school-learning.json');
+    f.failFlush = true;
+    f.flushGate = deferred();
+    const late = deferred();
+    f.handler = async url => {
+      if (url.endsWith('/api/semesters')) await late.promise;
+      if (url.includes(trigger === 'refresh' ? '/todos' : '/student/')) return response(url, {}, 401);
+    };
+    const inFlight = assert.rejects(f.schoolDevice.read('lntTerms', undefined, recoveryAccount), { code: 'COOKIE_STORAGE' });
+    const operation = f.learning[trigger]();
+    await tick();
+    deliverRecoveryLanding(f, f.schoolBrowser.getSnapshot());
+    await tick();
+    const count = f.calls.length;
+    const peer = assert.rejects(f.schoolDevice.read('rollcalls', undefined, recoveryAccount), { code: 'COOKIE_STORAGE' });
+    await tick();
+    f.flushGate.resolve();
+    assert.equal(await operation, false);
+    assert.equal(f.learning.getSnapshot().authenticated, false);
+    assert.equal(f.learning.getSnapshot().needsLogin, true);
+    await peer;
+    late.resolve();
+    await inFlight;
+    f.handler = null;
+    assert.equal(await f.learning.refresh(), false);
+    assert.equal(await f.learning.refreshHistory(), false);
+    await assert.rejects(f.schoolDevice.read('rollcalls', undefined, recoveryAccount), { code: 'COOKIE_STORAGE' });
+    await assert.rejects(f.schoolDevice.answerNumber('81', '0007', recoveryAccount), { code: 'COOKIE_STORAGE' });
+    assert.equal(f.calls.length, count);
+    assert.equal(f.files.get('school-learning.json'), saved);
+    assert.deepEqual(f.learning.getSnapshot().todos, [todo]);
+
+    f.failFlush = false;
+    const retry = f.learning.login();
+    await authorize(f); await initialize(f);
+    assert.equal(await retry, true);
+    assert.equal(f.learning.getSnapshot().needsLogin, false);
+  }
+});
+
 test('the full recovery deadline covers the page, session probe, and Cookie flush', async () => {
   for (const phase of ['page', 'probe', 'flush']) {
     const timers = new Map(), gate = deferred();
@@ -678,8 +825,10 @@ test('logout closes hidden recovery and drains the browser, probe, or Cookie flu
       deliverRecoveryLanding(f, page);
       await tick();
     }
+    const answer = assert.rejects(f.schoolDevice.answerNumber('81', '0007', recoveryAccount), { code: 'CANCELLED' });
     const logout = f.learning.logout();
     await rejected;
+    await answer;
     assert.equal(f.schoolBrowser.getSnapshot(), null);
     assert.equal(f.cookieCalls.includes('clearAllStores'), false);
     if (phase === 'probe') assert.equal(f.calls[1].options.signal.aborted, true);
@@ -695,13 +844,35 @@ test('logout closes hidden recovery and drains the browser, probe, or Cookie flu
   }
 });
 
+test('replacement login cancels a waiting PUT and drains the old Cookie flush', async () => {
+  const f = fixture(), gate = deferred();
+  f.flushGate = gate;
+  f.handler = async url => url.includes('/todos') ? response(url, {}, 401) : undefined;
+  const read = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'CANCELLED' });
+  await tick();
+  deliverRecoveryLanding(f, f.schoolBrowser.getSnapshot());
+  await tick();
+  const answer = assert.rejects(f.schoolDevice.answerNumber('81', '0007', recoveryAccount), { code: 'CANCELLED' });
+  const login = f.learning.login();
+  await Promise.all([read, answer]);
+  await tick();
+  assert.equal(f.schoolBrowser.getSnapshot(), null);
+  assert.deepEqual(f.cookieCalls, ['flush']);
+  f.handler = null;
+  gate.resolve();
+  await authorize(f); await initialize(f);
+  assert.equal(await login, true);
+  assert.deepEqual(f.cookieCalls, ['flush', 'flush']);
+  assert.equal(f.calls.filter(call => call.options.method === 'PUT').length, 0);
+});
+
 test('activity reads and number PUT reuse school sessions, exact ids, string codes and UUID device ids', async () => {
   const f = fixture();
   const activity = { rollcall_id: 'school-81', course_id: 301, course_title: '真实字段模拟活动', is_number: true };
   f.handler = async (url, options) => url.endsWith('/radar/rollcalls') ? response(url, { rollcalls: [activity] })
     : options.method === 'PUT' ? response(url, { success: true, message: '学校已记录签到' }) : undefined;
   assert.deepEqual(await f.schoolDevice.read('rollcalls'), { rollcalls: [activity] });
-  const receipt = await f.schoolDevice.answerNumber('school-81', '0007');
+  const receipt = await f.schoolDevice.answerNumber('school-81', '0007', recoveryAccount);
   assert.equal(receipt.result, 'success'); assert.equal(receipt.message, '学校已记录签到');
   const call = f.calls[1], body = JSON.parse(call.options.body);
   assert.equal(call.url, 'https://lnt.xmu.edu.cn/api/rollcall/school-81/answer_number_rollcall');
@@ -720,14 +891,14 @@ test('number PUT uses the uncertain-result fallback for unconfirmed responses an
     [409, { is_expired: true, message: '签到已结束' }, 'ended'], [503, { message: '响应说明' }, 'failed'],
   ]) {
     const f = fixture(); f.handler = async url => response(url, body, status);
-    const receipt = await f.schoolDevice.answerNumber('81', '0206');
+    const receipt = await f.schoolDevice.answerNumber('81', '0206', recoveryAccount);
     assert.equal(receipt.result, expected);
     if (expected === 'failed') assert.match(receipt.message, /^提交结果未知，请核实本人记录/);
     if (body.message) assert.ok(receipt.message.includes(body.message));
     assert.equal(f.calls.length, 1);
   }
   const f = fixture(); f.handler = async () => { throw Error('cookie=private-cookie'); };
-  await assert.rejects(f.schoolDevice.answerNumber('81', '0206'), { code: 'NETWORK' });
+  await assert.rejects(f.schoolDevice.answerNumber('81', '0206', recoveryAccount), { code: 'NETWORK' });
   assert.equal(f.calls.length, 1); assert.equal(f.logs.length, 0);
 });
 
@@ -737,7 +908,7 @@ test('location PUT keeps all actual coordinates, nullable fields and the current
   const receipt = await f.schoolDevice.submitLocation('location/82', {
     latitude: 24.441, longitude: 118.103, accuracy: 7, altitude: null, altitudeAccuracy: null, heading: 0, speed: 0,
     timestamp: 1000, mocked: false,
-  });
+  }, recoveryAccount);
   assert.equal(receipt.result, 'success'); assert.equal(receipt.message, '学校确认定位签到');
   const call = f.calls[0], { deviceId, ...position } = JSON.parse(call.options.body);
   assert.equal(call.url, 'https://lnt.xmu.edu.cn/api/rollcall/location%2F82/answer');
@@ -759,7 +930,7 @@ test('location requests reject invalid device coordinates and preserve school ex
   assert.equal(invalid.calls.length, 0);
   for (const [status, body, expected] of [[409, { is_expired: true, message: '学校确认结束' }, 'ended'], [200, { success: false }, 'failed']]) {
     const f = fixture(); f.handler = async url => response(url, body, status);
-    const receipt = await f.schoolDevice.submitLocation('82', position);
+    const receipt = await f.schoolDevice.submitLocation('82', position, recoveryAccount);
     assert.equal(receipt.result, expected);
     if (expected === 'failed') assert.match(receipt.message, /提交结果未知/);
     assert.equal(f.calls.length, 1); assert.equal(f.logs.length, 0);
@@ -777,7 +948,7 @@ test('number requests reject invalid input, login pages and malformed receipts',
     f.handler = async url => kind === '401' ? response(url, {}, 401)
       : kind === 'redirect' ? response('https://ids.xmu.edu.cn/authserver/login', {})
       : kind === 'html' ? response(url, '<html>login</html>', 200, 'text/html') : response(url, '{broken');
-    await assert.rejects(f.schoolDevice.answerNumber('81', '0206'), { code });
+    await assert.rejects(f.schoolDevice.answerNumber('81', '0206', recoveryAccount), { code });
     assert.equal(f.calls.length, 1); assert.equal(f.logs.length, 0);
   }
 });
@@ -789,7 +960,7 @@ test('QR PUT preserves opaque data, shares the session and only accepts HTTP 200
     [200, '', 'failed'], [200, { status: 'absent' }, 'failed'], [503, { status: 'on_call' }, 'failed'],
   ]) {
     const f = fixture(); f.handler = async url => response(url, body, status);
-    const receipt = await f.schoolDevice.submitQr('qr/83', '  opaque+/=%25\n码  ');
+    const receipt = await f.schoolDevice.submitQr('qr/83', '  opaque+/=%25\n码  ', recoveryAccount);
     assert.equal(receipt.result, expected);
     const call = f.calls[0], payload = JSON.parse(call.options.body);
     assert.equal(call.url, 'https://lnt.xmu.edu.cn/api/rollcall/qr%2F83/answer_qr_rollcall');
@@ -804,7 +975,7 @@ test('QR PUT preserves opaque data, shares the session and only accepts HTTP 200
     f.handler = async url => kind === '401' ? response(url, {}, 401)
       : kind === 'redirect' ? response('https://ids.xmu.edu.cn/authserver/login', {})
       : kind === 'html' ? response(url, '<html>login</html>', 200, 'text/html') : response(url, '{broken');
-    await assert.rejects(f.schoolDevice.submitQr('83', { opaque: [' x ', 7] }), { code });
+    await assert.rejects(f.schoolDevice.submitQr('83', { opaque: [' x ', 7] }, recoveryAccount), { code });
     assert.equal(f.calls.length, 1); assert.equal(f.logs.length, 0);
   }
 });

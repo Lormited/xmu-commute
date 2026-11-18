@@ -34,9 +34,9 @@ export type SchoolDevice = {
   clear(): Promise<void>;
   authenticate(onAuthorized?: () => void): Promise<void>;
   read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account): Promise<unknown>;
-  answerNumber(rollcallId: string, numberCode: string): Promise<AttendanceReceipt>;
-  submitLocation(rollcallId: string, position: Position): Promise<AttendanceReceipt>;
-  submitQr(rollcallId: string, data: unknown): Promise<AttendanceReceipt>;
+  answerNumber(rollcallId: string, numberCode: string, account: Account): Promise<AttendanceReceipt>;
+  submitLocation(rollcallId: string, position: Position, account: Account): Promise<AttendanceReceipt>;
+  submitQr(rollcallId: string, data: unknown, account: Account): Promise<AttendanceReceipt>;
 };
 export const todoKey = (item: SchoolTodo) => `${item.type}:${item.course_id}:${item.id}`;
 export function todoView(item: SchoolTodo, now = new Date()) {
@@ -65,12 +65,16 @@ function accountFrom(value: unknown): Account {
   if (!p || typeof p !== 'object' || Array.isArray(p) || p.success === false) throw Error('INVALID_PROFILE');
   return { lntId: Number.isSafeInteger(p.id) ? p.id as number : null, studentNumber: typeof p.user_no === 'string' ? p.user_no : '', name: typeof p.name === 'string' ? p.name : '' };
 }
+const matchesLntAccount = (expected: Account, actual: Pick<Account, 'lntId' | 'studentNumber'>) =>
+  (expected.lntId === null || expected.lntId === actual.lntId)
+  && (!expected.studentNumber || expected.studentNumber === actual.studentNumber);
 export function assertLntAccount(expected: Account, actual: Pick<Account, 'lntId' | 'studentNumber'>) {
-  if ((expected.lntId !== null && expected.lntId !== actual.lntId)
-    || (expected.studentNumber && expected.studentNumber !== actual.studentNumber)) {
+  if (!matchesLntAccount(expected, actual)) {
     throw Object.assign(Error('AUTH_REQUIRED'), { code: 'AUTH_REQUIRED' });
   }
 }
+const loginRetryMessage = (code?: string) => code === 'AUTH_REQUIRED' ? '学校登录失效，请重新登录'
+  : code === 'COOKIE_STORAGE' ? '学校登录状态保存失败，请重新登录' : null;
 function todosFrom(value: unknown): SchoolTodo[] {
   const list = (value as { todo_list?: unknown } | null)?.todo_list;
   if ((value as { success?: unknown } | null)?.success === false || !Array.isArray(list) || !list.every(item => item && Number.isSafeInteger(item.id) && Number.isSafeInteger(item.course_id)
@@ -201,6 +205,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
   let cleanupFailed = false;
   let restoreFailed = false;
   const current = (version: number) => generation === version;
+  const cacheMatches = (account: Account | null | undefined) => !!(state.account && account
+    && (state.account.lntId !== null || state.account.studentNumber.trim()) && matchesLntAccount(state.account, account));
   const completed = () => ({ ...state.attendance, ...state.pendingAttendance });
   function rememberAttendance() {
     const version = identity;
@@ -269,8 +275,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         failure = 'LNT 进行中签到更新失败，已保留原数据';
         const rollcalls = rollcallsFrom(await device.read('rollcalls', undefined, account));
         if (!current(version)) return false;
-        const sameAccount = state.account && (account.lntId !== null ? account.lntId === state.account.lntId
-          : !!account.studentNumber && account.studentNumber === state.account.studentNumber);
+        const sameAccount = cacheMatches(account);
         failure = 'LNT 当前学期读取失败，已保留原数据';
         const term = lntTermFrom(await device.read('lntTerms', undefined, account));
         if (!current(version)) return false;
@@ -281,7 +286,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         const cachedSchedule = state.account?.studentNumber === account.studentNumber && state.account?.lntId === account.lntId ? state.schedule : null;
         const schedule = includeSchedule ? await readSchedule(device, account.studentNumber, now, login ? null : cachedSchedule) : cachedSchedule;
         if (!current(version)) return false;
-        const keepHistory = state.account?.lntId === account.lntId && (state.term?.id === term.id
+        const keepHistory = sameAccount && (state.term?.id === term.id
           || state.term?.id === null && courses.some(course => state.courses.some(previous => previous.id === course.id)));
         if (login) failure = '历史签到读取失败，已保留原数据';
         const history = login ? await readHistory(courses, account)
@@ -306,10 +311,11 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       } catch (error) {
         if (current(version)) {
           const { code, loginStage } = (error as { code?: string; loginStage?: string }) ?? {};
-          const needsLogin = !authorized || code === 'AUTH_REQUIRED';
+          const retry = loginRetryMessage(code);
+          const needsLogin = !authorized || !!retry;
           const loginFailure = loginStage && Object.hasOwn(loginFailures, loginStage) ? loginFailures[loginStage] : undefined;
           publish({ ...(needsLogin ? { authenticated: false, needsLogin: true } : {}),
-            message: code === 'CANCELLED' ? '已取消学校登录' : loginFailure ?? (code === 'AUTH_REQUIRED' ? '学校登录失效，请重新登录' : failure) });
+            message: code === 'CANCELLED' ? '已取消学校登录' : loginFailure ?? retry ?? failure });
         }
         return false;
       } finally {
@@ -319,22 +325,24 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     operation = task;
     return task;
   }
-  function submitAttendance(id: string, method: Rollcall['method'], valid: boolean, send: () => Promise<AttendanceReceipt>): Promise<AttendanceReceipt> {
+  function submitAttendance(id: string, method: Rollcall['method'], valid: boolean, send: (account: Account) => Promise<AttendanceReceipt>): Promise<AttendanceReceipt> {
       const unavailable: AttendanceReceipt = { result: 'failed', message: '签到不可用，请刷新后重试' };
       const existing = submissions.get(id);
       if (existing) return existing.task;
-      if (!state.authenticated || state.loggingIn || !valid || state.attendance[id] || state.pendingAttendance[id]
+      const account = sessionAccount;
+      if (!state.authenticated || state.loggingIn || !account || !cacheMatches(account) || !valid || state.attendance[id] || state.pendingAttendance[id]
         || !state.rollcalls.some(item => item.id === id && item.method === method)) return Promise.resolve(unavailable);
       const version = identity;
       const active = { dismissed: false, task: null! as Promise<AttendanceReceipt> };
       submissions.set(id, active);
       active.task = (async () => {
         let receipt: AttendanceReceipt;
-        try { receipt = await send(); }
+        try { receipt = await send(account); }
         catch (error) {
           const { code } = (error as { code?: string }) ?? {};
-          receipt = { result: 'failed', message: code === 'AUTH_REQUIRED' ? '学校登录失效，请重新登录' : '未收到有效回执，提交结果未知，请核实本人记录' };
-          if (identity === version && code === 'AUTH_REQUIRED') {
+          const retry = loginRetryMessage(code);
+          receipt = { result: 'failed', message: retry ?? '未收到有效回执，提交结果未知，请核实本人记录' };
+          if (identity === version && retry) {
             generation++; operation = null; historyOperation = null;
             publish({ authenticated: false, needsLogin: true, refreshing: false, historyRefreshing: false, message: receipt.message });
           }
@@ -356,7 +364,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     if (historyOperation) return historyOperation;
     if (!state.authenticated) return Promise.resolve(false);
     const { account, term, courses } = state;
-    if (!account || !Number.isSafeInteger(account.lntId) || !term) {
+    if (!account || !Number.isSafeInteger(account.lntId) || !term || (sessionAccount !== undefined && !cacheMatches(sessionAccount))) {
       publish({ historyMessage: '请先刷新个人资料和当前学期课程' });
       return Promise.resolve(false);
     }
@@ -365,7 +373,13 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     const task = (async () => {
       let failure = '历史签到读取失败，已保留原数据';
       try {
-        const history = await readHistory(courses, account);
+        if (sessionAccount === undefined) {
+          const actual = accountFrom(await device.read('profile', undefined, account));
+          if (!current(version)) return false;
+          assertLntAccount(account, actual);
+          sessionAccount = actual;
+        }
+        const history = await readHistory(courses, sessionAccount ?? account);
         if (!current(version)) return false;
         const historyAt = now();
         failure = '历史签到保存失败，已保留原数据';
@@ -382,9 +396,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         return await saved;
       } catch (error) {
         if (current(version)) {
-          const expired = (error as { code?: string } | null)?.code === 'AUTH_REQUIRED';
-          publish({ ...(expired ? { authenticated: false, needsLogin: true } : {}),
-            historyMessage: expired ? '学校登录失效，请重新登录' : failure });
+          const retry = loginRetryMessage((error as { code?: string } | null)?.code);
+          publish({ ...(retry ? { authenticated: false, needsLogin: true } : {}), historyMessage: retry ?? failure });
         }
         return false;
       } finally {
@@ -423,7 +436,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       return saved;
     },
     submitNumber(id: string, numberCode: string): Promise<AttendanceReceipt> {
-      return submitAttendance(id, 'number', typeof numberCode === 'string' && /^\d{4}$/.test(numberCode), () => device.answerNumber(id, numberCode));
+      return submitAttendance(id, 'number', typeof numberCode === 'string' && /^\d{4}$/.test(numberCode), account => device.answerNumber(id, numberCode, account));
     },
     submitQr(id: string, rawScanText: string): Promise<AttendanceReceipt> {
       let data: unknown;
@@ -433,10 +446,10 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
           ? '二维码与当前签到活动不符' : (error as Error).message === 'UNSUPPORTED_QR_WRAPPER'
             ? '此二维码包装暂不支持，请使用学校客户端签到' : '二维码无效，请扫描当前活动的学校二维码' });
       }
-      return submitAttendance(id, 'qr', true, () => device.submitQr(id, data));
+      return submitAttendance(id, 'qr', true, account => device.submitQr(id, data, account));
     },
     submitLocation(id: string, position: Position): Promise<AttendanceReceipt> {
-      return submitAttendance(id, 'radar', isPosition(position), () => device.submitLocation(id, position));
+      return submitAttendance(id, 'radar', isPosition(position), account => device.submitLocation(id, position, account));
     },
     attendanceDismissed(context: { ids: string[] } | { openIds: string[] }) {
       const ids = [...new Set([...Object.keys(state.pendingAttendance), ...submissions.keys()])]
