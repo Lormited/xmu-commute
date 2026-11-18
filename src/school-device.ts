@@ -13,7 +13,8 @@ const fail = (code: string, httpStatus?: number) => Object.assign(Error(code), {
 const cache = () => new File(Paths.document, 'school-learning.json');
 const temporary = () => new File(Paths.document, 'school-learning.tmp');
 const logoutMarker = () => new File(Paths.document, 'school-logout');
-const sessionKey = 'xmuc.school-session';
+const sessionKeys = ['xmuc.school-session', 'xmuc.school-session.next'] as const;
+const sessionSelectionKey = 'xmuc.school-session.active';
 const requestTimeout = 30000;
 const academicProfileUrl = 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/wdkcb/initXsxx.do?XH=';
 const endpoints = {
@@ -36,6 +37,7 @@ const lntOrigin = new URL(LNT_HOME).origin;
 const renewalHosts = new Set(['lnt.xmu.edu.cn', 'ids.xmu.edu.cn', 'c-identity.xmu.edu.cn', 'c-mobile.xmu.edu.cn']);
 const redirects = new Set([301, 302, 303, 307, 308]);
 let active: BoundSession | null = null;
+let sessionSlot: 0 | 1 = 0;
 let selectedAccount: Account | null = null;
 let restored = false;
 let sessionFailure = 'AUTH_REQUIRED';
@@ -119,12 +121,16 @@ function persistSession(session: BoundSession, version: number, admission?: { pu
     guard();
     try {
       const store = await import('expo-secure-store');
-      const previous = deadline === undefined ? null : store.getItem(sessionKey);
       guard();
-      if (deadline !== undefined && previous === null) throw fail('COOKIE_STORAGE');
       const options = { keychainAccessible: store.WHEN_UNLOCKED_THIS_DEVICE_ONLY };
-      store.setItem(sessionKey, serialized, options);
-      if (deadline !== undefined && Date.now() >= deadline) store.setItem(sessionKey, previous!, options);
+      if (deadline === undefined) store.setItem(sessionKeys[sessionSlot], serialized, options);
+      else {
+        const candidateSlot = sessionSlot === 0 ? 1 : 0;
+        store.setItem(sessionKeys[candidateSlot], serialized, options);
+        guard();
+        store.setItem(sessionSelectionKey, String(candidateSlot), options);
+        sessionSlot = candidateSlot;
+      }
     } catch (error) {
       check(version, admission?.signal);
       if ((error as { code?: string } | null)?.code === 'AUTH_REQUIRED') throw error;
@@ -132,7 +138,6 @@ function persistSession(session: BoundSession, version: number, admission?: { pu
       sessionFailure = 'COOKIE_STORAGE';
       throw fail('COOKIE_STORAGE');
     }
-    guard();
     admission?.publish();
   });
   persistence = saved.catch(() => {});
@@ -382,9 +387,12 @@ async function restoreSession(raw: string | null, version: number) {
   } catch { /* The learning cache parser reports invalid data. */ }
   try {
     const store = await import('expo-secure-store');
-    const secret = await store.getItemAsync(sessionKey);
+    const selection = await store.getItemAsync(sessionSelectionKey);
+    const slot = selection === '1' ? 1 : 0;
+    const secret = await store.getItemAsync(sessionKeys[slot]);
     check(version);
     if (restored) return;
+    sessionSlot = slot;
     if (secret) {
       const saved = JSON.parse(secret);
       if (saved?.version !== 1) throw fail('COOKIE_STORAGE');
@@ -404,6 +412,7 @@ function clear(): Promise<void> {
   if (clearing) return clearing;
   generation++; mustClear = true;
   active = null;
+  sessionSlot = 0;
   selectedAccount = null;
   restored = false;
   sessionFailure = 'AUTH_REQUIRED';
@@ -420,7 +429,9 @@ function clear(): Promise<void> {
     await Promise.allSettled(pending);
     const results = await Promise.allSettled([
       (async () => { for (const file of [cache(), temporary()]) if (file.exists) file.delete(); })(),
-      import('expo-secure-store').then(store => store.deleteItemAsync(sessionKey)),
+      import('expo-secure-store').then(async store => {
+        for (const key of [...sessionKeys, sessionSelectionKey]) await store.deleteItemAsync(key);
+      }),
       // shortcut: Site storage and HTTP auth data are not covered; revisit library support if full erasure is required.
       import('@preeternal/react-native-cookie-manager').then(({ default: cookies }) => cookies.clearAllStores()),
     ]);

@@ -30,6 +30,8 @@ const academicTerms = { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '测试�
 const profile = { id: 42, user_no: '001234', name: '测试同学' };
 const recoveryAccount = { lntId: 42, studentNumber: '001234', name: '测试同学' };
 const sessionKey = 'xmuc.school-session';
+const candidateKey = 'xmuc.school-session.next';
+const selectionKey = 'xmuc.school-session.active';
 const lntRoot = 'https://lnt.xmu.edu.cn/';
 const casLogin = 'https://ids.xmu.edu.cn/authserver/login';
 const webCookies = [
@@ -104,12 +106,10 @@ function fixture(files = new Map(), { secure = new Map(), timers = {} } = {}) {
     'expo/fetch': { fetch },
     get 'expo-secure-store'() {
       return {
-        async getItemAsync(key) { assert.equal(key, sessionKey); return secure.get(key) ?? null; },
-        getItem(key) { assert.equal(key, sessionKey); return secure.get(key) ?? null; },
+        async getItemAsync(key) { return secure.get(key) ?? null; },
         setItem(key, value) {
-          assert.equal(key, sessionKey);
-          secureCalls.push('set');
-          f.onSecureSet?.();
+          secureCalls.push(key === selectionKey ? 'select' : 'set');
+          f.onSecureSet?.(key);
           if (f.failSecureWrite) throw Error('SECURE_STORAGE');
           secure.set(key, value);
         },
@@ -120,8 +120,7 @@ function fixture(files = new Map(), { secure = new Map(), timers = {} } = {}) {
           secure.set(key, value);
         },
         async deleteItemAsync(key) {
-          assert.equal(key, sessionKey);
-          secureCalls.push('delete');
+          if (key === sessionKey) secureCalls.push('delete');
           if (f.failSecureDelete) throw Error('SECURE_STORAGE');
           secure.delete(key);
         },
@@ -263,7 +262,7 @@ test('expired course POST follows the official HTTP redirect chain and replays a
     assert.equal(f.schoolBrowser.getSnapshot(), null);
   } finally { verification.resolve(); }
   assert.deepEqual(Array.from((await result).courses), [course]);
-  assert.deepEqual(f.secureCalls, ['set']);
+  assert.deepEqual(f.secureCalls, ['set', 'select']);
   assert.equal(attempts, 2);
   assert.equal(f.calls.at(-1).options.method, 'POST');
   assert.equal(f.calls.at(-1).options.body, f.calls[0].options.body);
@@ -300,8 +299,8 @@ test('concurrent LNT reads share recovery, keep valid successes and replay only 
   assert.deepEqual(await requests[3], validHistory);
   assert.deepEqual([...sent.values()], [2, 2, 2, 1]);
   assert.equal(f.calls.filter(call => call.url === lntRoot).length, 1);
-  assert.deepEqual(f.secureCalls, ['set']);
-  assert.equal(CookieJar.deserializeSync(JSON.parse(f.secure.get(sessionKey)).cookies).getCookieStringSync(lntRoot), 'lnt_session=web-lnt');
+  assert.deepEqual(f.secureCalls, ['set', 'select']);
+  assert.equal(CookieJar.deserializeSync(JSON.parse(f.secure.get(candidateKey)).cookies).getCookieStringSync(lntRoot), 'lnt_session=web-lnt');
 });
 
 test('each attendance PUT waits for verified recovery and an expired write is never replayed', async () => {
@@ -452,6 +451,7 @@ test('recovery timeout retains the previous session on restart even after late v
 
 test('a renewal that crosses its deadline during storage keeps the prior session and skips replay', async () => {
   let now = Date.now();
+  const deadline = now + 30_000;
   class Clock extends Date { static now() { return now; } }
   const f = await boundFixture(new Map(), { timers: { Date: Clock } });
   const previous = f.secure.get(sessionKey);
@@ -459,10 +459,35 @@ test('a renewal that crosses its deadline during storage keeps the prior session
     if (url.includes('/todos')) return response(url, {}, 401);
     if (url === lntRoot) return redirect(url, '/user/index', [['Set-Cookie', 'lnt_session=late; Path=/; Secure']]);
   };
-  f.onSecureSet = () => { now += 30_001; f.onSecureSet = null; };
+  f.onSecureSet = () => {
+    if (now > deadline) throw Error('SecureStore is unavailable after the delayed write');
+    now += 30_001;
+  };
   await assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'AUTH_REQUIRED' });
   assert.equal(f.calls.filter(call => call.url.includes('/todos')).length, 1);
   assert.equal(f.secure.get(sessionKey), previous);
+  assert.equal(f.secure.has(selectionKey), false);
+  const reopened = fixture(f.files, { secure: f.secure });
+  await reopened.schoolDevice.load();
+  await reopened.schoolDevice.read('todos');
+  assert.match(requestCookie(reopened.calls[0]), /lnt_session=web-lnt/);
+});
+
+test('a failed session selection leaves the previous account session restorable', async () => {
+  const f = await boundFixture();
+  f.handler = async url => {
+    if (url.includes('/todos')) return response(url, {}, 401);
+    if (url === lntRoot) return redirect(url, '/user/index', [['Set-Cookie', 'lnt_session=replacement; Path=/; Secure']]);
+  };
+  f.onSecureSet = key => { if (key === selectionKey) throw Error('SECURE_STORAGE'); };
+  await assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'COOKIE_STORAGE' });
+  assert.equal(f.calls.filter(call => call.url.includes('/todos')).length, 1);
+  const reopened = fixture(f.files, { secure: f.secure });
+  await reopened.schoolDevice.load();
+  await reopened.schoolDevice.read('todos');
+  assert.match(requestCookie(reopened.calls[0]), /lnt_session=web-lnt/);
+  await reopened.schoolDevice.clear();
+  assert.equal(f.secure.size, 0);
 });
 
 test('logout cancels recovery and drains pending navigation or verification before removing both stores', async () => {
@@ -488,7 +513,7 @@ test('logout cancels recovery and drains pending navigation or verification befo
     } finally { gate.resolve(); }
     await Promise.all([read, answer]);
     assert.equal(await logout, true);
-    assert.equal(f.secure.has(sessionKey), false);
+    assert.equal(f.secure.size, 0);
     assert.equal(f.files.size, 0);
     assert.equal(f.cookies.size, 0);
     assert.deepEqual(f.secureCalls, ['delete']);
