@@ -1255,6 +1255,30 @@ test('today renders school course cards by starting section', async () => {
   assert.deepEqual(React.Children.toArray(carousel.props.children).map(card => card.props.children.props.session.start), [0, 1]);
 });
 
+test('today shows the same empty card with no classes today or no timetable', async () => {
+  const monday = new Date(2026, 10, 16, 9, 30).getTime();
+  const tuesday = { WID: 'tuesday', BJDM: '001-A', KCMC: '周二课程', JASMC: '教室', JSXM: '张老师', XQ: 2, KSJCDM: 1, JSJCDM: 2, KSSJ: '0800', JSSJ: '0940', ZCMC: '8周', JCFADM: 'a' };
+  for (const [scenario, rows] of [['classes on another day', [tuesday]], ['empty timetable', []], ['no timetable cache', null]]) {
+    const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: [todo], todosAt: monday,
+      ...(rows && { schedule: { jwTermCode: '20261', name: '测试学期', currentWeek: 8, weeks: [8], weekAt: monday, rows }, scheduleAt: monday }) });
+    const f = fixture(new Map([['school-learning.json', raw]]));
+    await f.learning.restore();
+    const app = pages(f);
+    app.todoClock.now = app.todayClock.now = monday;
+    const context = app.render();
+    assert.equal(context.data.schedule?.rows.length ?? null, rows?.length ?? null, scenario);
+    if (rows?.length) assert.equal(context.timetable.sessionsForWeek(8).length, 1, scenario);
+    const courseBlock = app.find(app.today(), props => props?.resource === 'jw' && props?.emptyTitle);
+    const courseArea = courseBlock.type(courseBlock.props);
+    const card = app.find(courseArea, props => props?.title === '今天没有课程');
+    assert.ok(card, scenario);
+    const rendered = card.type(card.props);
+    assert.ok(app.find(rendered, props => props?.accessibilityRole === 'header' && props.children === '今天没有课程'), scenario);
+    assert.ok(app.find(rendered, props => props?.name === 'sunny-outline'), scenario);
+    assert.equal(app.find(courseArea, props => props?.horizontal), undefined, scenario);
+  }
+});
+
 test('today keeps the initial lesson until an ordinary refresh, then uses the cached timetable', async () => {
   const f = fixture(), app = pages(f); app.render();
   const now = new Date(); now.setHours(9, 30, 0, 0);
