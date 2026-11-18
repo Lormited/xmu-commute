@@ -46,7 +46,8 @@ export function qrData(rawScanText: string, expectedId: string): unknown {
     try { url = new URL(rawScanText, 'https://lnt.xmu.edu.cn'); } catch { throw Error('INVALID_QR'); }
     if (!['http:', 'https:'].includes(url.protocol) || !['/j', '/scanner-jumper'].includes(url.pathname)) throw Error('INVALID_QR');
     try { value = JSON.parse(url.searchParams.get('_p') ?? ''); }
-    catch {
+    catch { value = undefined; }
+    if (!value) {
       const packed = url.searchParams.getAll('p');
       if (packed.length !== 1) throw Error('INVALID_QR');
       value = packedQr(packed[0]);

@@ -721,6 +721,7 @@ test('QR keeps JSON and _p precedence, and decodes official p scalars without re
     ['/j?_p=%7B%22rollcallId%22%3A83%2C%22data%22%3A%22%252B%2B%2F%3D%22%7D&p=4~83!3~ignored', '%2B+/='],
     ['/scanner-jumper?_p=%7B%22rollcallId%22%3A%2283%22%2C%22data%22%3A%7B%22opaque%22%3A%5B%22%20x%20%22%2C7%5D%7D%7D', { opaque: [' x ', 7] }],
     ['/scanner-jumper?_p=broken&p=rollcallId~83!data~%102b.3h!__proto__~ignored!unrelated', 83.125],
+    ['/j?_p=null&p=4~%102b!3~fallback', 'fallback'],
     ['/j?p=4~83!3~', ''],
     ['/j?p=4~83!3~%1A0', false],
     ['/j?p=4~83!3~%1A1', true],
@@ -745,7 +746,8 @@ test('QR rejects malformed or mismatched scans without a school submission', asy
     'https://lnt.xmu.edu.cn/elsewhere?_p=%7B%22rollcallId%22%3A83%2C%22data%22%3A%22x%22%7D']) {
     assert.deepEqual(await f.learning.submitQr('83', raw), { result: 'failed', message: '二维码无效，请扫描当前活动的学校二维码' }, raw);
   }
-  for (const raw of ['{"rollcallId":82,"data":"secret"}', '/j?p=4~%102a!3~x']) {
+  for (const raw of ['{"rollcallId":82,"data":"secret"}', '/j?p=4~%102a!3~x',
+    '/j?_p=%7B%22rollcallId%22%3A82%2C%22data%22%3A%22x%22%7D&p=4~83!3~fallback']) {
     assert.deepEqual(await f.learning.submitQr('83', raw), { result: 'failed', message: '二维码与当前签到活动不符' });
   }
   for (const id of ['missing', '81', '82']) await f.learning.submitQr(id, JSON.stringify({ rollcallId: id, data: 'wrong method' }));
