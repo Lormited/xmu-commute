@@ -74,7 +74,9 @@ export function assertLntAccount(expected: Account, actual: Pick<Account, 'lntId
   }
 }
 const loginRetryMessage = (code?: string) => code === 'AUTH_REQUIRED' ? '学校登录失效，请重新登录'
-  : code === 'COOKIE_STORAGE' ? '学校登录状态保存失败，请重新登录' : null;
+  : code === 'COOKIE_STORAGE' ? '学校登录状态保存失败，请重新登录'
+  : code === 'SESSION_DRAINING' ? '学校登录状态仍在处理，请稍后重试' : null;
+type SchoolFailure = { code?: string; loginStage?: string; needsLogin?: boolean };
 function todosFrom(value: unknown): SchoolTodo[] {
   const list = (value as { todo_list?: unknown } | null)?.todo_list;
   if ((value as { success?: unknown } | null)?.success === false || !Array.isArray(list) || !list.every(item => item && Number.isSafeInteger(item.id) && Number.isSafeInteger(item.course_id)
@@ -310,9 +312,9 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         return await saved;
       } catch (error) {
         if (current(version)) {
-          const { code, loginStage } = (error as { code?: string; loginStage?: string }) ?? {};
+          const { code, loginStage, needsLogin: sessionUnverified } = (error as SchoolFailure) ?? {};
           const retry = loginRetryMessage(code);
-          const needsLogin = !authorized || !!retry;
+          const needsLogin = !authorized || !!retry || sessionUnverified;
           const loginFailure = loginStage && Object.hasOwn(loginFailures, loginStage) ? loginFailures[loginStage] : undefined;
           publish({ ...(needsLogin ? { authenticated: false, needsLogin: true } : {}),
             message: code === 'CANCELLED' ? '已取消学校登录' : loginFailure ?? retry ?? failure });
@@ -339,12 +341,15 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         let receipt: AttendanceReceipt;
         try { receipt = await send(account); }
         catch (error) {
-          const { code } = (error as { code?: string }) ?? {};
+          const { code, needsLogin } = (error as SchoolFailure) ?? {};
           const retry = loginRetryMessage(code);
           receipt = { result: 'failed', message: retry ?? '未收到有效回执，提交结果未知，请核实本人记录' };
-          if (identity === version && retry) {
-            generation++; operation = null; historyOperation = null;
-            publish({ authenticated: false, needsLogin: true, refreshing: false, historyRefreshing: false, message: receipt.message });
+          if (identity === version && (retry || needsLogin)) {
+            if (needsLogin) publish({ authenticated: false, needsLogin: true });
+            else {
+              generation++; operation = null; historyOperation = null;
+              publish({ authenticated: false, needsLogin: true, refreshing: false, historyRefreshing: false, message: receipt.message });
+            }
           }
         }
         if (identity !== version) return { result: 'failed', message: '登录状态已改变，请刷新核对签到结果' } as AttendanceReceipt;
@@ -396,8 +401,9 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         return await saved;
       } catch (error) {
         if (current(version)) {
-          const retry = loginRetryMessage((error as { code?: string } | null)?.code);
-          publish({ ...(retry ? { authenticated: false, needsLogin: true } : {}), historyMessage: retry ?? failure });
+          const { code, needsLogin } = (error as SchoolFailure) ?? {};
+          const retry = loginRetryMessage(code);
+          publish({ ...(retry || needsLogin ? { authenticated: false, needsLogin: true } : {}), historyMessage: retry ?? failure });
         }
         return false;
       } finally {

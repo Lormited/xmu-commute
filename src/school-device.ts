@@ -26,10 +26,9 @@ let clearing: Promise<void> | null = null;
 let mustClear = false;
 let verifiedTerms: unknown = null;
 type LntIdentity = { lntId: number; studentNumber: string };
-let lntSession: { recovery?: Promise<LntIdentity> } = {};
-let recoveredLntIdentity: LntIdentity | null | undefined;
-let cookieStorageFailed = false;
-let recovering: { abort(): void; drain: Promise<LntIdentity>; result: Promise<LntIdentity> } | null = null;
+let lntSession: { recovery?: Promise<void> } = {};
+let lntIdentity: LntIdentity | 'AUTH_REQUIRED' | 'COOKIE_STORAGE' | undefined;
+let recovering: { abort(): void; signal: AbortSignal; drain: Promise<void>; result: Promise<void> } | null = null;
 const requests = new Map<AbortController, Promise<unknown>>();
 const writes = new Set<Promise<unknown>>();
 export const schoolBrowser = createSchoolBrowser(() => {
@@ -38,6 +37,12 @@ export const schoolBrowser = createSchoolBrowser(() => {
 });
 function check(version: number, signal?: AbortSignal) {
   if (generation !== version || mustClear || signal?.aborted) throw fail('CANCELLED');
+}
+function checkSchoolAccess(version: number, account?: Account) {
+  check(version);
+  if (typeof lntIdentity === 'string') throw Object.assign(fail(lntIdentity), { needsLogin: true });
+  if (authenticating) throw fail('AUTH_REQUIRED');
+  if (account && lntIdentity) assertLntAccount(account, lntIdentity);
 }
 function request(url: string, version: number, init: RequestInit = {}, { signal, lntQuery = false }: { signal?: AbortSignal; lntQuery?: boolean } = {}) {
   check(version, signal);
@@ -88,7 +93,7 @@ function request(url: string, version: number, init: RequestInit = {}, { signal,
 function recoverLnt(version: number, account: Account) {
   if (authenticating) throw fail('AUTH_REQUIRED');
   if (recovering) return recovering.result;
-  recoveredLntIdentity = null;
+  lntIdentity = 'AUTH_REQUIRED';
   const controller = new AbortController();
   const { signal } = controller;
   let interrupt!: (error: Error) => void;
@@ -112,62 +117,55 @@ function recoverLnt(version: number, account: Account) {
       await cookies.flush();
     } catch {
       check(version, signal);
-      cookieStorageFailed = true;
+      lntIdentity = 'COOKIE_STORAGE';
       throw fail('COOKIE_STORAGE');
     }
     check(version, signal);
-    recoveredLntIdentity = recovered;
-    return recovered;
+    lntIdentity = recovered;
   })().finally(() => { recovering = null; });
-  const result = Promise.race([drain, interrupted]).finally(() => clearTimeout(timer));
-  recovering = { abort, drain, result };
+  const result = Promise.race([drain, interrupted]).catch(error => {
+    throw Object.assign(error ?? fail('INVALID_RESPONSE'), { needsLogin: true });
+  }).finally(() => clearTimeout(timer));
+  recovering = { abort, signal, drain, result };
   return result;
 }
-async function query(url: string, version: number, init: RequestInit, account?: Account) {
+async function query(url: string, version: number, init: RequestInit, account?: Account, canRetry = true): Promise<unknown> {
+  check(version);
+  const pending = recovering?.result;
+  if (pending) await pending;
+  checkSchoolAccess(version, account);
+  const retry = canRetry && !pending;
+  if (url === endpoints.jwTerms && verifiedTerms !== null) {
+    const terms = verifiedTerms; verifiedTerms = null;
+    return terms;
+  }
   const lntQuery = new URL(url).origin === new URL(LNT_HOME).origin;
   const session = lntSession;
-  const fetchQuery = async () => jsonResponse(await request(url, version, init, { lntQuery }));
-  if (!lntQuery) return fetchQuery();
-  check(version);
-  if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
-  if (authenticating) throw fail('AUTH_REQUIRED');
-  const verifyRecovery = async (recovery: Promise<LntIdentity>) => {
-    const recovered = await recovery;
-    check(version);
-    if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
-    if (recovering || recoveredLntIdentity === null) throw fail('AUTH_REQUIRED');
-    if (account) assertLntAccount(account, recovered);
-    if (account && recoveredLntIdentity) assertLntAccount(account, recoveredLntIdentity);
-  };
-  const pending = recovering?.result;
-  if (pending) {
-    await verifyRecovery(pending);
-    return fetchQuery();
-  }
-  if (account && recoveredLntIdentity) assertLntAccount(account, recoveredLntIdentity);
   let data: unknown;
-  try { data = await fetchQuery(); }
+  try { data = jsonResponse(await request(url, version, init, { lntQuery })); }
   catch (error) {
     check(version);
-    if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
-    if ((error as { code?: string } | null)?.code !== 'AUTH_REQUIRED') throw error;
+    if (session.recovery) await session.recovery;
+    checkSchoolAccess(version, account);
+    if (!retry || !lntQuery || (error as { code?: string } | null)?.code !== 'AUTH_REQUIRED') throw error;
     if (!account || (account.lntId === null && !account.studentNumber.trim())) throw error;
     session.recovery ??= recoverLnt(version, account).finally(() => {
       if (lntSession === session) lntSession = {};
     });
-    await verifyRecovery(session.recovery);
-    return fetchQuery();
+    await session.recovery;
+    return query(url, version, init, account, false);
   }
-  if (session.recovery) await verifyRecovery(session.recovery);
-  if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
+  if (session.recovery) {
+    await session.recovery;
+    if (!retry) throw fail('INVALID_RESPONSE');
+    return query(url, version, init, account, false);
+  }
+  checkSchoolAccess(version, account);
   return data;
 }
-async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], account?: Account, version = generation): Promise<unknown> {
+async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], account?: Account): Promise<unknown> {
+  const version = generation;
   check(version);
-  if (action === 'jwTerms' && verifiedTerms !== null) {
-    const terms = verifiedTerms; verifiedTerms = null;
-    return terms;
-  }
   if (action === 'courses') {
     if (!Number.isSafeInteger(params?.semesterId) || params!.semesterId! <= 0) throw fail('INVALID_SEMESTER');
     const courses: unknown[] = [];
@@ -242,7 +240,7 @@ async function authenticate(onAuthorized?: () => void) {
     await schoolBrowser.initializeAcademic();
     check(version);
     stage = 'academic-probe';
-    const academic = await read('jwTerms', undefined, undefined, version) as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
+    const academic = jsonResponse(await request(endpoints.jwTerms, version, { headers: { Accept: 'application/json' } })) as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
     if (academic?.success === false || !Array.isArray(academic?.datas?.kfdxnxqcx?.rows)) throw fail('INVALID_ACADEMIC_SESSION');
     terms = academic;
     stage = 'lnt';
@@ -281,8 +279,7 @@ function clear(): Promise<void> {
   if (clearing) return clearing;
   generation++; mustClear = true;
   lntSession = {};
-  recoveredLntIdentity = undefined;
-  cookieStorageFailed = false;
+  lntIdentity = undefined;
   verifiedTerms = null;
   const recovery = recovering;
   recovery?.abort();
@@ -308,13 +305,10 @@ function clear(): Promise<void> {
 async function answerRollcall(rollcallId: string, kind: 'number' | 'qr' | 'location', payload: Record<string, unknown>, receipt: typeof numberReceipt, account: Account) {
   if (typeof rollcallId !== 'string' || !rollcallId.trim()) throw fail('INVALID_ATTENDANCE');
   const version = generation;
-  if (!account || (account.lntId === null && !account.studentNumber.trim()) || authenticating) throw fail('AUTH_REQUIRED');
+  if (!account || (account.lntId === null && !account.studentNumber.trim())) throw fail('AUTH_REQUIRED');
   const recovery = recovering;
   if (recovery) await recovery.result;
-  check(version);
-  if (cookieStorageFailed) throw fail('COOKIE_STORAGE');
-  if (recovering || recoveredLntIdentity === null) throw fail('AUTH_REQUIRED');
-  if (recoveredLntIdentity) assertLntAccount(account, recoveredLntIdentity);
+  checkSchoolAccess(version, account);
   const response = await request(`https://lnt.xmu.edu.cn/api/rollcall/${encodeURIComponent(rollcallId)}/${kind === 'location' ? 'answer' : `answer_${kind}_rollcall`}`, version, {
     method: 'PUT', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
     body: JSON.stringify({ deviceId: Crypto.randomUUID(), ...payload }),
@@ -357,18 +351,24 @@ export const schoolDevice: SchoolDevice = {
   authenticate(onAuthorized) {
     if (clearing || mustClear) return Promise.reject(fail('CLEANUP_REQUIRED'));
     authenticating ??= (async () => {
+      const recovery = recovering;
+      if (recovery?.signal.aborted) throw fail('SESSION_DRAINING');
       const version = ++generation;
       lntSession = {};
-      recoveredLntIdentity = null;
-      const recovery = recovering;
+      lntIdentity = 'AUTH_REQUIRED';
       recovery?.abort();
       for (const controller of requests.keys()) controller.abort();
-      await Promise.allSettled([recovery?.drain, ...requests.values()]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled([recovery?.drain, ...requests.values()]),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(fail('SESSION_DRAINING')), requestTimeout); }),
+        ]);
+      } finally { clearTimeout(timer); }
       check(version);
       await authenticate(onAuthorized);
       check(version);
-      cookieStorageFailed = false;
-      recoveredLntIdentity = undefined;
+      lntIdentity = undefined;
     })().finally(() => { authenticating = null; });
     return authenticating;
   },

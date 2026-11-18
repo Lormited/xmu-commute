@@ -242,10 +242,11 @@ test('simultaneous and late stale history responses share one recovery and each 
     const courseId = Number(new URL(url).pathname.split('/')[3]);
     const count = (sent.get(courseId) ?? 0) + 1;
     sent.set(courseId, count);
-    if (count === 1 && courseId === 5) await late.promise;
+    if (count === 1 && courseId >= 5) await late.promise;
+    if (count === 1 && courseId === 6) return response(url, { rollcalls: ['unverified'] });
     if (count === 1 || courseId === 5) return response(url, {}, 401);
   };
-  const requests = [3, 4, 5].map(courseId => f.schoolDevice.read('history', { courseId, studentId: 42 }, recoveryAccount));
+  const requests = [3, 4, 5, 6].map(courseId => f.schoolDevice.read('history', { courseId, studentId: 42 }, recoveryAccount));
   const rejected = assert.rejects(requests[2], { code: 'AUTH_REQUIRED' });
   await tick();
   const page = f.schoolBrowser.getSnapshot();
@@ -254,7 +255,8 @@ test('simultaneous and late stale history responses share one recovery and each 
   await Promise.all(requests.slice(0, 2));
   late.resolve();
   await rejected;
-  assert.deepEqual([...sent.values()], [2, 2, 2]);
+  assert.deepEqual((await requests[3]).rollcalls, [], 'a successful response overlapping recovery is read again after verification');
+  assert.deepEqual([...sent.values()], [2, 2, 2, 2]);
   assert.deepEqual(f.cookieCalls, ['flush']);
   assert.equal(f.schoolBrowser.getSnapshot(), null);
 });
@@ -751,6 +753,76 @@ test('a recovery Cookie failure keeps cached data and requires explicit login fr
   }
 });
 
+test('inconclusive recovery preserves the first failure and blocks access to the unverified session', async () => {
+  for (const [failure, trigger, expectedMessage] of [
+    ['network', 'refresh', 'LNT 待办更新失败，已保留原数据'],
+    ['service', 'refreshHistory', '历史签到读取失败，已保留原数据'],
+    ['browser', 'refreshHistory', '历史签到读取失败，已保留原数据'],
+    ['profile', 'refreshHistory', '历史签到读取失败，已保留原数据'],
+  ]) {
+    const f = fixture(), login = f.learning.login(), late = deferred();
+    const activity = { rollcall_id: 81, course_id: course.id, course_title: '旧活动', is_number: true };
+    f.handler = async url => url.endsWith('/radar/rollcalls') ? response(url, { rollcalls: [activity] }) : undefined;
+    await authorize(f); await initialize(f);
+    assert.equal(await login, true);
+    const saved = f.files.get('school-learning.json'), before = f.learning.getSnapshot();
+    let changed = false, expired = false;
+    f.handler = async (url, options) => {
+      if (url.includes('/course/4/student/') || url.includes('queryXspkjg.do')) await late.promise;
+      if (!expired && url.includes(trigger === 'refresh' ? '/todos' : '/course/3/student/')) {
+        expired = true;
+        return response(url, {}, 401);
+      }
+      if (changed && url.endsWith('/profile')) {
+        if (failure === 'network') throw Error('offline');
+        if (failure === 'service') return response(url, {}, 503);
+        if (failure === 'profile') return response(url, { id: 43 });
+        return response(url, { ...profile, id: 43 });
+      }
+      if (options.method === 'PUT') return response(url, { success: true });
+    };
+    const lateReads = Promise.allSettled([
+      f.schoolDevice.read('history', { courseId: 4, studentId: 42 }, recoveryAccount),
+      f.schoolDevice.read('jwSchedule', { jwTermCode: '20261', studentNumber: '001234' }),
+    ]);
+    const operation = f.learning[trigger]();
+    await tick();
+    const page = f.schoolBrowser.getSnapshot();
+    assert.equal(page?.kind, 'recovery');
+    const staggered = Promise.allSettled([f.schoolDevice.read('rollcalls', undefined, recoveryAccount)]);
+    const pendingAnswer = f.learning.submitNumber('81', '0007');
+    changed = true;
+    if (failure === 'browser') f.schoolBrowser.fail(page, 'NETWORK');
+    else deliverRecoveryLanding(f, page);
+    assert.equal(await operation, false, failure);
+    assert.equal(f.learning.getSnapshot()[trigger === 'refresh' ? 'message' : 'historyMessage'], expectedMessage);
+    assert.equal((await pendingAnswer).result, 'failed');
+    assert.equal((await staggered)[0].status, 'rejected');
+    late.resolve();
+    assert.deepEqual((await lateReads).map(result => result.status), ['rejected', 'rejected']);
+    assert.equal(f.learning.getSnapshot().needsLogin, true);
+    assert.equal(f.learning.getSnapshot().authenticated, false);
+    for (const key of ['account', 'todos', 'rollcalls', 'history', 'schedule']) assert.strictEqual(f.learning.getSnapshot()[key], before[key]);
+    assert.equal(f.files.get('school-learning.json'), saved);
+    assert.equal(f.calls.some(call => call.options.method === 'PUT'), false);
+
+    const count = f.calls.length;
+    assert.equal(await f.learning.refreshHistory(), false);
+    assert.equal((await f.learning.submitNumber('81', '0007')).result, 'failed');
+    await assert.rejects(f.schoolDevice.read('profile', undefined, recoveryAccount), { code: 'AUTH_REQUIRED' });
+    await assert.rejects(f.schoolDevice.read('history', { courseId: 3, studentId: 42 }, recoveryAccount), { code: 'AUTH_REQUIRED' });
+    await assert.rejects(f.schoolDevice.read('jwSchedule', { jwTermCode: '20261', studentNumber: '001234' }), { code: 'AUTH_REQUIRED' });
+    await assert.rejects(f.schoolDevice.answerNumber('81', '0007', recoveryAccount), { code: 'AUTH_REQUIRED' });
+    assert.equal(f.calls.length, count);
+
+    f.handler = null;
+    const retry = f.learning.login();
+    await authorize(f); await initialize(f);
+    assert.equal(await retry, true);
+    assert.equal(await f.learning.refreshHistory(), true);
+  }
+});
+
 test('the full recovery deadline covers the page, session probe, and Cookie flush', async () => {
   for (const phase of ['page', 'probe', 'flush']) {
     const timers = new Map(), gate = deferred();
@@ -786,6 +858,12 @@ test('the full recovery deadline covers the page, session probe, and Cookie flus
     if (phase === 'flush') {
       f.handler = async url => url.includes('/todos') ? response(url, {}, 401) : undefined;
       await assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'AUTH_REQUIRED' });
+      const login = f.learning.login();
+      assert.equal(await Promise.race([login, tick().then(() => 'pending')]), false, 'manual login gives retry feedback while flush is stuck');
+      assert.equal(f.learning.getSnapshot().loggingIn, false);
+      assert.equal(f.learning.getSnapshot().needsLogin, true);
+      assert.match(f.learning.getSnapshot().message, /请稍后重试/);
+      assert.equal(f.schoolBrowser.getSnapshot(), null);
     }
     gate.resolve();
     await tick();
@@ -793,17 +871,10 @@ test('the full recovery deadline covers the page, session probe, and Cookie flus
     assert.deepEqual(f.cookieCalls, phase === 'flush' ? ['flush'] : []);
     assert.equal(timers.size, 0);
     if (phase === 'flush') {
-      let expired = true;
-      f.handler = async url => {
-        if (url.includes('/todos') && expired) { expired = false; return response(url, {}, 401); }
-      };
-      const next = f.schoolDevice.read('todos', undefined, recoveryAccount);
-      void next.catch(() => {});
-      await tick();
-      const page = f.schoolBrowser.getSnapshot();
-      assert.equal(page?.kind, 'recovery');
-      deliverRecoveryLanding(f, page);
-      assert.deepEqual((await next).todo_list, [todo]);
+      f.handler = null;
+      const login = f.learning.login();
+      await authorize(f); await initialize(f);
+      assert.equal(await login, true);
     }
   }
 });
@@ -845,25 +916,41 @@ test('logout closes hidden recovery and drains the browser, probe, or Cookie flu
 });
 
 test('replacement login cancels a waiting PUT and drains the old Cookie flush', async () => {
-  const f = fixture(), gate = deferred();
-  f.flushGate = gate;
-  f.handler = async url => url.includes('/todos') ? response(url, {}, 401) : undefined;
-  const read = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'CANCELLED' });
-  await tick();
-  deliverRecoveryLanding(f, f.schoolBrowser.getSnapshot());
-  await tick();
-  const answer = assert.rejects(f.schoolDevice.answerNumber('81', '0007', recoveryAccount), { code: 'CANCELLED' });
-  const login = f.learning.login();
-  await Promise.all([read, answer]);
-  await tick();
-  assert.equal(f.schoolBrowser.getSnapshot(), null);
-  assert.deepEqual(f.cookieCalls, ['flush']);
-  f.handler = null;
-  gate.resolve();
-  await authorize(f); await initialize(f);
-  assert.equal(await login, true);
-  assert.deepEqual(f.cookieCalls, ['flush', 'flush']);
-  assert.equal(f.calls.filter(call => call.options.method === 'PUT').length, 0);
+  for (const waitExpires of [false, true]) {
+    const timers = new Set(), gate = deferred();
+    const f = fixture(undefined, {
+      setTimeout(fn) { timers.add(fn); return fn; },
+      clearTimeout(fn) { timers.delete(fn); },
+    });
+    f.flushGate = gate;
+    f.handler = async url => url.includes('/todos') ? response(url, {}, 401) : undefined;
+    const read = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'CANCELLED' });
+    await tick();
+    deliverRecoveryLanding(f, f.schoolBrowser.getSnapshot());
+    await tick();
+    const answer = assert.rejects(f.schoolDevice.answerNumber('81', '0007', recoveryAccount), { code: 'CANCELLED' });
+    let login = f.learning.login();
+    await Promise.all([read, answer]);
+    await tick();
+    assert.equal(f.schoolBrowser.getSnapshot(), null);
+    assert.deepEqual(f.cookieCalls, ['flush']);
+    if (waitExpires) {
+      assert.equal(timers.size, 1);
+      const [deadline] = timers;
+      deadline();
+      assert.equal(await login, false);
+      assert.match(f.learning.getSnapshot().message, /请稍后重试/);
+      assert.equal(f.schoolBrowser.getSnapshot(), null);
+    }
+    f.handler = null;
+    gate.resolve();
+    if (waitExpires) { await tick(); login = f.learning.login(); }
+    await authorize(f); await initialize(f);
+    assert.equal(await login, true);
+    assert.equal(timers.size, 0);
+    assert.deepEqual(f.cookieCalls, ['flush', 'flush']);
+    assert.equal(f.calls.filter(call => call.options.method === 'PUT').length, 0);
+  }
 });
 
 test('activity reads and number PUT reuse school sessions, exact ids, string codes and UUID device ids', async () => {
@@ -1304,7 +1391,8 @@ test('legacy Android messages require a current top-document signal before recov
   const landingUrl = 'https://lnt.xmu.edu.cn/user/index#/';
   const loginUrl = 'https://ids.xmu.edu.cn/authserver/login?service=school';
   let attempts = 0;
-  f.handler = async url => url.includes('/todos') && attempts++ < 2 ? response(url, {}, 401) : undefined;
+  const expireTodos = async url => url.includes('/todos') && attempts++ < 2 ? response(url, {}, 401) : undefined;
+  f.handler = expireTodos;
   const expired = assert.rejects(f.schoolDevice.read('todos', undefined, recoveryAccount), { code: 'NETWORK' });
   const mount = async () => {
     await tick();
@@ -1328,6 +1416,11 @@ test('legacy Android messages require a current top-document signal before recov
   first.onError({ nativeEvent: { ...androidNavigation(landingUrl), code: -2 } });
   host.detach();
   await expired;
+  f.handler = null;
+  const login = f.learning.login();
+  await authorize(f); await initialize(f);
+  assert.equal(await login, true);
+  f.handler = expireTodos;
 
   const pending = f.schoolDevice.read('todos', undefined, recoveryAccount);
   void pending.catch(() => {});
@@ -1377,7 +1470,7 @@ test('legacy Android messages require a current top-document signal before recov
     await pending.catch(() => {});
   }
   assert.deepEqual((await pending).todo_list, [todo]);
-  assert.deepEqual(f.cookieCalls, ['flush']);
+  assert.deepEqual(f.cookieCalls, ['flush', 'flush']);
 });
 
 test('hidden recovery preserves official navigation and hands the recognized login form back to manual login', async () => {
