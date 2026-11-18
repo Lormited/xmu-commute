@@ -9,8 +9,7 @@ export function currentCourseIndex(sessions: Session[], now = new Date()) {
 
 export type SchoolScheduleRow = { WID: string; BJDM: string; KCMC: string; JASMC: string; JSXM: string;
   XQ: number; KSJCDM: number; JSJCDM: number; KSSJ: string; JSSJ: string; ZCMC: string; JCFADM: string };
-export type ScheduleTerm = { jwTermCode: string; name: string; currentWeek: number; weeks: number[] };
-export type SchoolSchedule = ScheduleTerm & { weekAt: number; rows: SchoolScheduleRow[] };
+export type SchoolSchedule = { jwTermCode: string; name: string; currentWeek: number; weeks: number[]; weekAt: number; rows: SchoolScheduleRow[] };
 function number(value: unknown) {
   const parsed = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
   if (!Number.isSafeInteger(parsed) || (parsed as number) < 1) throw Error('INVALID_SCHEDULE');
@@ -26,7 +25,7 @@ function time(value: unknown) {
   if (!/^([01]\d|2[0-3])[0-5]\d$/.test(raw)) throw Error('INVALID_SCHEDULE');
   return raw.slice(0, 2) + ':' + raw.slice(2);
 }
-export function scheduleFrom(rowsValue: unknown, jwTermCode: string) {
+export function scheduleRowsFrom(rowsValue: unknown): SchoolScheduleRow[] {
   const response = rowsValue as { success?: boolean; pkjgList?: unknown } | null;
   if (response?.success !== true || !Array.isArray(response.pkjgList)) throw Error('INVALID_SCHEDULE');
   const rows = response.pkjgList.map(row => ({ WID: text(row?.WID), BJDM: text(row?.BJDM), KCMC: text(row?.KCMC),
@@ -35,9 +34,9 @@ export function scheduleFrom(rowsValue: unknown, jwTermCode: string) {
     KSSJ: time(row?.KSSJ), JSSJ: time(row?.JSSJ), ZCMC: text(row?.ZCMC), JCFADM: text(row?.JCFADM) }));
   rows.forEach(row => teachingWeeks(row.ZCMC));
   if (rows.some(row => row.XQ > 7 || row.KSJCDM > row.JSJCDM || row.JSJCDM > 100 || row.KSSJ >= row.JSSJ)) throw Error('INVALID_SCHEDULE');
-  return { jwTermCode, rows };
+  return rows;
 }
-function termsFrom(value: unknown): Pick<ScheduleTerm, 'jwTermCode' | 'name'>[] {
+function termsFrom(value: unknown): Pick<SchoolSchedule, 'jwTermCode' | 'name'>[] {
   const response = value as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
   const rows = response?.datas?.kfdxnxqcx?.rows;
   if (response?.success === false || !Array.isArray(rows)) throw Error('INVALID_TERMS');
@@ -52,7 +51,7 @@ function weekNumber(value: unknown): number {
   if (!Number.isSafeInteger(number)) throw Error('INVALID_WEEKS');
   return number as number;
 }
-function weeksFrom(value: unknown): Pick<ScheduleTerm, 'currentWeek' | 'weeks'> {
+function weeksFrom(value: unknown): Pick<SchoolSchedule, 'currentWeek' | 'weeks'> {
   const response = value as { success?: boolean; currentZc?: unknown; zcList?: { ZC?: unknown }[] } | null;
   if (response?.success !== true || !Array.isArray(response.zcList) || !Object.hasOwn(response, 'currentZc')) throw Error('INVALID_WEEKS');
   const weeks = [...new Set(response.zcList.map(row => weekNumber(row?.ZC)))].sort((a, b) => a - b);
@@ -63,15 +62,14 @@ export async function readSchedule(device: SchoolDevice, studentNumber: string, 
   const elapsedWeeks = cached ? Math.round((monday(new Date(now())).getTime() - monday(new Date(cached.weekAt)).getTime()) / 604800000) : 0;
   if (cached && cached.weeks.includes(cached.currentWeek + elapsedWeeks)) {
     const rows = await device.read('jwSchedule', { jwTermCode: cached.jwTermCode, studentNumber });
-    return { ...cached, ...scheduleFrom(rows, cached.jwTermCode) };
+    return { ...cached, rows: scheduleRowsFrom(rows) };
   }
   for (const candidate of termsFrom(await device.read('jwTerms'))) {
     const week = weeksFrom(await device.read('jwWeek', { jwTermCode: candidate.jwTermCode }));
     if (!week.weeks.includes(week.currentWeek)) continue;
     const weekAt = now();
-    const params = { jwTermCode: candidate.jwTermCode, studentNumber };
-    const rows = await device.read('jwSchedule', params);
-    return { ...scheduleFrom(rows, candidate.jwTermCode), ...candidate, ...week, weekAt };
+    const rows = await device.read('jwSchedule', { jwTermCode: candidate.jwTermCode, studentNumber });
+    return { ...candidate, ...week, weekAt, rows: scheduleRowsFrom(rows) };
   }
   throw Error('NO_CURRENT_TERM');
 }
@@ -93,13 +91,12 @@ function monday(date: Date) {
   result.setDate(result.getDate() - (result.getDay() + 6) % 7);
   return result;
 }
-export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'scheduleAt' | 'schedule'>, now = new Date()) {
+export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'schedule'>, now = new Date()) {
   const schedule = data.schedule;
-  const term = schedule;
   const grouped = new Map<string, SchoolScheduleRow[]>();
   for (const row of schedule?.rows ?? []) {
     const ranges = teachingWeeks(row.ZCMC);
-    const weeks = term!.weeks.filter(week => ranges.some(range => week >= range.start && week <= range.end
+    const weeks = schedule!.weeks.filter(week => ranges.some(range => week >= range.start && week <= range.end
       && (range.parity === '单' ? week % 2 === 1 : range.parity === '双' ? week % 2 === 0 : true)));
     const key = JSON.stringify([row.BJDM, weeks, row.XQ, row.KSSJ, row.JSSJ, row.KSJCDM, row.JSJCDM, row.JCFADM]);
     const group = grouped.get(key);
@@ -109,11 +106,11 @@ export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'sch
     JASMC: [...new Set(group.map(row => row.JASMC).filter(Boolean))].join('、'),
     JSXM: [...new Set(group.map(row => row.JSXM).filter(Boolean))].join('、'),
   }));
-  const anchor = monday(new Date(schedule?.weekAt ?? data.scheduleAt ?? now.getTime()));
-  const currentWeek = (term?.currentWeek ?? 1) + Math.round((monday(now).getTime() - anchor.getTime()) / 604800000);
+  const anchor = monday(new Date(schedule?.weekAt ?? now.getTime()));
+  const currentWeek = (schedule?.currentWeek ?? 1) + Math.round((monday(now).getTime() - anchor.getTime()) / 604800000);
   const courseId = (row: SchoolScheduleRow) => String(data.courses.find(course => course.course_code === row.BJDM)?.id ?? 'jw:' + row.BJDM);
   const periods = Array.from({ length: rows.reduce((length, row) => Math.max(length, row.JSJCDM), defaultPeriods.length) },
-    (_, index): [string, string] => [defaultPeriods[index]?.[0] ?? '', defaultPeriods[index]?.[1] ?? '']);
+    (_, index) => defaultPeriods[index] ?? ['', '']);
   const sessions: Session[] = rows.map((row, index) => ({
     id: row.WID + ':' + index, courseId: courseId(row), day: row.XQ - 1, start: row.KSJCDM - 1,
     length: row.JSJCDM - row.KSJCDM + 1, room: row.JASMC, teacher: row.JSXM,
@@ -122,9 +119,9 @@ export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'sch
   const courseIds = [...new Set([...data.courses.map(course => String(course.id)), ...sessions.map(session => session.courseId)])];
   return {
     sessions, periods,
-    name: term?.name ?? '当前学期', currentWeek, minWeek: term?.weeks[0] ?? 1, weeks: term?.weeks.at(-1) ?? 1,
+    name: schedule?.name ?? '当前学期', currentWeek, minWeek: schedule?.weeks[0] ?? 1, weeks: schedule?.weeks.at(-1) ?? 1,
     sessionsForWeek(week: number): Session[] {
-      if (!term?.weeks.includes(week)) return [];
+      if (!schedule?.weeks.includes(week)) return [];
       return sessions.filter(session => teachingWeeks(session.weeks!).some(range => week >= range.start && week <= range.end
         && (range.parity === '单' ? week % 2 === 1 : range.parity === '双' ? week % 2 === 0 : true)));
     },
@@ -137,7 +134,7 @@ export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'sch
     },
     weekDays(week: number) {
       return Array.from({ length: 7 }, (_, day) => {
-        const date = new Date(anchor); date.setDate(date.getDate() + (week - (term?.currentWeek ?? 1)) * 7 + day);
+        const date = new Date(anchor); date.setDate(date.getDate() + (week - (schedule?.currentWeek ?? 1)) * 7 + day);
         return { label: ['一', '二', '三', '四', '五', '六', '日'][day], date: date.getDate(), month: date.getMonth() + 1, today: date.toDateString() === now.toDateString() };
       });
     },

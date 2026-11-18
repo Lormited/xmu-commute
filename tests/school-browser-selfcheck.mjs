@@ -26,7 +26,7 @@ const academicPage = 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/*default/index.do'
 const academicTerms = { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '测试学期' }] } } };
 const profile = { id: 42, user_no: '001234', name: '测试同学' };
 const todo = { id: 7, course_id: 3, course_name: '课程', title: '学校返回的作业', type: 'homework', end_time: null, is_locked: false };
-const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9, semester: { id: 9, code: '2026-1' } };
+const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9 };
 const academicWeeks = { success: true, currentZc: '8', zcList: Array.from({ length: 18 }, (_, i) => ({ ZC: i + 1 })) };
 const authorization = IDENTITY + '/auth?' + new URLSearchParams({ redirect_uri: CALLBACK, state: 'test-state' });
 // RNCWebViewClient.createWebViewEvent: direct Android requests omit a frame flag.
@@ -132,7 +132,7 @@ test('LNT courses use the selected semester and collect every page before return
     const body = JSON.parse(options.body);
     assert.deepEqual(body.conditions.semester_id, [9]);
     assert.equal(body.page_size, 100);
-    assert.equal(body.fields, 'id,course_code,name,semester_id,semester');
+    assert.equal(body.fields, 'id,course_code,name,semester_id');
     return response(url, { courses: [{ ...course, id: body.page }], pages: 2, total: 2 });
   };
   for (const semesterId of [undefined, 0, -1, '9', 1.5]) {
@@ -987,16 +987,14 @@ test('learning tabs use independent school collections, preserve switching, and 
 });
 test('timetable requests send the current term and own student number without a week filter', async () => {
   const f = fixture();
-  for (const action of ['jwSchedule']) {
-    await assert.rejects(f.schoolDevice.read(action, { jwTermCode: 'invalid', studentNumber: '001234' }), { code: 'INVALID_TERM' });
-    await f.schoolDevice.read(action, { jwTermCode: '20261', studentNumber: '001234' });
-    const request = f.calls.at(-1);
-    assert.ok(request.url.endsWith('/queryXspkjg.do'));
-    assert.equal(request.options.method, 'POST');
-    assert.equal(request.options.headers['Content-Type'], 'application/x-www-form-urlencoded');
-    assert.equal(request.options.body, 'XNXQDM=20261&XH=001234');
-    assert.equal(new URLSearchParams(request.options.body).has('ZC'), false);
-  }
+  await assert.rejects(f.schoolDevice.read('jwSchedule', { jwTermCode: 'invalid', studentNumber: '001234' }), { code: 'INVALID_TERM' });
+  await f.schoolDevice.read('jwSchedule', { jwTermCode: '20261', studentNumber: '001234' });
+  const request = f.calls.at(-1);
+  assert.ok(request.url.endsWith('/queryXspkjg.do'));
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  assert.equal(request.options.body, 'XNXQDM=20261&XH=001234');
+  assert.equal(new URLSearchParams(request.options.body).has('ZC'), false);
   assert.equal(f.calls.length, 1);
 });
 

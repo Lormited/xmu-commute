@@ -3,18 +3,17 @@ import { test } from 'node:test';
 import * as scheduleModule from '../src/schedule.ts';
 import { courses as courseColors, groupSessions, periods as defaultPeriods } from '../src/demo-data.ts';
 const row = { WID: 'one', BJDM: '001-A', KCMC: '教务课程一', JASMC: '学校教室 101', JSXM: '张老师', XQ: '1', KSJCDM: '1', JSJCDM: '2', KSSJ: '0800', JSSJ: '0940', ZCMC: '1-2,7-9周', JCFADM: 'a' };
-const term = { jwTermCode: '20261', lntTermCode: '2026-1', name: '学校当前学期', currentWeek: 8, weeks: Array.from({ length: 18 }, (_, i) => i + 1) };
+const term = { jwTermCode: '20261', name: '学校当前学期', currentWeek: 8, weeks: Array.from({ length: 18 }, (_, i) => i + 1) };
 const courses = [{ id: 3, course_code: '001-A', name: 'LNT 课程一' }, { id: 4, course_code: '001-A ', name: '同名但不同教学班' }];
 const at = new Date(2026, 9, 26, 12).getTime();
-const makeData = (rows = [row]) => ({ courses, scheduleAt: at, schedule: { ...scheduleModule.scheduleFrom({ success: true, pkjgList: rows }, '20261'), ...term, weekAt: at } });
+const makeData = (rows = [row]) => ({ courses, schedule: { ...term, weekAt: at, rows: scheduleModule.scheduleRowsFrom({ success: true, pkjgList: rows }) } });
 
 test('schedule needs only arrangement rows, keeps late sections, and validates their bounds', () => {
-  const schedule = scheduleModule.scheduleFrom({ success: true, pkjgList: [{ ...row, KSJCDM: 11, JSJCDM: 12 }] }, '20261');
-  const view = scheduleModule.schoolScheduleView({ courses, scheduleAt: at, schedule: { ...schedule, ...term, weekAt: at } }, new Date(at));
+  const view = scheduleModule.schoolScheduleView(makeData([{ ...row, KSJCDM: 11, JSJCDM: 12 }]), new Date(at));
   assert.deepEqual(view.periods, [...defaultPeriods, ['', '']]);
   assert.equal(view.sessions[0].time, '08:00 — 09:40');
   for (const patch of [{ XQ: 8 }, { KSJCDM: 0 }, { KSJCDM: 3, JSJCDM: 2 }, { JSJCDM: 101 }, { KSSJ: '08:75' }, { JSSJ: '0700' }]) {
-    assert.throws(() => scheduleModule.scheduleFrom({ success: true, pkjgList: [{ ...row, ...patch }] }, '20261'));
+    assert.throws(() => scheduleModule.scheduleRowsFrom({ success: true, pkjgList: [{ ...row, ...patch }] }));
   }
 });
 
@@ -30,7 +29,7 @@ test('daily schedule requests reuse the calendar anchor until the calculated wee
   assert.deepEqual(calls.map(([action]) => action), ['jwSchedule']);
   assert.equal(next.weekAt, at);
   assert.equal(next.currentWeek, 8);
-  assert.equal(scheduleModule.schoolScheduleView({ courses, schedule: next, scheduleAt: at + 604800000 }, new Date(at + 604800000)).currentWeek, 9);
+  assert.equal(scheduleModule.schoolScheduleView({ courses, schedule: next }, new Date(at + 604800000)).currentWeek, 9);
   assert.deepEqual(next.weeks, term.weeks, 'empty arrangements retain teaching weeks without lessons');
   for (const calendar of [null, { ...cached, weekAt: at - 20 * 604800000 }]) {
     calls.length = 0;

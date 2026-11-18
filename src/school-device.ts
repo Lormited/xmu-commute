@@ -69,7 +69,7 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
     for (let page = 1; page <= pages; page++) {
       const response = await request(endpoints.courses, version, {
         method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ page, page_size: 100, fields: 'id,course_code,name,semester_id,semester', conditions: { semester_id: [params!.semesterId] } }),
+        body: JSON.stringify({ page, page_size: 100, fields: 'id,course_code,name,semester_id', conditions: { semester_id: [params!.semesterId] } }),
       });
       const result = jsonResponse(response) as { success?: unknown; courses?: unknown; pages?: unknown; total?: unknown } | null;
       if (result?.success === false || !Array.isArray(result?.courses) || !Number.isSafeInteger(result.pages) || (result.pages as number) < 0

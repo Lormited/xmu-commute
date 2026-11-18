@@ -3,9 +3,9 @@ import { test } from 'node:test';
 import { createLearning, historyView } from '../src/learning.ts';
 import { visibleHistory } from '../src/demo-data.ts';
 
-const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9, semester: { id: 9, code: '2026-1' } };
+const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9 };
 const otherCourse = { ...course, id: 4, name: '另一课程' };
-const term = { jwTermCode: '20261', lntTermCode: '2026-1', name: '秋季学期', currentWeek: 8, weeks: [8] };
+const term = { id: 9, name: '秋季学期' };
 const record = { rollcall_id: 11, student_rollcall_id: 111, rollcall_time: '2026-11-08T08:00:00+08:00', title: '课堂签到', student_status: 'on_call', status: 'on_call_fine', student_status_detail: null, is_number: true, is_radar: false, type: 'manual', rollcall_status: 'closed', is_expired: true };
 const scheduleRow = { WID: 'row-1', BJDM: '001-A', KCMC: '学校课程', JASMC: '教学楼 101', JSXM: '张老师', XQ: 2, KSJCDM: 1, JSJCDM: 1, KSSJ: '0800', JSSJ: '0845', ZCMC: '8周', JCFADM: 'a' };
 const saved = { version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [], todosAt: 1000, term, courses: [course, otherCourse], coursesAt: 1000 };

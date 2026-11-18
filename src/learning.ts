@@ -1,4 +1,4 @@
-import { readSchedule, scheduleFrom, type SchoolSchedule } from './schedule.ts';
+import { readSchedule, scheduleRowsFrom, type SchoolSchedule } from './schedule.ts';
 import { rollcallsFrom, type AttendanceReceipt, type CompletedAttendance } from './attendance.ts';
 import { methodLabel, type HistoryItem, type Rollcall } from './demo-data.ts';
 import { isPosition, type Position } from './location-attendance.ts';
@@ -12,7 +12,7 @@ export type SchoolTodo = {
 };
 export type SchoolTerm = { id: number | null; name: string };
 export type SchoolCourse = {
-  id: number; course_code: string; name: string; semester_id?: number; semester?: { id?: number; code?: string; [key: string]: unknown } | null;
+  id: number; course_code: string; name: string; semester_id?: number;
   [key: string]: unknown;
 };
 export type SchoolHistory = {
@@ -87,10 +87,7 @@ function coursesFrom(value: unknown, term: SchoolTerm): SchoolCourse[] {
   const list = (value as { courses?: unknown } | null)?.courses;
   if ((value as { success?: unknown } | null)?.success === false || !Array.isArray(list) || !list.every(item => item && Number.isSafeInteger(item.id)
     && typeof item.course_code === 'string' && typeof item.name === 'string'
-    && (term.id === null || Number.isSafeInteger(item.semester_id) && item.semester_id > 0)
-    && (item.semester == null || (typeof item.semester === 'object' && !Array.isArray(item.semester)
-      && (item.semester.id === undefined || Number.isSafeInteger(item.semester.id))
-      && (item.semester.code === undefined || typeof item.semester.code === 'string'))))) throw Error('INVALID_COURSES');
+    && (term.id === null || Number.isSafeInteger(item.semester_id) && item.semester_id > 0))) throw Error('INVALID_COURSES');
   if (new Set(list.map(item => item.id)).size !== list.length) throw Error('INVALID_COURSES');
   return term.id === null ? list : list.filter(item => item.semester_id === term.id);
 }
@@ -134,10 +131,8 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
     const saved = data.term as SchoolTerm & Partial<SchoolSchedule> & { lntTermCode?: string };
     if (!saved || typeof saved.name !== 'string' || !Number.isFinite(data.coursesAt)) throw Error('INVALID_CACHE');
     if (saved.jwTermCode !== undefined) {
-      if (!/^\d{4}[123]$/.test(saved.jwTermCode) || saved.lntTermCode !== saved.jwTermCode.slice(0, 4) + '-' + saved.jwTermCode.slice(4)
-        || !Number.isSafeInteger(saved.currentWeek) || !Array.isArray(saved.weeks) || !saved.weeks.every(week => Number.isSafeInteger(week) && week > 0)
-        || !saved.weeks.includes(saved.currentWeek!)) throw Error('INVALID_CACHE');
-      if (!Array.isArray(data.courses) || !data.courses.every(course => course.semester?.code === saved.lntTermCode)) throw Error('INVALID_CACHE');
+      if (!/^\d{4}[123]$/.test(saved.jwTermCode) || saved.lntTermCode !== saved.jwTermCode.slice(0, 4) + '-' + saved.jwTermCode.slice(4)) throw Error('INVALID_CACHE');
+      if (!Array.isArray(data.courses) || !data.courses.every(course => (course.semester as { code?: unknown } | null)?.code === saved.lntTermCode)) throw Error('INVALID_CACHE');
       const semesterId = data.courses[0]?.semester_id;
       const knownId = Number.isSafeInteger(semesterId) && semesterId! > 0 && data.courses.every(course => course.semester_id === semesterId);
       term = { id: knownId ? semesterId! : null, name: saved.name };
@@ -158,7 +153,7 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
       || !Number.isSafeInteger(metadata.currentWeek) || !Array.isArray(metadata.weeks) || !metadata.weeks.every(week => Number.isSafeInteger(week) && week > 0)
       || !metadata.weeks.includes(metadata.currentWeek!) || data.schedule.jwTermCode !== metadata.jwTermCode
       || !Number.isFinite(weekAt) || !Number.isFinite(data.scheduleAt)) throw Error('INVALID_CACHE');
-    schedule = { ...scheduleFrom({ success: true, pkjgList: data.schedule.rows }, metadata.jwTermCode),
+    schedule = { jwTermCode: metadata.jwTermCode, rows: scheduleRowsFrom({ success: true, pkjgList: data.schedule.rows }),
       name: metadata.name, currentWeek: metadata.currentWeek!, weeks: metadata.weeks, weekAt: weekAt! };
     scheduleAt = data.scheduleAt;
   }

@@ -6,7 +6,7 @@ import { schoolScheduleView } from '../src/schedule.ts';
 
 const profile = { id: 42, user_no: '001234', name: '测试同学' };
 const todo = { id: 7, course_id: 3, course_name: '测试课程', title: '学校待办', type: 'homework', end_time: '2026-11-10T12:00:00Z', is_locked: false };
-const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9, semester: { id: 9, code: '2026-1', name: '秋季' }, extra: 'preserved' };
+const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9, extra: 'preserved' };
 const terms = { datas: { kfdxnxqcx: { rows: [{ XNXQDM: '20261', XNXQDM_DISPLAY: '2026 秋季学期' }] } } };
 const lntTerms = { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] };
 const weeks = { success: true, currentZc: '8', zcList: Array.from({ length: 18 }, (_, i) => ({ ZC: String(i + 1) })) };
@@ -260,7 +260,7 @@ test('invalid term, week, and course responses retain the entire saved batch', a
     ['courses', { courses: [{ ...course, id: '3' }] }], ['courses', { courses: [{ ...course, course_code: 3 }] }],
     ['courses', { courses: [{ ...course, semester_id: undefined }] }],
     ['courses', { courses: [course, course] }],
-    ['courses', { courses: [{ ...course, semester: [] }] }], ['courses', { success: false, courses: [] }],
+    ['courses', { success: false, courses: [] }],
   ];
   for (const [failedAction, response] of invalid) {
     const f = fixture(); assert.equal(await f.learning.login(), true);
@@ -276,13 +276,13 @@ test('invalid term, week, and course responses retain the entire saved batch', a
   }
 });
 
-test('LNT current semester does not require a code or matching academic term, including an empty course semester', async () => {
+test('LNT current semester ignores unrelated semester metadata and accepts an empty course semester', async () => {
   const f = fixture(); await f.learning.login();
   const before = f.learning.getSnapshot(), savedSchedule = before.schedule;
   f.device.read = async action => {
     if (action.startsWith('jw')) assert.fail('a disabled refresh is LNT-only');
     return action === 'lntTerms' ? { semesters: [{ id: 77, name: '当前 LNT 学期', is_active: true }, { id: 999, name: '未来学期', is_active: false }] }
-      : action === 'courses' ? { courses: [{ ...course, semester_id: 77, semester: { id: 77 } }] } : schoolData(action);
+      : action === 'courses' ? { courses: [{ ...course, semester_id: 77, semester: [] }] } : schoolData(action);
   };
   assert.equal(await f.learning.refresh(), true);
   assert.deepEqual(f.learning.getSnapshot().term, { id: 77, name: '当前 LNT 学期' });
@@ -413,16 +413,14 @@ test('ordinary refresh keeps the cached timetable and late timetable reads canno
   assert.equal(await f.learning.refresh(), true);
   assert.equal(f.calls.includes('jwSchedule'), false);
   assert.deepEqual(f.learning.getSnapshot().schedule, original);
-  for (const paused of ['jwSchedule']) {
-    const pending = fixture(), gate = deferred(), read = pending.device.read;
-    pending.device.read = async (action, params) => { if (action === paused) await gate.promise; return read(action, params); };
-    const login = pending.learning.login(); await tick();
-    assert.equal(await pending.learning.logout(), true);
-    gate.resolve(); assert.equal(await login, false);
-    assert.equal(pending.learning.getSnapshot().schedule, null);
-    assert.equal(pending.learning.getSnapshot().scheduleAt, null);
-    assert.equal(pending.stored(), null);
-  }
+  const pending = fixture(), gate = deferred(), read = pending.device.read;
+  pending.device.read = async (action, params) => { if (action === 'jwSchedule') await gate.promise; return read(action, params); };
+  const login = pending.learning.login(); await tick();
+  assert.equal(await pending.learning.logout(), true);
+  gate.resolve(); assert.equal(await login, false);
+  assert.equal(pending.learning.getSnapshot().schedule, null);
+  assert.equal(pending.learning.getSnapshot().scheduleAt, null);
+  assert.equal(pending.stored(), null);
 });
 test('damaged timetable caches are rejected without modifying the file', async () => {
   const f = fixture(); await f.learning.login();
@@ -837,6 +835,19 @@ test('legacy cache keeps timetable dates, history and update time across ordinar
     courses: [{ ...course, semester_id: undefined, semester: { code: '2026-1' } }], coursesAt: at, scheduleAt: at - 7 * 86400000,
     schedule: { jwTermCode: '20261', rows: [scheduleRow], periods: schedulePeriods },
     history: [{ course_id: 3, course_name: course.name, rollcall_id: 11, rollcall_time: '2026-11-02T00:00:00Z', title: '签到', student_status: 'on_call', status: 'on_call_fine', student_status_detail: null }], historyAt: at };
+  for (const calendar of [{ currentWeek: undefined, weeks: undefined }, { currentWeek: 0, weeks: [] }]) for (const schedule of [null, legacy.schedule]) {
+    const raw = JSON.stringify({ ...legacy, term: { ...legacy.term, ...calendar }, schedule,
+      courses: [{ ...course, semester: { code: '2026-1' } }] }), reopened = fixture(raw);
+    await reopened.learning.restore();
+    const data = reopened.learning.getSnapshot();
+    assert.equal(data.authenticated, schedule === null, 'only a timetable needs a valid calendar');
+    if (schedule === null) {
+      assert.deepEqual(data.term, { id: 9, name: legacy.term.name });
+      assert.deepEqual(data.history, legacy.history);
+      assert.deepEqual([data.coursesAt, data.historyAt], [at, at]);
+    } else assert.match(data.message, /读取失败/);
+    assert.equal(reopened.stored(), raw);
+  }
   const f = fixture(JSON.stringify(legacy)); f.learning = createLearning(f.device, () => later);
   await f.learning.restore();
   assert.equal(f.learning.getSnapshot().authenticated, true);
