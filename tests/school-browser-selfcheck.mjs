@@ -33,6 +33,7 @@ const sessionKey = 'xmuc.school-session';
 const candidateKey = 'xmuc.school-session.next';
 const selectionKey = 'xmuc.school-session.active';
 const lntRoot = 'https://lnt.xmu.edu.cn/';
+const rollcallsUrl = lntRoot + 'api/radar/rollcalls?api_version=1.1.0';
 const casLogin = 'https://ids.xmu.edu.cn/authserver/login';
 const webCookies = [
   { name: 'lnt_session', value: 'web-lnt', domain: 'lnt.xmu.edu.cn', path: '/' },
@@ -98,7 +99,7 @@ function fixture(files = new Map(), { secure = new Map(), timers = {} } = {}) {
     if (url.includes('/my-courses')) return response(url, { courses: [course], pages: 1, total: 1 });
     if (url.endsWith('/profile')) return response(url, profile);
     if (url.includes('/todos')) return response(url, { todo_list: [todo] });
-    if (url.endsWith('/radar/rollcalls')) return response(url, { rollcalls: [] });
+    if (url === rollcallsUrl) return response(url, { rollcalls: [] });
     if (url.includes('/rollcalls')) return response(url, { rollcalls: [] });
     throw Error('Unexpected request');
   };
@@ -869,7 +870,7 @@ test('undocumented identity redirects, broad login markup, and resource 403 do n
 test('activity reads and number PUT reuse school sessions, exact ids, string codes and UUID device ids', async () => {
   const f = await boundFixture();
   const activity = { rollcall_id: 'school-81', course_id: 301, course_title: '真实字段模拟活动', is_number: true };
-  f.handler = async (url, options) => url.endsWith('/radar/rollcalls') ? response(url, { rollcalls: [activity] })
+  f.handler = async (url, options) => url === rollcallsUrl ? response(url, { rollcalls: [activity] })
     : options.method === 'PUT' ? response(url, { success: true, message: '学校已记录签到' }) : undefined;
   assert.deepEqual(await f.schoolDevice.read('rollcalls'), { rollcalls: [activity] });
   const receipt = await f.schoolDevice.answerNumber('school-81', '0007', recoveryAccount);
@@ -957,7 +958,7 @@ test('number requests reject invalid input, login pages and malformed receipts',
 test('a school p scan sends one PUT with decoded opaque data and returns the school receipt', async () => {
   const f = fixture();
   const activity = { rollcall_id: 83, course_id: course.id, course_title: '扫码活动' };
-  f.handler = async (url, options) => url.endsWith('/radar/rollcalls') ? response(url, { rollcalls: [activity] })
+  f.handler = async (url, options) => url === rollcallsUrl ? response(url, { rollcalls: [activity] })
     : options.method === 'PUT' ? response(url, { status: 'on_call' }) : undefined;
   const login = f.learning.login();
   await authorize(f); await initialize(f);
@@ -1274,7 +1275,7 @@ test('the real homepage refresh renders separate school activities and opens eac
   const saved = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [], todosAt: 1000 });
   const f = await boundFixture(new Map([['school-learning.json', saved]])), app = pages(f);
   await f.learning.restore(); app.render();
-  f.handler = async url => url.endsWith('/radar/rollcalls') ? response(url, { rollcalls: [
+  f.handler = async url => url === rollcallsUrl ? response(url, { rollcalls: [
     { rollcall_id: 81, course_id: 301, course_title: '学校数字码活动', is_number: true },
     { rollcall_id: 82, course_id: 301, course_title: '学校二维码活动' },
     { rollcall_id: 83, course_id: 302, course_name: '学校定位活动', is_radar: true },
@@ -1675,7 +1676,7 @@ test('history page entry, toolbar and pull context refresh history independently
   assert.equal(f.calls.length, 1); assert.match(f.calls[0].url, /rollcalls/);
   f.calls.length = 0; app.render(); app.refreshButton().props.onPress(); await tick();
   assert.equal(f.calls.some(call => /\/course\/\d+\/student\//.test(call.url)), false);
-  assert.equal(f.calls.some(call => call.url.endsWith('/radar/rollcalls')), true);
+  assert.equal(f.calls.some(call => call.url === rollcallsUrl), true);
 });
 
 

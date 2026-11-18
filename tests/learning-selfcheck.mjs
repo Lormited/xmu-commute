@@ -579,6 +579,7 @@ test('school activities preserve identities, names and methods; malformed collec
   const f = await attendanceFixture(), saved = f.stored(), before = f.learning.getSnapshot();
   for (const payload of [null, {}, { rollcalls: null }, { rollcalls: [null] }, { rollcalls: [{}] },
     { rollcalls: [{ ...schoolRollcalls[0], course_id: null }] }, { rollcalls: [{ ...schoolRollcalls[0], is_number: 'true' }] },
+    { rollcalls: [{ ...schoolRollcalls[0], status: 'on_call_fine', course_id: null }] },
     { rollcalls: [schoolRollcalls[0], schoolRollcalls[0]] }, { success: false, rollcalls: [] }]) {
     assert.throws(() => rollcallsFrom(payload), /INVALID_ROLLCALLS/);
     f.device.read = async action => action === 'profile' ? profile : action === 'rollcalls' ? payload : action === 'todos' ? { todo_list: [] } : schoolData(action);
@@ -599,6 +600,23 @@ test('a refresh waits for activities and publishes the whole saved batch togethe
   assert.equal(await refresh, true);
   assert.deepEqual(f.learning.getSnapshot().todos, []);
   assert.deepEqual(f.learning.getSnapshot().rollcalls, []);
+});
+
+test('refresh drops an ongoing activity marked complete by school and restores only pending activities', async () => {
+  const f = await attendanceFixture();
+  assert.deepEqual(f.learning.getSnapshot().rollcalls.map(item => item.id), ['81', '82', '83']);
+  const read = f.device.read;
+  f.device.read = async action => action === 'rollcalls'
+    ? { rollcalls: [{ ...schoolRollcalls[0], status: 'on_call_fine' }, ...schoolRollcalls.slice(1)] }
+    : read(action);
+  assert.equal(await f.learning.refresh(), true);
+  assert.deepEqual(f.learning.getSnapshot().rollcalls.map(item => item.id), ['82', '83']);
+  assert.deepEqual(f.learning.getSnapshot().attendance, {});
+  assert.deepEqual(f.answers, []);
+
+  const reopened = createLearning(f.device);
+  await reopened.restore();
+  assert.deepEqual(reopened.getSnapshot().rollcalls.map(item => item.id), ['82', '83']);
 });
 
 test('number submission validates the activity, keeps leading zeroes and sends one request while busy', async () => {

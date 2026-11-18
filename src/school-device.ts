@@ -22,7 +22,7 @@ const endpoints = {
   todos: 'https://lnt.xmu.edu.cn/api/todos?no-intercept=true',
   lntTerms: 'https://lnt.xmu.edu.cn/api/semesters',
   courses: 'https://lnt.xmu.edu.cn/api/my-courses',
-  rollcalls: 'https://lnt.xmu.edu.cn/api/radar/rollcalls',
+  rollcalls: 'https://lnt.xmu.edu.cn/api/radar/rollcalls?api_version=1.1.0',
   jwTerms: 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/modules/xskcb/kfdxnxqcx.do',
 };
 let generation = 0;

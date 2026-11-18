@@ -9,16 +9,19 @@ export function rollcallsFrom(value: unknown): Rollcall[] {
   const body = value as { success?: unknown; rollcalls?: unknown } | null;
   if (body?.success === false || !Array.isArray(body?.rollcalls)) throw Error('INVALID_ROLLCALLS');
   const ids = new Set<string>();
-  return body.rollcalls.map(item => {
+  const pending: Rollcall[] = [];
+  for (const item of body.rollcalls) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) throw Error('INVALID_ROLLCALLS');
     const id = identifier(item.rollcall_id) || identifier(item.id);
     const courseId = identifier(item.course_id) || identifier(item.course?.id);
     if (!id || !courseId || ids.has(id) || ['is_number', 'is_radar'].some(key => item[key] != null && typeof item[key] !== 'boolean')) throw Error('INVALID_ROLLCALLS');
     ids.add(id);
+    if (item.status === 'on_call_fine') continue;
     const title = [item.course_title, item.course_name].find(text => typeof text === 'string' && text.trim()) ?? '签到活动';
-    return { id, courseId, title, method: item.is_radar ? 'radar' : item.is_number ? 'number' : 'qr',
-      time: typeof item.rollcall_time === 'string' ? item.rollcall_time : '' };
-  });
+    pending.push({ id, courseId, title, method: item.is_radar ? 'radar' : item.is_number ? 'number' : 'qr',
+      time: typeof item.rollcall_time === 'string' ? item.rollcall_time : '' });
+  }
+  return pending;
 }
 
 export function numberReceipt(httpStatus: number, value: unknown): AttendanceReceipt {
