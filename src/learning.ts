@@ -73,9 +73,9 @@ export function assertLntAccount(expected: Account, actual: Pick<Account, 'lntId
     throw Object.assign(Error('AUTH_REQUIRED'), { code: 'AUTH_REQUIRED' });
   }
 }
-const loginRetryMessage = (code?: string) => code === 'AUTH_REQUIRED' ? '学校登录失效，请重新登录'
-  : code === 'COOKIE_STORAGE' ? '学校登录状态保存失败，请重新登录'
-  : code === 'SESSION_DRAINING' ? '学校登录状态仍在处理，请稍后重试' : null;
+const loginRetryMessage = (code?: string, needsLogin?: boolean) => code === 'COOKIE_STORAGE' ? '学校登录状态保存失败，请重新登录'
+  : code === 'SESSION_DRAINING' ? '学校登录状态仍在处理，请稍后重试'
+  : code === 'AUTH_REQUIRED' || needsLogin ? '学校登录失效，请重新登录' : null;
 type SchoolFailure = { code?: string; loginStage?: string; needsLogin?: boolean };
 function todosFrom(value: unknown): SchoolTodo[] {
   const list = (value as { todo_list?: unknown } | null)?.todo_list;
@@ -239,8 +239,12 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
   async function readHistory(courses: SchoolCourse[], account: Account): Promise<SchoolHistory[]> {
     const studentId = account.lntId;
     if (studentId === null || studentId <= 0) throw Error('INVALID_PROFILE');
-    const responses = await Promise.all(courses.map(async course => historyFrom(await device.read('history', { courseId: course.id, studentId }, account), course)));
-    return sortHistory(responses.flat());
+    const responses = await Promise.allSettled(courses.map(async course => historyFrom(await device.read('history', { courseId: course.id, studentId }, account), course)));
+    const failures = responses.filter(result => result.status === 'rejected');
+    const authFailure = failures.find(({ reason }) => loginRetryMessage(reason?.code, reason?.needsLogin));
+    const failure = authFailure ?? failures[0];
+    if (failure) throw failure.reason;
+    return sortHistory(responses.flatMap(result => result.status === 'fulfilled' ? result.value : []));
   }
   function update(login: boolean, onAuthorized?: () => void): Promise<boolean> {
     if (clearing || cleanupFailed) return Promise.resolve(false);
@@ -314,8 +318,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       } catch (error) {
         if (current(version)) {
           const { code, loginStage, needsLogin: sessionUnverified } = (error as SchoolFailure) ?? {};
-          const retry = loginRetryMessage(code);
-          const needsLogin = !authorized || !!retry || sessionUnverified;
+          const retry = loginRetryMessage(code, sessionUnverified);
+          const needsLogin = !authorized || !!retry;
           const loginFailure = loginStage && Object.hasOwn(loginFailures, loginStage) ? loginFailures[loginStage] : undefined;
           publish({ ...(needsLogin ? { authenticated: false, needsLogin: true } : {}),
             message: code === 'CANCELLED' ? '已取消学校登录' : loginFailure ?? retry ?? failure });
@@ -398,8 +402,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       } catch (error) {
         if (current(version)) {
           const { code, needsLogin } = (error as SchoolFailure) ?? {};
-          const retry = loginRetryMessage(code);
-          publish({ ...(retry || needsLogin ? { authenticated: false, needsLogin: true } : {}), historyMessage: retry ?? failure });
+          const retry = loginRetryMessage(code, needsLogin);
+          publish({ ...(retry ? { authenticated: false, needsLogin: true } : {}), historyMessage: retry ?? failure });
         }
         return false;
       } finally {

@@ -115,7 +115,7 @@ test('restore keeps HTTP-acquired LNT cookies and drops invalid persisted scope 
   assert.equal(restored.getCookieStringSync('https://sub.lnt.xmu.edu.cn/api/profile'), '');
   assert.equal(restored.getCookieStringSync(profile, { sameSiteContext: 'none' }), '');
   assert.equal(restored.getCookieStringSync(profile, { http: false }), '');
-  assert.deepEqual(schoolJarFrom({ cookies: {} }).serializeSync().cookies, []);
+  assert.throws(() => schoolJarFrom({ cookies: {} }), { message: 'COOKIE_STORAGE' });
 });
 
 test('reading and restoring a Max-Age cookie does not extend its lifetime', ctx => {

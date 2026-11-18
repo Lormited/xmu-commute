@@ -134,8 +134,8 @@ test('login history read, parse, and save failures retain the entire old batch, 
     if (failure === 'save') f.device.save = async () => { throw Error('DISK'); };
     const pending = f.learning.login();
     try {
+      await tick(); late.resolve();
       assert.equal(await pending, false);
-      late.resolve(); await tick();
       assert.equal(f.stored(), previous);
       for (const key of ['account', 'todos', 'todosAt', 'term', 'courses', 'coursesAt', 'schedule', 'scheduleAt', 'rollcalls', 'attendance', 'refreshSchedule', 'history', 'historyAt']) {
         assert.deepEqual(f.learning.getSnapshot()[key], before[key], key);
@@ -242,6 +242,34 @@ test('history errors keep the last saved collection and authentication expiry st
   assert.doesNotMatch(f.learning.getSnapshot().historyMessage, /private/);
   f.device.read = () => assert.fail('expired sessions must wait for explicit login');
   assert.equal(await f.learning.refreshHistory(), false);
+});
+
+test('history waits for parallel peers and gives a late login failure priority over an earlier read error', async () => {
+  for (const failure of [{ code: 'AUTH_REQUIRED' }, { code: 'HTTP_ERROR', needsLogin: true }]) {
+    const f = fixture(); await f.learning.restore(); await f.learning.refreshHistory();
+    const previous = f.stored(), before = f.learning.getSnapshot(), late = deferred(), started = [];
+    f.device.read = async (action, params) => {
+      assert.equal(action, 'history');
+      started.push(params.courseId);
+      if (params.courseId === 3) throw Error('NETWORK');
+      await late.promise;
+      throw Object.assign(Error('private response'), failure);
+    };
+    const pending = f.learning.refreshHistory();
+    try {
+      await tick();
+      assert.deepEqual(started, [3, 4]);
+      assert.equal(f.learning.getSnapshot().historyRefreshing, true);
+    } finally { late.resolve(); await pending; }
+    assert.equal(await pending, false);
+    const after = f.learning.getSnapshot();
+    assert.equal(after.authenticated, false);
+    assert.equal(after.needsLogin, true);
+    assert.match(after.historyMessage, /登录失效/);
+    assert.strictEqual(after.history, before.history);
+    assert.equal(after.historyAt, before.historyAt);
+    assert.equal(f.stored(), previous);
+  }
 });
 
 test('logout and replacement login cannot be undone by late history reads or writes', async () => {
