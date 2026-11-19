@@ -350,6 +350,22 @@ test('a notification preserves the unfinished underlying code when the second sh
   assert.deepEqual(a.state.attendance, { '81': 'success', '82': 'success' });
 });
 
+test('a notification shows the saved receipt after the Job removes its activity', async () => {
+  const { app, learning, answers, device } = await realScreen();
+  let saved;
+  device.save = async value => { saved = JSON.parse(value); };
+  app.enter('0206'); await app.flush(); app.nativeDismiss();
+  const read = device.read;
+  device.read = action => action === 'rollcalls' ? Promise.resolve({ rollcalls: [] }) : read(action);
+  await learning.refreshPendingRollcalls(learning.getSnapshot().account, new AbortController().signal, () => true);
+  assert.deepEqual(saved.rollcalls, []);
+  assert.equal(saved.attendance['81'], 'success');
+  const reopened = await notificationScreen(app, learning, '81');
+  assert.ok(reopened.find(node => node.type === 'Text' && node.props.children === '签到成功'));
+  assert.equal(reopened.find(node => node.type === 'TextInput'), undefined);
+  assert.equal(answers.length, 1);
+});
+
 test('school sheets accept both in-flight writes and keep out-of-order and late receipts on their own activity', async () => {
   for (const first of ['81', '82']) {
     const replies = {};

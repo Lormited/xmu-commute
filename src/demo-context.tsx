@@ -3,7 +3,7 @@ import { AccessibilityInfo, AppState, Platform } from 'react-native';
 import { demoReducer, initialState, type DemoEvent, type DemoState } from './demo-state';
 import { TERM, courseFor, periods, sessionsForWeek, weekDays, todoFixtures, type Todo } from './demo-data';
 import { createLearning, historyView, todoView, type LearningSnapshot } from './learning';
-import { clearSchoolReminders, schoolLearning, schoolRemindersAvailable, setSchoolReminders, syncSchoolReminders } from './school-reminder-device';
+import { clearSchoolReminders, readSchoolRemindersEnabled, schoolLearning, schoolRemindersAvailable, setSchoolReminders, syncSchoolReminders } from './school-reminder-device';
 import { schoolScheduleView } from './schedule';
 
 type Demo = { state: DemoState; dispatch: Dispatch<DemoEvent>; refresh: () => void; refreshHistory: () => void; refreshing: boolean; homeRefreshAt: Date | null; syncResult: 'success' | 'offline' | null; reducedMotion: boolean;
@@ -65,9 +65,9 @@ export function DemoProvider({ children }: { children: ReactNode }) {
   }, [real, learning, data.schedule, timetable.minWeek, timetable.weeks]);
   const [refreshing, setRefreshing] = useState(false);
   const [homeRefreshAt, setHomeRefreshAt] = useState<Date | null>(null);
-  const refreshSchool = useCallback(() => {
+  const refreshSchool = useCallback((keepRollcalls = false) => {
     setHomeRefreshAt(new Date());
-    return learning.refresh();
+    return keepRollcalls ? learning.refresh({ keepRollcalls: true }) : learning.refresh();
   }, [learning]);
   const [syncResult, setSyncResult] = useState<Demo['syncResult']>(null);
   const [reducedMotion, setReducedMotion] = useState(false);
@@ -86,7 +86,10 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     wasRefreshing.current = data.refreshing;
   }, [real, data.refreshing, data.message]);
   useEffect(() => {
-    if (real) void learning.restore().then(refreshSchool);
+    if (real) void learning.restore().then(async () => {
+      const keepRollcalls = schoolRemindersAvailable && await readSchoolRemindersEnabled();
+      return refreshSchool(keepRollcalls);
+    });
   }, [learning, real, refreshSchool]);
   useEffect(() => {
     let alive = true;

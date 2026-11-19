@@ -1,16 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createRollcallReminder, attendanceDestination } from '../src/attendance-reminders.ts';
-import { createAttendanceTrial } from '../src/attendance-trial.ts';
 import * as schedule from '../src/schedule.ts';
 import * as learning from '../src/learning.ts';
-import * as reminders from '../src/attendance-reminders.ts';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
-import { spawnSync } from 'node:child_process';
-import React from 'react';
 import ts from 'typescript';
 
 const require = createRequire(import.meta.url);
@@ -19,21 +14,6 @@ const monday = (hour, minute = 0) => new Date(2026, 10, 16, hour, minute).getTim
 const lesson = (id, start, end) => ({ WID: id, BJDM: id, KCMC: id, XQ: 1, KSJCDM: 1, JSJCDM: 2,
   KSSJ: start, JSSJ: end, ZCMC: '9周', JCFADM: '1', JASMC: '', JSXM: '' });
 const calendar = rows => ({ weekAt: monday(12), currentWeek: 9, weeks: [9, 10], rows });
-
-test('overlapping courses keep separate reminder windows and expired windows are skipped', () => {
-  const cached = calendar([lesson('later', '10:55', '11:40'), lesson('first', '10:00', '10:50')]);
-  assert.deepEqual(schedule.nextReminderWindow(cached, monday(9)), { start: monday(9, 50), end: monday(11) });
-  assert.deepEqual(schedule.nextReminderWindow(cached, monday(10)), { start: monday(9, 50), end: monday(10, 45) });
-  assert.deepEqual(schedule.nextReminderWindow(cached, monday(10, 49)), { start: monday(10, 45), end: monday(11, 50) });
-  assert.deepEqual(schedule.nextReminderWindow(cached, monday(11)), { start: monday(10, 45), end: monday(11, 50) });
-  assert.equal(schedule.nextReminderWindow(cached, monday(11, 50)), null);
-  const nextWeek = schedule.nextReminderWindow({ ...cached, rows: [{ ...cached.rows[0], ZCMC: '10周' }] }, monday(23));
-  assert.equal(nextWeek.start, new Date(2026, 10, 23, 10, 45).getTime());
-  const nested = calendar([lesson('outer', '10:00', '12:00'), lesson('inner', '10:20', '11:00')]);
-  assert.deepEqual(schedule.nextReminderWindow(nested, monday(10)), { start: monday(9, 50), end: monday(10, 10) });
-  assert.deepEqual(schedule.nextReminderWindow(nested, monday(10, 10)), { start: monday(10, 10), end: monday(11, 10) });
-  assert.deepEqual(schedule.nextReminderWindow(nested, monday(11, 10)), { start: monday(9, 50), end: monday(12, 10) });
-});
 
 function load(path, dependencies, globals = {}) {
   const source = ts.transpileModule(readFileSync(new URL(path, import.meta.url), 'utf8'), {
@@ -49,7 +29,8 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
   let now = monday(9), current = 'job-1', onStop;
   const scheduled = [], finished = [], notices = [], dismissed = [], calls = [], timers = new Map();
   const account = { lntId: accountId, studentNumber: '0041', name: '个人信息' };
-  const cached = { version: 1, account, term: { id: 1, name: '本学期' }, courses: [], coursesAt: now,
+  const courses = [{ id: 1, course_code: 'course', name: '学校课程', semester_id: 1 }];
+  const cached = { version: 1, account, term: { id: 1, name: '本学期' }, courses, coursesAt: now,
     todos: [], todosAt: now, rollcalls: [], attendance: { '83': 'success' }, history: [], historyAt: null, refreshSchedule: false,
     scheduleAt: now, schedule: { ...calendar(rows), jwTermCode: '20261', name: '秋季' } };
   class File {
@@ -68,18 +49,21 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
     readFile: uri => files.get(uri),
     deleteFile: uri => files.delete(uri),
     getPermissions: async () => ({ granted: fixture.permission }),
-    loadLearning: async () => ({ raw: JSON.stringify(cached), account }),
+    loadLearning: async () => ({ raw: files.get('learning') ?? JSON.stringify(cached), account }),
+    saveLearning: async value => { files.set('learning', value); },
     async advance(at) { now = at; for (const [timer, time] of timers) if (time <= now) { timers.delete(timer); timer(); } await flush(); },
     stop(token = current) { if (current === token) current = null; onStop?.({ token }); },
     read: async () => ({ rollcalls: [pending, { ...pending, rollcall_id: 82, status: 'on_call_fine' }, { ...pending, rollcall_id: 83 }] }),
-    async post(token, identifier, endAt) {
+    async post(token, identifier, endAt, rollcallId) {
       if (!job.isCurrent(token) || now >= endAt) return false;
+      assert.equal(rollcallId, '81');
       notices.push(identifier);
       return true;
     },
   };
   const device = { load: () => fixture.loadLearning(),
-    async save() {},
+    save: value => fixture.saveLearning(value),
+    answerNumber: (...args) => fixture.answerNumber(...args),
     async clear() {},
     async read(action, _params, expected, signal) {
       calls.push([action, expected, signal]);
@@ -87,7 +71,8 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
       if (action === 'profile') return { id: account.lntId, user_no: account.studentNumber, name: account.name };
       if (action === 'todos') return { todo_list: [] };
       if (action === 'lntTerms') return { semesters: [{ id: 1, name: '本学期', is_active: true }] };
-      if (action === 'courses') return { courses: [] };
+      if (action === 'courses') return { courses };
+      if (action === 'history') return fixture.readHistory();
       throw Error('UNEXPECTED_READ');
     } };
   Object.assign(fixture, load('../src/school-reminder-device.ts', {
@@ -103,6 +88,114 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
     setTimeout: (callback, ms) => { timers.set(callback, now + ms); return callback; }, clearTimeout: callback => timers.delete(callback) }));
   return fixture;
 }
+
+test('the Job saves and publishes pending activities before posting, then saves an empty result', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  const published = [];
+  const unsubscribe = fixture.schoolLearning.subscribe(() => published.push(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id)));
+  const save = fixture.saveLearning;
+  let release;
+  fixture.saveLearning = value => new Promise(resolve => { release = () => resolve(save(value)); });
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  assert.equal(typeof release, 'function');
+  assert.deepEqual(published, []);
+  assert.deepEqual(fixture.notices, []);
+  release();
+  await flush();
+  assert.deepEqual(published, [['81']]);
+  assert.deepEqual(JSON.parse(fixture.files.get('learning')).rollcalls.map(item => item.id), ['81']);
+  assert.equal(fixture.notices.length, 1);
+  fixture.saveLearning = save;
+  fixture.read = async () => ({ rollcalls: [] });
+  await fixture.advance(monday(10) + 30000);
+  assert.deepEqual(published, [['81'], []]);
+  assert.deepEqual(JSON.parse(fixture.files.get('learning')).rollcalls, []);
+  assert.equal(fixture.notices.length, 1);
+  unsubscribe();
+  fixture.stop();
+  await running;
+});
+
+test('cold-start refresh queries activities unless reminders are enabled for the restored account', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  const reopen = async (accountId = 41) => {
+    const reopened = schoolFixture(new Map(fixture.files), accountId);
+    await reopened.schoolLearning.restore();
+    const keepRollcalls = await reopened.readSchoolRemindersEnabled();
+    assert.equal(await reopened.schoolLearning.refresh({ keepRollcalls }), true);
+    return reopened.calls.filter(([action]) => action === 'rollcalls').length;
+  };
+  assert.equal(await reopen(), 1);
+  assert.equal(await fixture.setSchoolReminders(true), true);
+  assert.equal(await reopen(), 0);
+  assert.equal(await reopen(42), 1);
+  fixture.files.set('school-reminders.json', '{');
+  assert.equal(await reopen(), 1);
+});
+
+test('an ordinary batch cannot overwrite a newer Job result and reads activities again when the Job stops', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  let finishRead;
+  fixture.read = signal => signal ? Promise.resolve({ rollcalls: [] }) : new Promise(resolve => { finishRead = resolve; });
+  const refreshing = fixture.schoolLearning.refresh();
+  await flush();
+  assert.ok(finishRead, 'ordinary refresh queries when the Job has not started');
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  finishRead({ rollcalls: [{ id: 81, course_id: 1, is_number: true }] });
+  assert.equal(await refreshing, true);
+  assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
+  assert.deepEqual(JSON.parse(fixture.files.get('learning')).rollcalls, []);
+  assert.equal(await fixture.syncSchoolReminders(), true);
+  assert.deepEqual(fixture.scheduled, [monday(9, 50)], 'opening the foreground must leave the active Job alone');
+  assert.equal(await fixture.schoolLearning.refresh(), true);
+  assert.equal(fixture.calls.filter(([action]) => action === 'rollcalls').length, 2);
+  fixture.stop();
+  await running;
+  fixture.read = async () => ({ rollcalls: [{ id: 81, course_id: 1, is_number: true }] });
+  assert.equal(await fixture.schoolLearning.refresh({ keepRollcalls: true }), true);
+  assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
+  assert.equal(await fixture.schoolLearning.refresh(), true);
+  assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id), ['81']);
+});
+
+test('history and a live receipt preserve an empty Job result when saving', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  let finishReceipt, finishHistory;
+  fixture.answerNumber = () => new Promise(resolve => { finishReceipt = resolve; });
+  fixture.readHistory = () => new Promise(resolve => { finishHistory = resolve; });
+  const submitted = fixture.schoolLearning.submitNumber('81', '0206');
+  const history = fixture.schoolLearning.refreshHistory();
+  fixture.read = async () => ({ rollcalls: [] });
+  await fixture.advance(monday(10) + 30000);
+  assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
+  finishHistory({ rollcalls: [] });
+  assert.equal(await history, true);
+  finishReceipt({ result: 'success', message: '签到成功' });
+  assert.equal((await submitted).result, 'success');
+  assert.deepEqual(fixture.schoolLearning.getSnapshot().pendingAttendance, { '81': 'success' });
+  fixture.schoolLearning.attendanceDismissed({ openIds: [] });
+  await flush();
+  const restarted = schoolFixture(fixture.files);
+  await restarted.schoolLearning.restore();
+  assert.deepEqual(restarted.schoolLearning.getSnapshot().rollcalls, []);
+  assert.deepEqual(restarted.schoolLearning.getSnapshot().attendance, { '81': 'success', '83': 'success' });
+  fixture.stop();
+  await running;
+});
 
 test('the persisted enabled Job reads only pending LNT activities and dedupes after process restart', async () => {
   const foreground = schoolFixture();
@@ -131,7 +224,7 @@ test('the persisted enabled Job reads only pending LNT activities and dedupes af
   assert.deepEqual(restarted.finished, [['job-1', null]]);
 });
 
-test('an unacknowledged notice remains tappable and retries with the same identifier after restart', async () => {
+test('an unacknowledged notice retries with the same identifier after restart', async () => {
   const fixture = schoolFixture();
   await fixture.schoolLearning.restore();
   await fixture.setSchoolReminders(true);
@@ -146,7 +239,6 @@ test('an unacknowledged notice remains tappable and retries with the same identi
   assert.equal(fixture.notices.length, 1);
   const [identifier] = fixture.notices;
   const restarted = schoolFixture(new Map(fixture.files));
-  assert.equal(await restarted.openSchoolReminder(identifier, new AbortController().signal), '81');
   await restarted.advance(monday(10, 1));
   const running = restarted.runSchoolReminderJob('job-1');
   await flush();
@@ -161,10 +253,11 @@ test('failed notification dispatch retries the same identifier within its window
   assert.equal(await fixture.setSchoolReminders(true), true);
   const post = fixture.post;
   const attempts = [];
-  fixture.post = async (token, identifier, endAt) => {
+  fixture.post = async (...args) => {
+    const [, identifier] = args;
     attempts.push(identifier);
     if (attempts.length === 1) throw Error('UNAVAILABLE');
-    return post(token, identifier, endAt);
+    return post(...args);
   };
   await fixture.advance(monday(10));
   const running = fixture.runSchoolReminderJob('job-1');
@@ -233,22 +326,22 @@ test('a failed learning load leaves the Job retryable in the same process', asyn
   assert.deepEqual(signedOut.finished, [['job-1', null]]);
 });
 
-test('the window deadline aborts a slow query and hands off once to the overlapping course', async () => {
-  const fixture = schoolFixture(new Map(), 41, [lesson('first', '10:00', '10:50'), lesson('later', '10:55', '11:40')]);
+test('the window deadline aborts a slow query and schedules the next lesson', async () => {
+  const fixture = schoolFixture(new Map(), 41, [lesson('first', '10:00', '10:50'), lesson('later', '14:00', '15:00')]);
   await fixture.schoolLearning.restore();
   await fixture.setSchoolReminders(true);
-  await fixture.advance(monday(10, 43));
+  await fixture.advance(monday(10, 58));
   fixture.read = signal => new Promise((_, reject) => signal.addEventListener('abort', () => reject(Error('ABORT')), { once: true }));
   const running = fixture.runSchoolReminderJob('job-1');
   assert.equal(fixture.runSchoolReminderJob('job-1'), running);
   await flush();
-  await fixture.advance(monday(10, 44));
+  await fixture.advance(monday(10, 59));
   assert.equal(fixture.calls.length, 1);
-  await fixture.advance(monday(10, 45));
+  await fixture.advance(monday(11));
   await running;
   assert.equal(fixture.calls[0][2].aborted, true);
   assert.equal(fixture.notices.length, 0);
-  assert.deepEqual(fixture.finished, [['job-1', monday(10, 45)]]);
+  assert.deepEqual(fixture.finished, [['job-1', monday(13, 50)]]);
 });
 
 test('permission refusal prevents jobs and disabling stops an in-flight read and survives restart', async () => {
@@ -281,7 +374,7 @@ test('logout cleanup retries failed reminder deletion with no current account', 
   const fixture = schoolFixture();
   await fixture.schoolLearning.restore();
   await fixture.setSchoolReminders(true);
-  const [saved] = fixture.files.keys();
+  const saved = 'school-reminders.json';
   fixture.files.set(saved.replace(/\.json$/, '.tmp'), fixture.files.get(saved));
   const remove = fixture.deleteFile;
   fixture.deleteFile = () => { throw Error('TEMPORARILY_UNAVAILABLE'); };
@@ -307,11 +400,12 @@ for (const [action, stop] of [
     await fixture.advance(monday(10));
     let deliver, identifier, stopped = false;
     const post = fixture.post;
-    fixture.post = (token, id, endAt) => new Promise(resolve => {
+    fixture.post = (...args) => new Promise(resolve => {
+      const [token, id, endAt] = args;
       assert.equal(token, 'job-1');
       assert.equal(endAt, monday(11));
       identifier = id;
-      deliver = async () => resolve(await post(token, id, endAt));
+      deliver = async () => resolve(await post(...args));
     });
     const running = fixture.runSchoolReminderJob('job-1').then(() => { stopped = true; });
     await flush();
@@ -341,429 +435,39 @@ for (const [action, stop] of [
   });
 }
 
-test('school taps resolve an issued notice through a fresh pending read across process and account refresh', async () => {
-  const fixture = schoolFixture();
-  await fixture.schoolLearning.restore();
-  await fixture.setSchoolReminders(true);
-  await fixture.advance(monday(10));
-  const running = fixture.runSchoolReminderJob('job-1');
-  await flush();
-  fixture.stop();
-  await running;
-  const [identifier] = fixture.notices;
-  const restarted = schoolFixture(fixture.files);
-  const other = schoolFixture(fixture.files, 42);
-  const scope = new AbortController();
-  assert.equal(await other.openSchoolReminder(identifier, scope.signal), null);
-  assert.equal(await restarted.openSchoolReminder(randomUUID(), scope.signal), null);
-  assert.equal(other.calls.length + restarted.calls.length, 0);
-
-  const read = restarted.read;
-  let deliver, finishRefresh;
-  restarted.read = signal => new Promise(resolve => {
-    if (signal) deliver = resolve;
-    else finishRefresh = resolve;
-  });
-  const coldAccount = restarted.schoolLearning.getSnapshot().account;
-  const refreshing = restarted.schoolLearning.refresh();
-  await flush();
-  let responseListener, cleanup;
+test('cold and warm taps wait for local readiness and open the given ID even when signed out', async () => {
+  const makeResponse = (identifier, data) => ({ actionIdentifier: 'default', notification: { request: { identifier, content: { data } } } });
+  const cold = makeResponse('cold', { source: 'school', rollcallId: '81' });
+  let last = cold, listener, cleanup, cleared = 0, removed = 0, ready = false, key;
   const routes = [];
-  const response = (id, data) => ({ actionIdentifier: 'default', notification: { request: { identifier: id, content: { data } } } });
-  const api = { DEFAULT_ACTION_IDENTIFIER: 'default', setNotificationHandler() {},
-    addNotificationResponseReceivedListener(listener) { responseListener = listener; return { remove() {} }; },
-    getLastNotificationResponseAsync: async () => response(identifier, { source: 'school', rollcallId: 'forged' }),
-    clearLastNotificationResponseAsync: async () => {},
+  const api = { DEFAULT_ACTION_IDENTIFIER: 'default',
+    addNotificationResponseReceivedListener(callback) { listener = callback; return { remove() { removed++; } }; },
+    getLastNotificationResponse: () => last,
+    clearLastNotificationResponse: () => { last = null; cleared++; },
   };
   const bridge = load('../src/attendance-notification-bridge.tsx', {
     react: { useEffect: effect => { cleanup = effect(); } }, 'react-native': { Platform: { OS: 'android' } },
-    'expo-router': { router: { push: value => routes.push(value.params.id) }, useRootNavigationState: () => ({ key: 'root' }) },
-    './demo-context': { useDemo: () => ({ real: true }) }, './attendance-reminders': reminders,
-    './school-reminder-device': restarted,
-    './attendance-trial-device': load('../src/attendance-trial-device.ts', { 'expo-notifications': api }),
-  }, { AbortController });
-  bridge.AttendanceNotificationBridge();
-  await flush();
-  assert.equal(deliver, undefined, 'the tap read waits for the ordinary batch');
-  finishRefresh({ rollcalls: [] });
-  assert.equal(await refreshing, true);
-  assert.notEqual(restarted.schoolLearning.getSnapshot().account, coldAccount);
-  await flush();
-  deliver(await read());
-  await flush();
-  assert.deepEqual(routes, ['81']);
-  responseListener(response(randomUUID(), { source: 'school', rollcallId: '81' }));
-  await flush();
-  assert.deepEqual(routes, ['81']);
-  assert.equal(restarted.schoolLearning.getSnapshot().rollcalls.find(item => item.id === '81').method, 'number');
-  restarted.read = async () => ({ rollcalls: [] });
-  assert.equal(await restarted.openSchoolReminder(identifier, scope.signal), null);
-  cleanup();
-});
-
-test('activity discovery sends one notification carrying only its source and id', async () => {
-  const sent = [];
-  const notify = createRollcallReminder(async content => { sent.push(content); });
-  const activity = { id: '81', courseId: '301', title: '学校课程', method: 'number', time: '' };
-  await notify([activity], 'school');
-  await notify([activity], 'school');
-  assert.equal(sent.length, 1);
-  assert.deepEqual(sent[0].data, { source: 'school', rollcallId: '81' });
-  assert.equal(sent[0].title, '有新的签到活动');
-  assert.deepEqual(attendanceDestination(sent[0].data), { pathname: '/attendance', params: { id: '81' } });
-  assert.equal(attendanceDestination({ source: 'other', rollcallId: '81' }), null);
-});
-
-function deviceFixture(saved = null) {
-  let now = 1000000, task, wake, wakePending = false;
-  const notices = [];
-  const device = {
-    now: () => now,
-    load: async () => saved,
-    save: async value => { saved = value; },
-    requestPermission: async () => true,
-    start: async run => { task = run(); },
-    stop: async () => { wake?.(); },
-    wait: () => new Promise(resolve => {
-      if (wakePending) { wakePending = false; resolve(); }
-      else wake = () => { wake = undefined; resolve(); };
-    }),
-    wake: () => { if (wake) wake(); else wakePending = true; },
-    notify: async value => { notices.push(value); },
-  };
-  const flush = () => new Promise(resolve => setImmediate(resolve));
-  return { device, notices, get saved() { return saved; },
-    async advance(ms) { now += ms; wake?.(); await flush(); },
-    flush, async done() { await task; } };
-}
-
-test('the background read discovers a due activity, persists it and sends an immediate notification', async () => {
-  const device = deviceFixture();
-  const trial = createAttendanceTrial(device.device, true);
-  await trial.start();
-  const id = await trial.queue('number', 'success');
-  assert.equal(device.notices.length, 0, 'queuing is not scheduling a system notification');
-  assert.equal(JSON.parse(device.saved).events[0].availableAt, 1015000);
-  await device.advance(14999);
-  assert.equal(device.notices.length, 0, 'the selected activity is unavailable before 15 seconds');
-  await device.advance(5001);
-  assert.equal(device.notices.length, 1);
-  assert.deepEqual(device.notices[0].data, { source: 'trial', rollcallId: id });
-  assert.equal(trial.getSnapshot().rollcalls[0].id, id);
-  assert.ok(JSON.parse(device.saved).events[0].discoveredAt);
-  await trial.stop();
-  await device.done();
-  const restored = createAttendanceTrial(deviceFixture(device.saved).device, true);
-  await restored.restore();
-  assert.equal(restored.getSnapshot().running, false);
-  assert.equal(restored.isTrialRollcall(id), true, 'cold-start click can resolve the same activity');
-  assert.equal((await restored.submitNumber(id, '0206')).result, 'success');
-  assert.equal(restored.getSnapshot().pendingAttendance[id], 'success');
-  restored.attendanceDismissed({ ids: [id] });
-  assert.equal(restored.getSnapshot().attendance[id], 'success');
-});
-
-test('an immediate activity wakes the same discovery loop without advancing time or duplicate delivery', async () => {
-  const fixture = deviceFixture();
-  const trial = createAttendanceTrial(fixture.device, true);
-  await trial.start(); await fixture.flush();
-  const id = await trial.queue('qr', 'success', 0);
-  await fixture.flush();
-  assert.equal(fixture.notices.length, 1);
-  assert.equal(fixture.notices[0].data.rollcallId, id);
-  assert.equal(trial.getSnapshot().logs.find(item => item.event === 'discovered').delayMs, 0);
-  await fixture.advance(20000);
-  assert.equal(fixture.notices.length, 1);
-  await trial.stop(); await fixture.done();
-});
-
-test('permission refusal and a disabled trial never start the background service', async () => {
-  const device = deviceFixture();
-  let starts = 0, permissions = 0, loads = 0;
-  device.device.start = async () => { starts++; };
-  device.device.requestPermission = async () => { permissions++; return false; };
-  device.device.load = async () => { loads++; return null; };
-  const production = createAttendanceTrial(device.device, false);
-  await production.restore(); await production.start(); await production.queue('number', 'success'); await production.stop();
-  assert.deepEqual([starts, permissions, loads], [0, 0, 0]);
-  assert.equal((await production.submit('trial-1-1')).result, 'failed');
-  const development = createAttendanceTrial(device.device, true);
-  await development.start();
-  assert.deepEqual([starts, permissions, loads], [0, 1, 1]);
-  assert.match(development.getSnapshot().message, /通知权限未允许/);
-});
-
-test('stop prevents pending discovery and the trial expires after five minutes', async () => {
-  const device = deviceFixture();
-  const trial = createAttendanceTrial(device.device, true);
-  await trial.start(); await trial.queue('qr', 'ended'); await trial.stop(); await device.done();
-  await device.advance(40000);
-  assert.equal(device.notices.length, 0);
-  await trial.start(); await device.flush();
-  await device.advance(300000); await device.done();
-  assert.equal(trial.getSnapshot().running, false);
-  assert.equal(trial.getSnapshot().logs.at(-1).event, 'expired');
-});
-
-test('notification failure retries at the next read without duplicate successful delivery', async () => {
-  const device = deviceFixture();
-  const send = device.device.notify;
-  let failed = false;
-  device.device.notify = async notice => { if (!failed) { failed = true; throw Error('private-device-info'); } await send(notice); };
-  const trial = createAttendanceTrial(device.device, true);
-  await trial.start(); await trial.queue('radar', 'failed'); await device.advance(40000);
-  assert.equal(device.notices.length, 0);
-  await device.advance(20000); await device.advance(20000);
-  assert.equal(device.notices.length, 1);
-  assert.ok(trial.getSnapshot().logs.some(item => item.event === 'notification-failed'));
-  assert.equal(device.saved.includes('private-device-info'), false);
-  await trial.stop(); await device.done();
-});
-
-test('a sheet closed while its simulated receipt is being saved does not leave a pending home card', async () => {
-  const id = 'trial-1-1';
-  const device = deviceFixture(JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'qr', outcome: 'success', availableAt: 1, discoveredAt: 2, notifiedAt: 2 },
-  ] }));
-  const trial = createAttendanceTrial(device.device, true);
-  await trial.restore();
-  let finish;
-  device.device.save = () => new Promise(resolve => { finish = resolve; });
-  const submitted = trial.submit(id);
-  await flush(); trial.opened();
-  assert.equal(trial.getSnapshot().attendance[id], undefined, 'a concurrent log cannot publish an unpersisted receipt');
-  trial.attendanceDismissed({ ids: [id] }); finish();
-  assert.equal((await submitted).result, 'success');
-  assert.deepEqual(trial.getSnapshot().pendingAttendance, {});
-  assert.equal(trial.getSnapshot().attendance[id], 'success');
-});
-
-test('failed receipt storage keeps the local activity available for retry', async () => {
-  const id = 'trial-1-1';
-  const device = deviceFixture(JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'number', outcome: 'success', availableAt: 1, discoveredAt: 2 },
-  ] }));
-  const trial = createAttendanceTrial(device.device, true);
-  await trial.restore();
-  device.device.save = async () => { throw Error('STORAGE'); };
-  assert.equal((await trial.submitNumber(id, '0206')).result, 'failed');
-  assert.equal(trial.getSnapshot().attendance[id], undefined);
-  assert.deepEqual(trial.getSnapshot().pendingAttendance, {});
-});
-
-test('concurrent trial saves keep both results and closing B does not dismiss the covered A receipt', async () => {
-  const ids = ['trial-1-1', 'trial-1-2'];
-  const fixture = deviceFixture(JSON.stringify({ version: 1, logs: [], events:
-    ids.map((id, index) => ({ id, method: 'number', outcome: index ? 'ended' : 'success', availableAt: 1, discoveredAt: 2, notifiedAt: 2 })),
-  }));
-  const trial = createAttendanceTrial(fixture.device, true);
-  await trial.restore();
-  let release;
-  const gate = new Promise(resolve => { release = resolve; });
-  const save = fixture.device.save;
-  fixture.device.save = async value => { await gate; await save(value); };
-  const a = trial.submitNumber(ids[0], '0206');
-  const b = trial.submitNumber(ids[1], '0206');
-  await flush();
-  assert.equal((await trial.submitNumber(ids[0], '0206')).result, 'failed', 'duplicate A cannot create a second save');
-  trial.attendanceDismissed({ ids: [ids[1]] }); release();
-  assert.equal((await a).result, 'success');
-  assert.equal((await b).result, 'ended');
-  assert.deepEqual(trial.getSnapshot().pendingAttendance, { [ids[0]]: 'success' });
-  assert.deepEqual(trial.getSnapshot().attendance, { [ids[1]]: 'ended' });
-  trial.attendanceDismissed({ ids: [ids[0]] });
-  assert.deepEqual(trial.getSnapshot().attendance, { [ids[0]]: 'success', [ids[1]]: 'ended' });
-  await flush();
-  const reopened = createAttendanceTrial(fixture.device, true); await reopened.restore();
-  assert.deepEqual(reopened.getSnapshot().attendance, { [ids[0]]: 'success', [ids[1]]: 'ended' });
-});
-
-test('cold and warm notification clicks wait for navigation and restore the exact local activity', async () => {
-  const id = 'trial-100-1', routes = [];
-  let restore, listener, registered = 0, cleared = 0, ready = false, cleanup;
-  const device = deviceFixture();
-  device.device.load = () => new Promise(resolve => { restore = resolve; });
-  const trial = createAttendanceTrial(device.device, true);
-  const response = { actionIdentifier: 'default', notification: { request: { identifier: 'notice1', content: { data: { source: 'trial', rollcallId: id } } } } };
-  const native = { DEFAULT_ACTION_IDENTIFIER: 'default',
-    setNotificationHandler() {}, addNotificationResponseReceivedListener(callback) { registered++; listener = callback; return { remove() {} }; },
-    getLastNotificationResponseAsync: async () => response, clearLastNotificationResponseAsync: async () => { cleared++; },
-  };
-  const adapter = load('../src/attendance-trial-device.ts', { 'expo-notifications': native });
-  const bridge = load('../src/attendance-notification-bridge.tsx', {
-    react: { useEffect: effect => { cleanup = effect(); } }, 'react-native': { Platform: { OS: 'android' } },
-    'expo-router': { router: { push: route => routes.push(route) }, useRootNavigationState: () => ready ? { key: 'root' } : undefined },
-    './demo-context': { useDemo: () => ({ real: true, trial }) }, './attendance-reminders': { attendanceDestination }, './attendance-trial-device': adapter,
-    './school-reminder-device': { openSchoolReminder: async () => null },
-    }, { AbortController });
+    'expo-router': { router: { push: route => routes.push(route) }, useRootNavigationState: () => ({ key }) },
+    'expo-notifications': api, './demo-context': { useDemo: () => ({ data: { ready, authenticated: false, account: null, rollcalls: [] } }) },
+  });
   bridge.AttendanceNotificationBridge(); await flush();
-  assert.equal(registered, 0);
-  ready = true; bridge.AttendanceNotificationBridge(); await flush();
-  assert.equal(registered, 1); assert.equal(routes.length, 0);
-  restore(JSON.stringify({ version: 1, logs: [], events: [{ id, method: 'number', outcome: 'success', availableAt: 100, discoveredAt: 101 }] }));
-  await flush();
-  assert.deepEqual(routes, [{ pathname: '/attendance', params: { id } }]);
-  listener(response); await flush();
-  assert.equal(routes.length, 1, 'duplicate delivery of the cold-start response is ignored');
-  listener({ ...response, notification: { request: { identifier: 'notice2', content: { data: { source: 'school', rollcallId: '82' } } } } });
-  await flush();
-  assert.equal(routes.length, 1, 'an unissued school payload does not navigate');
-  assert.equal(cleared, 2);
+  assert.equal(listener, undefined);
+  key = 'root';
+  bridge.AttendanceNotificationBridge(); await flush();
+  assert.equal(listener, undefined);
+  ready = true;
+  bridge.AttendanceNotificationBridge(); await flush();
+  listener(cold); await flush();
+  assert.deepEqual(routes.map(route => route.params.id), ['81']);
+  assert.equal(cleared, 1);
+  listener(last = makeResponse('foreign', { source: 'other', rollcallId: '82' })); await flush();
+  listener(last = makeResponse('legacy', { source: 'school' })); await flush();
+  listener(last = makeResponse('ended', { source: 'school', rollcallId: '99' }));
+  assert.equal(last, null, 'the handled response is cleared before the next event can arrive');
+  assert.deepEqual(routes.map(route => [route.pathname, route.params.id]), [['/attendance', '81'], ['/attendance', '99']]);
+  assert.equal(cleared, 4);
   cleanup();
-});
-
-test('release debug settings run the trial controller and keep notification handling available', async () => {
-  const device = deviceFixture();
-  const trial = createAttendanceTrial(device.device, true);
-  const context = { state: { accountCardStyle: 'stacked', method: 'number', outcome: 'success' }, real: true, data: { account: null }, trial,
-    get trialData() { return trial.getSnapshot(); }, dispatch() {} };
-  const ui = new Proxy({}, { get: (_target, key) => key === 's' ? {} : String(key), has: () => true });
-  const deps = { 'react-native': { Text: 'Text', Platform: { OS: 'android' } },
-    'expo-router': { Redirect: 'Redirect', router: {} }, '@/demo-context': { useDemo: () => context },
-    '@/debug-options': { accountCardStyles: {}, methods: {}, outcomes: {}, scenarios: {} }, '@/ui': ui };
-  const lab = load('../app/lab.tsx', deps, { __DEV__: false });
-  const profile = load('../app/(tabs)/profile.tsx', { ...deps, '@/demo-data': {} }, { __DEV__: false });
-  const profileTree = profile.default();
-  assert.match(JSON.stringify(profileTree), /调试设置/);
-  const choices = load('../app/debug-choice.tsx', { ...deps,
-    'expo-router': { router: {}, useLocalSearchParams: () => ({ kind: 'method' }) },
-  }, { __DEV__: false });
-  let event;
-  context.dispatch = value => { event = value; };
-  const choice = choices.default();
-  assert.equal(choice.props.title, '签到方式');
-  choice.props.select('qr');
-  assert.equal(event.type, 'method');
-  assert.equal(event.method, 'qr');
-
-  function find(node, label) {
-    if (node?.props?.label === label) return node;
-    for (const child of React.Children.toArray(node?.props?.children)) { const match = find(child, label); if (match) return match; }
-  }
-  find(lab.default(), '启动 5 分钟后台试验').props.onPress(); await flush();
-  assert.equal(trial.getSnapshot().running, true);
-  find(lab.default(), '立即发起所选模拟签到').props.onPress(); await flush();
-  assert.equal(device.notices.length, 1, 'immediate activity wakes the running discovery loop');
-  assert.equal(JSON.parse(device.saved).events[0].availableAt, 1000000);
-  find(lab.default(), '15 秒后发起所选模拟签到').props.onPress(); await flush();
-  assert.equal(JSON.parse(device.saved).events[1].availableAt, 1015000);
-  assert.equal(device.notices.length, 1);
-  await device.advance(20000); assert.equal(device.notices.length, 2);
-  find(lab.default(), '停止后台试验').props.onPress(); await flush(); await device.done();
-  assert.equal(trial.getSnapshot().running, false);
-  assert.ok(find(lab.default(), '启动 5 分钟后台试验'));
-  let subscriptions = 0;
-  const bridge = load('../src/attendance-notification-bridge.tsx', {
-    react: { useEffect: effect => effect() }, 'react-native': { Platform: { OS: 'android' } },
-    'expo-router': { useRootNavigationState: () => ({ key: 'root' }) }, './demo-context': { useDemo: () => ({ trial }) },
-    './attendance-reminders': { attendanceDestination }, './attendance-trial-device': { watchAttendanceNotifications: async () => { subscriptions++; return () => {}; } },
-    './school-reminder-device': { openSchoolReminder: async () => null },
-  }, { __DEV__: false, AbortController });
-  bridge.AttendanceNotificationBridge();
-  assert.equal(subscriptions, 1);
-});
-
-test('the native adapter uses a foreground task and sends only immediate notifications after discovery', async () => {
-  let options, stopped = 0, delivered;
-  const background = { start: async (run, value) => { options = value; void run(); }, stop: async () => { stopped++; } };
-  const api = { scheduleNotificationAsync: async value => { delivered = value; } };
-  const { attendanceTrialDevice: device } = load('../src/attendance-trial-device.ts', {
-    'react-native-background-actions': { __esModule: true, default: background }, 'expo-notifications': api,
-  });
-  await device.start(() => device.wait(20000));
-  assert.equal(options.taskName, 'AttendanceTrial');
-  assert.equal(options.foregroundServiceType.join(), 'dataSync');
-  assert.match(options.taskDesc, /5 分钟/);
-  await device.notify({ title: '模拟签到活动', body: '点按打开签到', data: { source: 'trial', rollcallId: 'trial-1-1' } });
-  assert.equal(delivered.trigger.channelId, 'attendance-trial');
-  assert.deepEqual(Object.keys(delivered.trigger), ['channelId'], 'there is no timer or future notification schedule');
-  assert.equal(delivered.content.data.rollcallId, 'trial-1-1');
-  await device.stop();
-  assert.equal(stopped, 1);
-});
-
-test('native discovery wake resolves a current wait and survives a wake before the next wait', async () => {
-  const timers = new Set();
-  const { attendanceTrialDevice: device } = load('../src/attendance-trial-device.ts', {}, {
-    setTimeout(callback) { timers.add(callback); return callback; },
-    clearTimeout(timer) { timers.delete(timer); },
-  });
-  let finished = false;
-  const waiting = device.wait(20000).then(() => { finished = true; });
-  assert.equal(timers.size, 1);
-  device.wake(); await waiting;
-  assert.equal(finished, true);
-  assert.equal(timers.size, 0);
-  device.wake(); device.wake();
-  finished = false;
-  const pending = device.wait(20000).then(() => { finished = true; });
-  await flush();
-  assert.equal(finished, true, 'wake is retained while discovery or storage work is in progress');
-  await pending;
-  assert.equal(timers.size, 0);
-  const next = device.wait(20000);
-  assert.equal(timers.size, 1, 'multiple wakes coalesce into one extra discovery pass');
-  device.wake(); await next;
-});
-
-test('trial cache replacement waits until the asynchronous temporary-file write completes', async () => {
-  let finishWrite, written;
-  const moves = [], writing = new Promise(resolve => { finishWrite = resolve; });
-  const { attendanceTrialDevice: device } = load('../src/attendance-trial-device.ts', {
-    'expo-file-system': { Paths: { document: 'file:///documents' }, File: class {
-      constructor(directory, name) { this.uri = `${directory}/${name}`; }
-      write(value) { written = value; return writing; }
-    } },
-    'expo-file-system/legacy': { moveAsync: async value => { moves.push(value); } },
-  });
-  const saving = device.save('trial-cache');
-  await flush();
-  assert.equal(written, 'trial-cache');
-  try { assert.equal(moves.length, 0, 'an incomplete temporary file cannot replace the saved cache'); }
-  finally { finishWrite(); }
-  await saving;
-  assert.equal(moves.length, 1);
-  assert.equal(moves[0].from, 'file:///documents/attendance-trial.tmp');
-  assert.equal(moves[0].to, 'file:///documents/attendance-trial.json');
-});
-
-test('a failed temporary-file write rejects saving and never replaces the existing trial cache', async () => {
-  const failure = Error('WRITE_FAILED'), writing = Promise.reject(failure);
-  void writing.catch(() => {});
-  let moves = 0;
-  const { attendanceTrialDevice: device } = load('../src/attendance-trial-device.ts', {
-    'expo-file-system': { Paths: { document: 'file:///documents' }, File: class {
-      constructor(directory, name) { this.uri = `${directory}/${name}`; }
-      write() { return writing; }
-    } },
-    'expo-file-system/legacy': { moveAsync: async () => { moves++; } },
-  });
-  await assert.rejects(device.save('trial-cache'), error => error === failure);
-  assert.equal(moves, 0);
-});
-
-test('invalid persisted trial payloads cannot create activities or route simulation to a school write', async () => {
-  const device = deviceFixture(JSON.stringify({ version: 1, logs: [], events: [
-    { id: '81', method: 'number', outcome: 'success', availableAt: 1, discoveredAt: 2, secret: 'cookie=private' },
-  ] }));
-  const trial = createAttendanceTrial(device.device, true);
-  await trial.restore();
-  assert.equal(trial.getSnapshot().rollcalls.length, 0);
-  assert.equal((await trial.submit('81')).result, 'failed');
-  assert.match(trial.getSnapshot().message, /未能恢复/);
-  assert.equal(JSON.stringify(trial.getSnapshot()).includes('private'), false);
-});
-
-test('Expo config introspection declares the existing dataSync service and required permissions', () => {
-  const result = spawnSync(process.execPath, ['./node_modules/expo/bin/cli', 'config', '--type', 'introspect', '--json'], {
-    cwd: new URL('..', import.meta.url), encoding: 'utf8', timeout: 30000, env: { ...process.env, CI: '1', EXPO_NO_TELEMETRY: '1' },
-  });
-  assert.equal(result.status, 0, result.stderr);
-  const manifest = JSON.parse(result.stdout)._internal.modResults.android.manifest.manifest;
-  const services = manifest.application[0].service;
-  const service = services.find(item => item.$['android:name'] === 'com.asterinet.react.bgactions.RNBackgroundActionsTask');
-  assert.equal(service.$['android:foregroundServiceType'], 'dataSync');
-  for (const name of ['FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_DATA_SYNC', 'WAKE_LOCK']) {
-    assert.ok(manifest['uses-permission'].some(item => item.$['android:name'] === 'android.permission.' + name));
-  }
+  assert.equal(removed, 1);
+  listener(makeResponse('after-cleanup', { source: 'school', rollcallId: '100' })); await flush();
+  assert.equal(routes.length, 2);
 });

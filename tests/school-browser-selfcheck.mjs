@@ -1232,7 +1232,7 @@ test('logout drains late requests before removing both sessions; pending logout 
   }
 });
 // Execute the Provider and page callbacks with native rendering/effects replaced.
-function pages(f, previewMode = false, development = true) {
+function pages(f, previewMode = false, development = true, remindersEnabled = null) {
   let context, cursor = 0;
   let preview = demoState.demoReducer(demoState.initialState(), { type: 'scenario', scenario: 'signed-out' });
   const slots = [], navigations = [], focusEffects = [], effects = [];
@@ -1268,7 +1268,13 @@ function pages(f, previewMode = false, development = true) {
       return { remove() { todoClock.listener = null; } };
     } } }, './demo-state': demoState, './demo-data': demoData,
     './schedule': scheduleModule, './learning': { historyView, todoView }, './school-device': f,
-    './school-reminder-device': { schoolLearning: f.learning, schoolRemindersAvailable: false, clearSchoolReminders: async () => {} },
+    './school-reminder-device': { schoolLearning: f.learning, schoolRemindersAvailable: remindersEnabled !== null,
+      clearSchoolReminders: async () => {}, syncSchoolReminders: async () => remindersEnabled,
+      async readSchoolRemindersEnabled() {
+        assert.notEqual(remindersEnabled, null);
+        assert.equal(f.learning.getSnapshot().authenticated, true);
+        return remindersEnabled;
+      } },
   }, { Date: TodoDate,
     setTimeout(callback, delay) { todoClock.timer = { callback, delay }; return todoClock.timer; },
     clearTimeout(timer) { if (todoClock.timer === timer) todoClock.timer = null; },
@@ -1912,10 +1918,10 @@ test('every ordinary page header and pull callback uses the same setting-control
   }
 });
 
-test('provider startup shows cache and makes exactly one ordinary refresh using the restored setting', async () => {
-  for (const enabled of [false, true]) {
+test('provider startup shows cache and refreshes once using the restored settings', async () => {
+  for (const [enabled, reminders] of [[false, null], [true, false], [true, true]]) {
     const learning = learningFixture({ account: { ...recoveryAccount, name: '缓存账号' }, refreshSchedule: enabled });
-    const f = await boundFixture(learning), gate = deferred(), app = pages(f);
+    const f = await boundFixture(learning), gate = deferred(), app = pages(f, false, true, reminders);
     f.handler = async url => { if (url.includes('/my-courses')) { await gate.promise; return response(url, { courses: [{ ...course, name: '启动刷新课程' }], pages: 1, total: 1 }); } };
     app.render(); app.runStartupEffects(); await tick();
     const cached = app.render();
@@ -1924,7 +1930,15 @@ test('provider startup shows cache and makes exactly one ordinary refresh using 
     assert.equal(cached.refreshing, true);
     gate.resolve(); assert.equal(await f.learning.refresh(), true);
     assert.equal(app.render().data.courses[0].name, '启动刷新课程');
-    assert.deepEqual(f.calls.map(call => new URL(call.url).pathname).sort(), [...ordinaryPaths, ...(enabled ? timetablePaths : [])].sort());
+    const rollcallsPath = new URL(rollcallsUrl).pathname;
+    const startupPaths = reminders ? ordinaryPaths.filter(path => path !== rollcallsPath) : ordinaryPaths;
+    assert.deepEqual(f.calls.map(call => new URL(call.url).pathname).sort(), [...startupPaths, ...(enabled ? timetablePaths : [])].sort());
+    if (reminders) {
+      f.calls.length = 0;
+      app.render().refresh();
+      assert.equal(await f.learning.refresh(), true);
+      assert.equal(f.calls.filter(call => call.url === rollcallsUrl).length, 1);
+    }
   }
 });
 

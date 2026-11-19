@@ -154,7 +154,7 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
     todos: todosFrom({ todo_list: data.todos }), todosAt: data.todosAt, refreshSchedule, rollcalls, attendance, history, historyAt };
 }
 
-export function createLearning(device: SchoolDevice, now = Date.now) {
+export function createLearning(device: SchoolDevice, now = Date.now, pollingRollcalls = () => false) {
   const empty = { account: null, todos: [], todosAt: null, term: null, courses: [], coursesAt: null, schedule: null, scheduleAt: null, history: [], historyAt: null, historyRefreshing: false, historyMessage: null, refreshSchedule: false, rollcalls: [], attendance: {}, pendingAttendance: {}, authenticated: false, ready: true, refreshing: false, loggingIn: false, message: null, needsLogin: false };
   let state: LearningSnapshot = { ...empty, ready: false };
   const listeners = new Set<() => void>();
@@ -171,19 +171,33 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
   let restoreFailed = false;
   const current = (version: number) => generation === version;
   const completed = () => ({ ...state.attendance, ...state.pendingAttendance });
-  async function readPendingRollcalls(account: Account, signal: AbortSignal) {
+  function saveAttendance(rollcalls = state.rollcalls) {
+    const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, history, historyAt } = state;
+    return device.save(JSON.stringify({ version: 1, account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, rollcalls, history, historyAt, attendance: completed() }));
+  }
+  async function refreshPendingRollcalls(account: Account, signal: AbortSignal, valid: () => boolean) {
     const version = identity;
-    const valid = () => !signal.aborted && version === identity && state.authenticated && !state.loggingIn && state.account?.lntId === account.lntId;
-    if (!valid()) return [];
+    const sameIdentity = () => version === identity && state.account?.lntId === account.lntId;
+    const sameSession = () => sameIdentity() && state.authenticated && !state.loggingIn;
+    if (!valid() || !sameSession()) return [];
     const activities = rollcallsFrom(await device.read('rollcalls', undefined, account, signal));
-    return valid() ? activities.filter(({ id }) => !Object.hasOwn(state.attendance, id) && !Object.hasOwn(state.pendingAttendance, id) && !submissions.has(id)) : [];
+    const saved = writing.then(async () => {
+      if (!valid() || !sameSession() || state.todosAt === null) return [];
+      const rollcalls = activities.filter(({ id }) => !Object.hasOwn(state.attendance, id));
+      await saveAttendance(rollcalls);
+      if (!sameIdentity()) return [];
+      publish({ rollcalls });
+      if (!valid() || !sameSession()) return [];
+      return rollcalls.filter(({ id }) => !Object.hasOwn(state.attendance, id) && !Object.hasOwn(state.pendingAttendance, id) && !submissions.has(id));
+    });
+    writing = saved.then(() => {}, () => {});
+    return saved;
   }
   function rememberAttendance() {
     const version = identity;
     writing = writing.then(async () => {
       if (version !== identity || !state.account || state.todosAt === null) return;
-      const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, rollcalls, history, historyAt } = state;
-      await device.save(JSON.stringify({ version: 1, account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, rollcalls, history, historyAt, attendance: completed() }));
+      await saveAttendance();
     }).catch(() => {
       if (version === identity) publish({ message: '签到结果已收到，但本机保存失败，请刷新核对' });
     });
@@ -225,11 +239,11 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     if (failure) throw failure.reason;
     return sortHistory(responses.flatMap(result => result.status === 'fulfilled' ? result.value : []));
   }
-  function update(login: boolean, onAuthorized?: () => void): Promise<boolean> {
+  function update(login: boolean, onAuthorized?: () => void, keepRollcalls = false): Promise<boolean> {
     if (clearing || cleanupFailed) return Promise.resolve(false);
     if (operation && (!login || state.loggingIn)) return operation;
     if (!login && !state.authenticated) return Promise.resolve(false);
-    if (!login && historyOperation) return historyOperation.then(() => update(false));
+    if (!login && historyOperation) return historyOperation.then(() => update(false, undefined, keepRollcalls));
     if (login) { identity++; submissions.clear(); historyOperation = null; publish({ historyRefreshing: false, historyMessage: null }); }
     const version = ++generation;
     const includeSchedule = login || state.refreshSchedule;
@@ -254,10 +268,12 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         failure = 'LNT 待办更新失败，已保留原数据';
         const todos = todosFrom(await device.read('todos', undefined, account));
         if (!current(version)) return false;
-        failure = 'LNT 进行中签到更新失败，已保留原数据';
-        const rollcalls = rollcallsFrom(await device.read('rollcalls', undefined, account));
-        if (!current(version)) return false;
         const sameAccount = state.account?.lntId === account.lntId && state.account.studentNumber === account.studentNumber;
+        failure = 'LNT 进行中签到更新失败，已保留原数据';
+        const rollcallsAtReadStart = state.rollcalls;
+        const rollcalls = !login && sameAccount && (keepRollcalls || pollingRollcalls())
+          ? null : rollcallsFrom(await device.read('rollcalls', undefined, account));
+        if (!current(version)) return false;
         failure = 'LNT 当前学期读取失败，已保留原数据';
         const term = lntTermFrom(await device.read('lntTerms', undefined, account));
         if (!current(version)) return false;
@@ -279,11 +295,13 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         failure = '学校本机数据保存失败，已保留原数据';
         const saved = writing.then(async () => {
           if (!current(version)) return false;
-          const next: SavedLearning = { version: 1, account, todos, todosAt: updatedAt, term, courses, coursesAt: updatedAt, schedule, scheduleAt, refreshSchedule: state.refreshSchedule, rollcalls, attendance: sameAccount ? completed() : {}, history, historyAt };
+          const latestRollcalls = rollcalls === null || (sameAccount && !login && state.rollcalls !== rollcallsAtReadStart)
+            ? state.rollcalls : rollcalls;
+          const next: SavedLearning = { version: 1, account, todos, todosAt: updatedAt, term, courses, coursesAt: updatedAt, schedule, scheduleAt, refreshSchedule: state.refreshSchedule, rollcalls: latestRollcalls, attendance: sameAccount ? completed() : {}, history, historyAt };
           await device.save(JSON.stringify(next));
           if (!current(version)) return false;
           restoreFailed = false;
-          publish({ account, todos, rollcalls, todosAt: next.todosAt, term, courses, coursesAt: next.coursesAt, schedule, scheduleAt, history, historyAt, ready: true, needsLogin: false,
+          publish({ account, todos, rollcalls: next.rollcalls, todosAt: next.todosAt, term, courses, coursesAt: next.coursesAt, schedule, scheduleAt, history, historyAt, ready: true, needsLogin: false,
             ...(!sameAccount ? { attendance: {}, pendingAttendance: {} } : {}) });
           return true;
         });
@@ -390,23 +408,9 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     getSnapshot: () => state,
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     restore,
-    readPendingRollcalls,
-    async openReminder(account: Account, id: string, signal: AbortSignal) {
-      const version = generation, accountVersion = identity;
-      const valid = () => !signal.aborted && current(version) && identity === accountVersion
-        && state.account?.lntId === account.lntId && state.authenticated && !state.loggingIn;
-      if (!valid()) return null;
-      if (operation) await operation;
-      if (!valid()) return null;
-      const pending = await readPendingRollcalls(account, signal);
-      const activity = pending.find(item => item.id === id);
-      if (!activity || !valid()
-        || Object.hasOwn(state.attendance, id) || Object.hasOwn(state.pendingAttendance, id) || submissions.has(id)) return null;
-      publish({ rollcalls: [...state.rollcalls.filter(item => item.id !== id), activity] });
-      return activity.id;
-    },
+    refreshPendingRollcalls,
     login: (onAuthorized?: () => void) => update(true, onAuthorized),
-    refresh: () => update(false),
+    refresh: (options?: { keepRollcalls?: boolean }) => update(false, undefined, options?.keepRollcalls),
     refreshHistory,
     async setRefreshSchedule(enabled: boolean): Promise<boolean> {
       if (typeof enabled !== 'boolean' || clearing || cleanupFailed) return false;

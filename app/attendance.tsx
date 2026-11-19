@@ -17,7 +17,7 @@ export default function Attendance() {
   const navigation = useNavigation();
   const focused = useIsFocused();
   const rollcall = id ? state.rollcalls.find(item => item.id === id) : state.rollcalls.at(-1);
-  const rollcallId = rollcall?.id ?? '';
+  const rollcallId = id ?? rollcall?.id ?? '';
   const insets = useSafeAreaInsets();
   const [code, setCode] = useState('');
   const [phase, setPhase] = useState<Phase>(state.pendingAttendance[rollcallId] ?? state.attendance[rollcallId] ?? 'input');
