@@ -33,7 +33,7 @@ export type SchoolDevice = {
   save(value: string): Promise<void>;
   clear(): Promise<void>;
   authenticate(onAuthorized?: () => void): Promise<void>;
-  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account): Promise<unknown>;
+  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account, signal?: AbortSignal): Promise<unknown>;
   answerNumber(rollcallId: string, numberCode: string, account: Account): Promise<AttendanceReceipt>;
   submitLocation(rollcallId: string, position: Position, account: Account): Promise<AttendanceReceipt>;
   submitQr(rollcallId: string, data: unknown, account: Account): Promise<AttendanceReceipt>;
@@ -171,6 +171,13 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
   let restoreFailed = false;
   const current = (version: number) => generation === version;
   const completed = () => ({ ...state.attendance, ...state.pendingAttendance });
+  async function readPendingRollcalls(account: Account, signal: AbortSignal) {
+    const version = identity;
+    const valid = () => !signal.aborted && version === identity && state.authenticated && !state.loggingIn && state.account?.lntId === account.lntId;
+    if (!valid()) return [];
+    const activities = rollcallsFrom(await device.read('rollcalls', undefined, account, signal));
+    return valid() ? activities.filter(({ id }) => !Object.hasOwn(state.attendance, id) && !Object.hasOwn(state.pendingAttendance, id) && !submissions.has(id)) : [];
+  }
   function rememberAttendance() {
     const version = identity;
     writing = writing.then(async () => {
@@ -372,6 +379,16 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     getSnapshot: () => state,
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     restore,
+    readPendingRollcalls,
+    async openReminder(account: Account, id: string, signal: AbortSignal) {
+      const version = identity;
+      const pending = await readPendingRollcalls(account, signal);
+      const activity = pending.find(item => item.id === id);
+      if (!activity || signal.aborted || identity !== version || state.account?.lntId !== account.lntId || !state.authenticated || state.loggingIn
+        || Object.hasOwn(state.attendance, id) || Object.hasOwn(state.pendingAttendance, id) || submissions.has(id)) return null;
+      publish({ rollcalls: [...state.rollcalls.filter(item => item.id !== id), activity] });
+      return activity.id;
+    },
     login: (onAuthorized?: () => void) => update(true, onAuthorized),
     refresh: () => update(false),
     refreshHistory,

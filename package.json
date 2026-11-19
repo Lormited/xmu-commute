@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "main": "expo-router/entry",
+  "main": "index.js",
   "scripts": {
     "start": "node --dns-result-order=ipv4first ./node_modules/expo/bin/cli start --localhost --port 1100",
     "web": "node --dns-result-order=ipv4first ./node_modules/expo/bin/cli start --web --host localhost --port 1100",

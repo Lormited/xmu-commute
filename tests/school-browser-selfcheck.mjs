@@ -968,6 +968,68 @@ test('manual login rejects a profile for a different selected account and preser
   }
 });
 
+test('aborting a reminder read aborts its HTTP request without touching a foreground read', async () => {
+  const f = await boundFixture();
+  const foreground = deferred();
+  f.handler = (url, options) => {
+    if (url.includes('/todos')) return foreground.promise;
+    if (url === rollcallsUrl) return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(Error('ABORT')), { once: true }));
+  };
+  const controller = new AbortController();
+  const reading = f.schoolDevice.read('todos', undefined, recoveryAccount);
+  const cancelled = assert.rejects(f.schoolDevice.read('rollcalls', undefined, recoveryAccount, controller.signal), { code: 'CANCELLED' });
+  await tick();
+  try {
+    controller.abort();
+    assert.equal(f.calls.find(call => call.url === rollcallsUrl).options.signal.aborted, true);
+    assert.equal(f.calls.find(call => call.url.includes('/todos')).options.signal.aborted, false);
+  } finally { foreground.resolve(response(f.calls.find(call => call.url.includes('/todos')).url, { todo_list: [] })); }
+  await cancelled;
+  await reading;
+  const count = f.calls.length;
+  await assert.rejects(f.schoolDevice.read('rollcalls', undefined, recoveryAccount, controller.signal), { code: 'CANCELLED' });
+  assert.equal(f.calls.length, count);
+});
+
+test('stopping a reminder releases its renewal wait and preserves renewal shared with foreground', async () => {
+  for (const shared of [false, true]) {
+    const f = await boundFixture(), renewal = deferred();
+    f.handler = (url, options) => {
+      if (url === rollcallsUrl) return response(url, {}, 401);
+      if (url === lntRoot) return Promise.race([renewal.promise,
+        new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(Error('ABORT')), { once: true }))]);
+    };
+    const controller = new AbortController();
+    const stopped = assert.rejects(f.schoolDevice.read('rollcalls', undefined, recoveryAccount, controller.signal), { code: 'CANCELLED' });
+    await tick();
+    const refreshing = shared ? f.schoolDevice.read('todos', undefined, recoveryAccount) : null;
+    await tick();
+    controller.abort();
+    await stopped;
+    const renewalRequest = f.calls.find(call => call.url === lntRoot);
+    try { assert.equal(renewalRequest.options.signal.aborted, !shared); }
+    finally { renewal.resolve(redirect(lntRoot, '/user/index')); }
+    if (shared) await refreshing;
+    else await f.schoolDevice.read('todos', undefined, recoveryAccount);
+    assert.equal(f.calls.filter(call => call.url === rollcallsUrl).length, 1);
+  }
+});
+
+test('abort after accepted response preserves rotated cookies and discards the reminder result', async () => {
+  const f = await boundFixture(), writing = deferred();
+  f.writeGate = writing;
+  f.handler = url => url === rollcallsUrl ? response(url, { rollcalls: [] }, 200, 'application/json', [
+    ['Set-Cookie', 'lnt_session=rotated; Path=/; Secure'],
+  ]) : undefined;
+  const controller = new AbortController();
+  const stopped = assert.rejects(f.schoolDevice.read('rollcalls', undefined, recoveryAccount, controller.signal), { code: 'CANCELLED' });
+  await tick();
+  controller.abort();
+  writing.resolve();
+  await stopped;
+  assert.match(f.files.get(cacheName), /rotated/);
+});
+
 test('ordinary LNT failures and academic expiry do not trigger HTTP recovery', async () => {
   for (const kind of ['academic', 'redirect', 'html', 'json', 'server', 'network']) {
     const f = await boundFixture();
@@ -1201,7 +1263,8 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
       todoClock.listener = listener;
       return { remove() { todoClock.listener = null; } };
     } } }, './demo-state': demoState, './demo-data': demoData,
-    './schedule': scheduleModule, './learning': { createLearning: () => f.learning, historyView, todoView }, './school-device': f,
+    './schedule': scheduleModule, './learning': { historyView, todoView }, './school-device': f,
+    './school-reminder-device': { schoolLearning: f.learning, schoolRemindersAvailable: false, clearSchoolReminders: async () => {} },
     './qr.ts': qrModule, './location-attendance.ts': locationModule,
     './attendance-trial': { createAttendanceTrial }, './attendance-trial-device': { attendanceTrialDevice: {
       now: Date.now, load: async () => trialCache, save: async () => {}, stop: async () => {},

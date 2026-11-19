@@ -41,7 +41,8 @@ let active: BoundSession | null = null;
 let restored = false;
 let sessionFailure = 'AUTH_REQUIRED';
 let persistence = Promise.resolve();
-let recovering: { abort(): void; signal: AbortSignal; drain: Promise<void>; result: Promise<void> } | null = null;
+type Recovery = { abort(): void; signal: AbortSignal; drain: Promise<void>; result: Promise<void>; waiters: number; abandoned: boolean; committing: boolean };
+let recovering: Recovery | null = null;
 const requests = new Map<AbortController, Promise<unknown>>();
 const writes = new Set<Promise<unknown>>();
 export const schoolBrowser = createSchoolBrowser(() => {
@@ -163,6 +164,7 @@ function recoverLnt(previous: BoundSession, version: number, expiredUrl: string,
         const next = { account: previous.account, jar };
         await persistSession(next, version, signal, () => {
           if (Date.now() >= deadline) throw fail('AUTH_REQUIRED');
+          recovery.committing = true;
           clearTimeout(timer);
         });
         check(version);
@@ -175,48 +177,76 @@ function recoverLnt(previous: BoundSession, version: number, expiredUrl: string,
       url = next.href;
     }
     throw fail('AUTH_REQUIRED');
-  })().finally(() => { recovering = null; });
+  })().finally(() => {
+    if (recovery.abandoned) delete previous.recovery;
+    recovering = null;
+  });
   const result = Promise.race([drain, interrupted]).catch(error => {
+    if (recovery.abandoned) throw fail('CANCELLED');
     if (generation === version) active = null;
     throw Object.assign(error ?? fail('INVALID_RESPONSE'), { needsLogin: true });
   }).finally(() => clearTimeout(timer));
-  recovering = { abort, signal, drain, result };
+  const recovery: Recovery = { abort, signal, drain, result, waiters: 0, abandoned: false, committing: false };
+  recovering = recovery;
   return result;
 }
-async function query(url: string, version: number, init: RequestInit, account?: Account, canRetry = true): Promise<unknown> {
-  check(version);
-  const pending = recovering?.result;
-  if (pending) await pending;
+async function waitForRecovery(result: Promise<void>, version: number, signal?: AbortSignal) {
+  check(version, signal);
+  const recovery = recovering?.result === result ? recovering : null;
+  if (recovery?.abandoned) result = recovery.drain.catch(() => {});
+  if (recovery) recovery.waiters++;
+  let abort: (() => void) | undefined;
+  try {
+    if (!signal) await result;
+    else await Promise.race([result, new Promise<never>((_, reject) => {
+      abort = () => reject(fail('CANCELLED'));
+      signal.addEventListener('abort', abort, { once: true });
+    })]);
+    check(version, signal);
+  } finally {
+    if (abort) signal?.removeEventListener('abort', abort);
+    if (recovery && --recovery.waiters === 0 && signal?.aborted && recovering === recovery && !recovery.committing && !recovery.signal.aborted) {
+      recovery.abandoned = true;
+      recovery.abort();
+    }
+  }
+}
+async function query(url: string, version: number, init: RequestInit, account?: Account, canRetry = true, signal?: AbortSignal): Promise<unknown> {
+  check(version, signal);
+  const pending = recovering;
+  if (pending) await waitForRecovery(pending.result, version, signal);
   const session = boundSession(version, account);
   if (url === endpoints.jwTerms && verifiedTerms !== null) {
     const terms = verifiedTerms; verifiedTerms = null;
     return terms;
   }
-  const response = await request(url, version, init, session.jar);
-  check(version);
+  const response = await request(url, version, init, session.jar, signal);
+  check(version, signal);
   const lnt = new URL(url).origin === lntOrigin;
   const expired = response.httpStatus === 401 || isLoginRedirect(url, response);
-  if (lnt && expired && canRetry && !pending) {
+  if (lnt && expired && canRetry && (!pending || pending.abandoned)) {
+    if (recovering?.abandoned) await waitForRecovery(recovering.result, version, signal);
     session.recovery ??= recoverLnt(session, version, url, response);
-    await session.recovery;
-    return query(url, version, init, account, false);
+    await waitForRecovery(session.recovery, version, signal);
+    return query(url, version, init, account, false, signal);
   }
   schoolResult(url, response);
   if (lnt && response.contentType.includes('html')) throw fail('INVALID_RESPONSE');
   const data = jsonResponse(response);
-  if (session.recovery) await session.recovery;
+  if (session.recovery) await waitForRecovery(session.recovery, version, signal);
   if (active === session && !session.recovery && setSchoolCookies(session.jar, url, response.headers)) {
     await persistSession(session, version);
   }
+  check(version, signal);
   boundSession(version, account);
   return data;
 }
-async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], account?: Account): Promise<unknown> {
+async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], account?: Account, signal?: AbortSignal): Promise<unknown> {
   const version = generation;
-  check(version);
+  check(version, signal);
   if (action === 'profile') {
     const pending = recovering?.result;
-    if (pending) await pending;
+    if (pending) await waitForRecovery(pending, version, signal);
     const { lntId, studentNumber, name } = boundSession(version, account).account;
     return { id: lntId, user_no: studentNumber, name };
   }
@@ -228,7 +258,7 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
       const result = await query(endpoints.courses, version, {
         method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify({ page, page_size: 100, fields: 'id,course_code,name,semester_id', conditions: { semester_id: [params!.semesterId] } }),
-      }, account) as { success?: unknown; courses?: unknown; pages?: unknown; total?: unknown } | null;
+      }, account, true, signal) as { success?: unknown; courses?: unknown; pages?: unknown; total?: unknown } | null;
       if (result?.success === false || !Array.isArray(result?.courses) || !Number.isSafeInteger(result.pages) || (result.pages as number) < 0
         || !Number.isSafeInteger(result.total) || (result.total as number) < 0
         || page > 1 && (result.pages !== pages || result.total !== total)) throw fail('INVALID_RESPONSE');
@@ -254,7 +284,7 @@ async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parame
   return query(url, version, timetable ? {
     method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({ XNXQDM: params!.jwTermCode!, XH: params?.studentNumber ?? '' }).toString(),
-  } : { headers: { Accept: 'application/json' } }, account);
+  } : { headers: { Accept: 'application/json' } }, account, true, signal);
 }
 function jsonResponse(response: { contentType: string; text: string }): unknown {
   if (!response.contentType.includes('json')) throw fail(response.contentType.includes('html') ? 'AUTH_REQUIRED' : 'INVALID_RESPONSE');
@@ -428,7 +458,7 @@ async function answerRollcall(rollcallId: string, kind: 'number' | 'qr' | 'locat
   const version = generation;
   if (!account) throw fail('AUTH_REQUIRED');
   const recovery = recovering;
-  if (recovery) await recovery.result;
+  if (recovery) await waitForRecovery(recovery.result, version);
   const session = boundSession(version, account);
   const url = `https://lnt.xmu.edu.cn/api/rollcall/${encodeURIComponent(rollcallId)}/${kind === 'location' ? 'answer' : `answer_${kind}_rollcall`}`;
   const response = schoolResult(url, await request(url, version, {
