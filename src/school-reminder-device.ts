@@ -15,13 +15,15 @@ type NativeJob = {
   isCurrent(token: string): boolean;
   addListener(event: 'onStop', listener: (data: JobData) => void): { remove(): void };
 };
-type SavedReminders = { enabled: boolean; issued: Record<string, string> };
+type SavedNotice = { identifier: string; delivered: boolean };
+type SavedReminders = { accountId: number; enabled: boolean; issued: Record<string, SavedNotice> };
 const channelId = 'school-attendance';
 const developPollInterval = 30000;
 const job = Platform.OS === 'android' ? requireOptionalNativeModule<NativeJob>('SchoolReminderJob') : null;
 export const schoolRemindersAvailable = !!job;
 export const schoolLearning = createLearning(schoolDevice);
-const file = (id: number) => new File(Paths.document, `school-reminders-${id}.json`);
+const file = () => new File(Paths.document, 'school-reminders.json');
+const temporaryFile = () => new File(Paths.document, 'school-reminders.tmp');
 const notifications = () => import('expo-notifications');
 let pending = Promise.resolve();
 let running: { token: string; stop(): void; task: Promise<void> } | undefined;
@@ -36,18 +38,21 @@ function currentAccount() {
   return ready && authenticated && !loggingIn ? account : null;
 }
 async function load(id: number): Promise<SavedReminders> {
-  const saved = file(id);
-  if (!saved.exists) return { enabled: false, issued: {} };
+  const empty = { accountId: id, enabled: false, issued: {} };
+  const saved = file();
+  if (!saved.exists) return empty;
   const value = JSON.parse(await saved.text()) as SavedReminders;
-  if (typeof value?.enabled !== 'boolean' || !value.issued || typeof value.issued !== 'object' || Array.isArray(value.issued)
-    || !Object.values(value.issued).every(id => typeof id === 'string')) throw Error('REMINDER_STORAGE');
-  return value;
+  if (!value || !Number.isSafeInteger(value.accountId) || value.accountId <= 0
+    || typeof value.enabled !== 'boolean' || !value.issued || typeof value.issued !== 'object' || Array.isArray(value.issued)
+    || !Object.values(value.issued).every(notice => typeof notice?.identifier === 'string' && notice.identifier.length === 36
+      && typeof notice.delivered === 'boolean')) throw Error('REMINDER_STORAGE');
+  return value.accountId === id ? value : empty;
 }
-async function save(id: number, value: SavedReminders) {
-  const temporary = new File(Paths.document, `school-reminders-${id}.tmp`);
+async function save(value: SavedReminders) {
+  const temporary = temporaryFile();
   try {
     await temporary.write(JSON.stringify(value));
-    await moveAsync({ from: temporary.uri, to: file(id).uri });
+    await moveAsync({ from: temporary.uri, to: file().uri });
   } finally { if (temporary.exists) temporary.delete(); }
 }
 async function permitted(prompt = false) {
@@ -88,27 +93,28 @@ export async function setSchoolReminders(enabled: boolean) {
   const id = account.lntId;
   if (enabled && (currentAccount()?.lntId !== id || !await permitted(true))) return false;
   running?.stop();
+  if (!enabled) void job?.cancel().catch(() => {});
   return serialize(async () => {
     if (schoolLearning.getSnapshot().account?.lntId !== id || enabled && currentAccount()?.lntId !== id) return false;
-    const saved = await load(id);
     if (!enabled) {
-      try { await save(id, { ...saved, enabled }); }
+      try { await save({ ...await load(id), enabled }); }
       finally { await schedule(false); }
       return true;
     }
-    await save(id, { ...saved, enabled });
+    const saved = await load(id);
+    await save({ ...saved, enabled });
     try { await schedule(currentAccount()?.lntId === id); }
-    catch (error) { await save(id, saved); throw error; }
+    catch (error) { await save(saved); throw error; }
     return true;
   });
 }
 
-export function clearSchoolReminders(account: Account | null) {
+export function clearSchoolReminders() {
   running?.stop();
+  void job?.cancel().catch(() => {});
   return serialize(async () => {
     try {
-      if (account) {
-        const saved = file(account.lntId);
+      for (const saved of [file(), temporaryFile()]) {
         if (saved.exists) saved.delete();
       }
     } finally { await schedule(false); }
@@ -121,7 +127,7 @@ export async function openSchoolReminder(identifier: string, signal: AbortSignal
   const account = currentAccount();
   if (!account || signal.aborted) return null;
   const { issued } = await pending.then(() => load(account.lntId));
-  const id = Object.keys(issued).find(id => issued[id] === identifier);
+  const id = Object.keys(issued).find(id => issued[id].identifier === identifier);
   if (signal.aborted || currentAccount()?.lntId !== account.lntId || !id || id.startsWith('trial-')) return null;
   return schoolLearning.openReminder(account, id, signal);
 }
@@ -135,26 +141,30 @@ function wait(ms: number, signal: AbortSignal) {
   });
 }
 
+async function untilAborted(task: Promise<void>, signal: AbortSignal) {
+  let abort!: () => void;
+  const aborted = new Promise<void>(resolve => { abort = resolve; });
+  if (signal.aborted) abort();
+  else signal.addEventListener('abort', abort, { once: true });
+  try { await Promise.race([task, aborted]); }
+  finally { signal.removeEventListener('abort', abort); }
+}
+
 async function notify(account: Account, rollcallId: string, valid: () => boolean) {
   await serialize(async () => {
     if (!valid() || rollcallId.startsWith('trial-')) return;
     const saved = await load(account.lntId);
-    if (!saved.enabled || Object.hasOwn(saved.issued, rollcallId) || !valid() || !await permitted()) return;
+    const notice = Object.hasOwn(saved.issued, rollcallId) ? saved.issued[rollcallId] : undefined;
+    if (!saved.enabled || notice?.delivered || !valid() || !await permitted()) return;
     if (!valid()) return;
     const api = await notifications();
-    const identifier = randomUUID();
-    await save(account.lntId, { ...saved, issued: { ...saved.issued, [rollcallId]: identifier } });
-    try {
-      if (valid()) {
-        await api.scheduleNotificationAsync({ identifier, content: { title: '有新的签到活动', body: '点按打开签到，由你确认提交',
-          data: { source: 'school' }, sound: 'default' }, trigger: { channelId } });
-        return;
-      }
-    } catch {
-      await save(account.lntId, saved);
-      throw Error('REMINDER_NOTIFICATION');
-    }
-    await save(account.lntId, saved);
+    const identifier = notice?.identifier ?? randomUUID();
+    if (!notice) await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: false } } });
+    if (!valid()) return;
+    await api.scheduleNotificationAsync({ identifier, content: { title: '有新的签到活动', body: '点按打开签到，由你确认提交',
+      data: { source: 'school' }, sound: 'default' }, trigger: { channelId } });
+    if (!valid()) { await api.dismissNotificationAsync(identifier); return; }
+    await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: true } } });
   });
 }
 
@@ -171,17 +181,16 @@ export function runSchoolReminderJob(token: string): Promise<void> {
   const task = (async () => {
     const listener = job.addListener('onStop', event => { if (event.token === token) stop(); });
     let deadline: ReturnType<typeof setTimeout> | undefined;
-    let following: number | null = null;
     try {
       await previous?.task;
-      await pending;
-      if (!active()) return;
+      await untilAborted(pending, signal);
+      if (!active()) return null;
       await schoolLearning.restore();
       const account = currentAccount();
-      if (!active() || !account || !(await load(account.lntId)).enabled || !await permitted() || !active()) return;
+      if (!active() || !account || !(await load(account.lntId)).enabled || !await permitted() || !active()) return null;
       const now = Date.now();
       const window = nextReminderWindow(schoolLearning.getSnapshot().schedule, now);
-      if (!window || window.start > now) { following = window?.start ?? null; return; }
+      if (!window || window.start > now) return window?.start ?? null;
       const valid = () => active() && Date.now() < window.end && currentAccount()?.lntId === account.lntId;
       deadline = setTimeout(() => abort.abort(), window.end - now);
       while (valid()) {
@@ -190,22 +199,23 @@ export function runSchoolReminderJob(token: string): Promise<void> {
           const rollcalls = await schoolLearning.readPendingRollcalls(account, signal);
           for (const { id } of rollcalls) {
             if (!valid()) break;
-            await notify(account, id, valid);
+            await untilAborted(notify(account, id, valid), signal);
           }
         } catch (error) {
           const { code, needsLogin } = (error as { code?: string; needsLogin?: boolean }) ?? {};
-          if (needsLogin || code === 'AUTH_REQUIRED' || code === 'COOKIE_STORAGE') return;
+          if (needsLogin || code === 'AUTH_REQUIRED' || code === 'COOKIE_STORAGE') return null;
           delay *= 2;
         }
         if (valid()) await wait(Math.min(delay, window.end - Date.now()), signal);
       }
-      if (!stopped && currentAccount()?.lntId === account.lntId) following = nextAt(Math.max(Date.now(), window.end));
+      return currentAccount()?.lntId === account.lntId ? nextAt(Math.max(Date.now(), window.end)) : null;
     } finally {
       clearTimeout(deadline);
       listener.remove();
-      if (!stopped && job.isCurrent(token)) await job.finish(token, following);
     }
-  })().catch(() => {}).finally(() => { if (running?.token === token) running = undefined; });
+  })().then(async following => {
+    if (!stopped && job.isCurrent(token)) await job.finish(token, following);
+  }).catch(() => {}).finally(() => { if (running?.token === token) running = undefined; });
   running = { token, stop, task };
   return task;
 }

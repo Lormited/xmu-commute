@@ -139,7 +139,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     setSyncResult(null);
     setSelectedWeek(null);
     if (real) {
-      const reminders = clearSchoolReminders(learning.getSnapshot().account).then(() => true, () => false);
+      const reminders = clearSchoolReminders().then(() => true, () => false);
       const cleared = learning.logout();
       await trial.stop();
       const [remindersCleared, learningCleared] = await Promise.all([reminders, cleared]);

@@ -381,10 +381,15 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     restore,
     readPendingRollcalls,
     async openReminder(account: Account, id: string, signal: AbortSignal) {
-      const version = identity;
+      const version = generation, accountVersion = identity;
+      const valid = () => !signal.aborted && current(version) && identity === accountVersion
+        && state.account?.lntId === account.lntId && state.authenticated && !state.loggingIn;
+      if (!valid()) return null;
+      if (operation) await operation;
+      if (!valid()) return null;
       const pending = await readPendingRollcalls(account, signal);
       const activity = pending.find(item => item.id === id);
-      if (!activity || signal.aborted || identity !== version || state.account?.lntId !== account.lntId || !state.authenticated || state.loggingIn
+      if (!activity || !valid()
         || Object.hasOwn(state.attendance, id) || Object.hasOwn(state.pendingAttendance, id) || submissions.has(id)) return null;
       publish({ rollcalls: [...state.rollcalls.filter(item => item.id !== id), activity] });
       return activity.id;
