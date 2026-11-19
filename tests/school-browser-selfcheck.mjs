@@ -950,25 +950,46 @@ test('authentication, cookie snapshot or cache storage failure preserves cached 
   }
 });
 
-test('manual login rejects a profile for a different selected account and preserves its cache', async () => {
-  for (const otherProfile of [{ ...profile, id: 43 }, { ...profile, user_no: '009999' }]) {
-    const raw = cacheEnvelope(learningFixture());
-    const f = fixture(new Map([[cacheName, raw]]));
+test('manual login replaces the session and keeps a failed business batch only for the same cached LNT id', async () => {
+  const oldLearning = learningFixture({ refreshSchedule: true, attendance: { 81: 'success' } });
+  for (const [cachedLearning, lntId, keep] of [
+    [oldLearning, 43, false],
+    [oldLearning, 42, true],
+    [{ version: 1, refreshSchedule: true }, 43, false],
+    [null, 43, false],
+  ]) {
+    const f = await boundFixture(cachedLearning);
     await f.learning.restore();
-    let authorized = 0;
-    f.handler = async url => url.endsWith('/profile') ? response(url, otherProfile) : undefined;
-    const login = f.learning.login(() => authorized++);
+    const account = { lntId, studentNumber: '009999', name: '本次登录同学' };
+    const business = deferred(), reading = deferred();
+    let authorized;
+    f.handler = async url => {
+      if (url.endsWith('/profile')) return response(url, { id: lntId, user_no: account.studentNumber, name: account.name });
+      if (url === academicProfileUrl) return response(url, { data: [{ XH: account.studentNumber }] });
+      if (url.includes('/todos')) { reading.resolve(); await business.promise; return response(url, {}, 503); }
+    };
+    const login = f.learning.login(() => { authorized = f.learning.getSnapshot(); });
     await authorize(f); await initialize(f);
+    try {
+      assert.equal(await Promise.race([reading.promise.then(() => true), login]), true, 'login starts business reads');
+      assert.equal(authorized.authenticated, true);
+      assert.deepEqual({ ...authorized.account }, account);
+      assert.deepEqual(authorized.todos, keep ? [todo] : []);
+      assert.deepEqual(authorized.courses, keep ? [course] : []);
+      assert.deepEqual(authorized.attendance, keep ? { 81: 'success' } : {});
+      assert.equal(authorized.refreshSchedule, keep);
+      assert.equal(await f.learning.setRefreshSchedule(!keep), false);
+      assert.deepEqual(f.cacheMoves, [cacheName]);
+    } finally { business.resolve(); }
     assert.equal(await login, false);
-    assert.equal(authorized, 0);
-    assert.equal(f.learning.getSnapshot().authenticated, false);
-    assert.equal(f.learning.getSnapshot().needsLogin, true);
-    assert.deepEqual(f.learning.getSnapshot().account, recoveryAccount);
-    assert.deepEqual(f.learning.getSnapshot().todos, [todo]);
-    assert.equal(f.files.get('school-learning.json'), raw);
-    assert.equal(savedSession(f), null);
-    assert.deepEqual(f.cacheMoves, []);
-    assert.equal(f.calls.at(-1).url, lntRoot + 'api/profile');
+    assert.equal(f.learning.getSnapshot().authenticated, true);
+    assert.deepEqual(f.learning.getSnapshot().todos, keep ? [todo] : []);
+    assert.deepEqual(f.cacheMoves, [cacheName]);
+    const reopened = await fixture(f.files).schoolDevice.load();
+    assert.deepEqual({ ...reopened.account }, account);
+    assert.deepEqual(JSON.parse(reopened.raw), keep ? { ...oldLearning, account } : null);
+    assert.equal(CookieJar.deserializeSync(savedSession(f).cookies).getCookieStringSync(lntRoot), 'lnt_session=manual-lnt');
+    if (!keep) await assert.rejects(f.schoolDevice.save(JSON.stringify(oldLearning)), { code: 'AUTH_REQUIRED' });
   }
 });
 
@@ -1401,8 +1422,8 @@ test('every login button opens the WebView directly; cancellation stays on the c
     const login = app.loginButton(page).props.onPress();
     await authorize(f); await initialize(f); assert.equal(await login, false);
     const failed = app.render();
-    assert.equal(failed.state.loggedIn, true, 'authentication is visible even before the first saved account');
-    assert.equal(failed.data.account, null); assert.equal(failed.data.needsLogin, false);
+    assert.equal(failed.state.loggedIn, true, 'authentication is visible before the first saved business batch');
+    assert.deepEqual({ ...failed.data.account }, recoveryAccount); assert.equal(failed.data.needsLogin, false);
     assert.equal(app.loginButton('profile'), undefined);
     assert.equal(f.schoolBrowser.getSnapshot(), null);
     const refresh = app.refreshButton(); assert.ok(refresh); assert.equal(refresh.props.disabled, false);

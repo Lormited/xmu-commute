@@ -26,7 +26,7 @@ const endpoints = {
   jwTerms: 'https://jw.xmu.edu.cn/gsapp/sys/wdkbapp/modules/xskcb/kfdxnxqcx.do',
 };
 let generation = 0;
-let authenticating: Promise<void> | null = null;
+let authenticating: ReturnType<SchoolDevice['authenticate']> | null = null;
 let clearing: Promise<void> | null = null;
 let mustClear = false;
 type BoundSession = { account: Account; jar: CookieJar; recovery?: Promise<void> };
@@ -112,12 +112,15 @@ function schoolResult(url: string, response: SchoolResponse, write = false) {
   if (httpStatus !== 200 && (!write || redirects.has(httpStatus))) throw fail('HTTP_ERROR', httpStatus);
   return response;
 }
-async function persistSession(session: BoundSession, version: number, signal?: AbortSignal, beforeCommit?: () => void) {
+async function persistSession(session: BoundSession, version: number,
+  { signal, beforeCommit, login = false }: { signal?: AbortSignal; beforeCommit?: () => void; login?: boolean } = {}) {
   try {
-    await persistCache(({ learning }) => {
-      const expected = learningAccount(learning);
-      if (expected) assertLntAccount(expected, session.account);
-      return { learning, session: { account: session.account, cookies: session.jar.serializeSync() } };
+    return await persistCache(({ learning }) => {
+      const owner = learningAccount(learning);
+      const { account, jar } = session;
+      if (login) learning = owner?.lntId === account.lntId ? { ...learning!, account } : null;
+      else if (owner) assertLntAccount(owner, account);
+      return { learning, session: { account, cookies: jar.serializeSync() } };
     }, version, signal, beforeCommit);
   } catch (error) {
     check(version, signal);
@@ -161,10 +164,12 @@ function recoverLnt(previous: BoundSession, version: number, expiredUrl: string,
         if (response.httpStatus !== 200) throw fail('HTTP_ERROR', response.httpStatus);
         if (new URL(url).origin !== lntOrigin) throw fail('AUTH_REQUIRED');
         const next = { account: previous.account, jar };
-        await persistSession(next, version, signal, () => {
-          if (Date.now() >= deadline) throw fail('AUTH_REQUIRED');
-          recovery.committing = true;
-          clearTimeout(timer);
+        await persistSession(next, version, {
+          signal, beforeCommit: () => {
+            if (Date.now() >= deadline) throw fail('AUTH_REQUIRED');
+            recovery.committing = true;
+            clearTimeout(timer);
+          },
         });
         check(version);
         active = next;
@@ -285,8 +290,7 @@ function jsonResponse(response: { contentType: string; text: string }): unknown 
   if (!response.contentType.includes('json')) throw fail(response.contentType.includes('html') ? 'AUTH_REQUIRED' : 'INVALID_RESPONSE');
   try { return JSON.parse(response.text); } catch { throw fail('INVALID_RESPONSE'); }
 }
-async function authenticate(expected: Account | undefined, onAuthorized?: () => void) {
-  const version = generation;
+async function authenticate(version: number) {
   check(version);
   let stage = 'native';
   try {
@@ -332,7 +336,6 @@ async function authenticate(expected: Account | undefined, onAuthorized?: () => 
     }, jar));
     setSchoolCookies(jar, loginUrl, login.headers);
     const account = await verifyProfile(jar, version);
-    if (expected) assertLntAccount(expected, account);
     stage = 'academic-probe';
     const identityResponse = schoolResult(academicProfileUrl, await request(academicProfileUrl, version, { headers: { Accept: 'application/json' } }, jar));
     const academicIdentity = jsonResponse(identityResponse) as { success?: boolean; data?: { XH?: unknown }[] } | null;
@@ -341,13 +344,12 @@ async function authenticate(expected: Account | undefined, onAuthorized?: () => 
     setSchoolCookies(jar, academicProfileUrl, identityResponse.headers);
     stage = 'flush';
     const session = { account, jar };
-    await persistSession(session, version, undefined, schoolBrowser.beginCommit);
+    const learning = await persistSession(session, version, { login: true, beforeCommit: schoolBrowser.beginCommit });
     check(version);
     active = session;
     restored = true;
     sessionFailure = 'AUTH_REQUIRED';
-    schoolBrowser.close();
-    onAuthorized?.();
+    return { account, raw: learning && JSON.stringify(learning) };
   } catch (cause) {
     const { code: rawCode, httpStatus, nativeCode } = (cause as { code?: string; httpStatus?: number; nativeCode?: number }) ?? {};
     // Only known codes and numeric statuses may leave the authentication boundary.
@@ -405,8 +407,9 @@ function persistCache(update: (previous: LocalCache) => LocalCache, version: num
       // File.move deletes the destination first; legacy moveAsync uses Android's same-directory renameTo.
       try { await moveAsync(move); } catch { throw fail('CACHE_STORAGE'); }
     } finally { if (file.exists) file.delete(); }
+    return learning;
   });
-  persistence = saved.catch(() => {});
+  persistence = saved.then(() => {}, () => {});
   return saved;
 }
 function clear(): Promise<void> {
@@ -478,8 +481,8 @@ export const schoolDevice: SchoolDevice = {
     }
     return { raw: learning && JSON.stringify(learning), account: active?.account ?? null };
   },
-  save(value) {
-    return persistCache(previous => {
+  async save(value) {
+    await persistCache(previous => {
       const learning = JSON.parse(value) as CachedLearning;
       if (learning?.version !== 1) throw fail('INVALID_CACHE');
       const account = learningAccount(learning);
@@ -504,7 +507,7 @@ export const schoolDevice: SchoolDevice = {
     if (data === undefined) throw fail('INVALID_ATTENDANCE');
     return answerRollcall(rollcallId, 'qr', { data }, qrReceipt, account);
   },
-  authenticate(onAuthorized) {
+  authenticate() {
     if (clearing || mustClear) return Promise.reject(fail('CLEANUP_REQUIRED'));
     authenticating ??= (async () => {
       if (logoutMarker().exists) throw fail('CLEANUP_REQUIRED');
@@ -522,10 +525,9 @@ export const schoolDevice: SchoolDevice = {
         ]);
       } finally { clearTimeout(timer); }
       check(version);
-      const { learning, session } = await readCache();
+      const binding = await authenticate(version);
       check(version);
-      await authenticate(learningAccount(learning) ?? session?.account, onAuthorized);
-      check(version);
+      return binding;
     })().finally(() => { authenticating = null; });
     return authenticating;
   },

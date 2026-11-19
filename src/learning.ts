@@ -32,7 +32,7 @@ export type SchoolDevice = {
   load(): Promise<{ raw: string | null; account: Account | null }>;
   save(value: string): Promise<void>;
   clear(): Promise<void>;
-  authenticate(onAuthorized?: () => void): Promise<void>;
+  authenticate(): Promise<{ raw: string | null; account: Account }>;
   read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account, signal?: AbortSignal): Promise<unknown>;
   answerNumber(rollcallId: string, numberCode: string, account: Account): Promise<AttendanceReceipt>;
   submitLocation(rollcallId: string, position: Position, account: Account): Promise<AttendanceReceipt>;
@@ -240,16 +240,24 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       try {
         await writing;
         if (!current(version)) return false;
-        if (login) await device.authenticate(() => {
-          if (!current(version)) return;
+        let account: Account;
+        if (login) {
+          const binding = await device.authenticate();
+          if (!current(version)) return false;
+          account = binding.account;
+          let saved: ReturnType<typeof cacheFrom> | null = null;
+          try {
+            saved = binding.raw ? cacheFrom(binding.raw) : null;
+            restoreFailed = false;
+          } catch { restoreFailed = true; }
           authorized = true;
-          publish({ authenticated: true, needsLogin: false });
+          publish({ ...empty, ...saved, account, loggingIn: true, refreshing: true, authenticated: true });
           onAuthorized?.();
-        });
-        if (!current(version)) return false;
-        publish({ refreshing: true });
-        failure = 'LNT 个人资料读取失败，已保留原数据';
-        const account = accountFrom(await device.read('profile'));
+        } else {
+          publish({ refreshing: true });
+          failure = 'LNT 个人资料读取失败，已保留原数据';
+          account = accountFrom(await device.read('profile'));
+        }
         if (!current(version)) return false;
         failure = 'LNT 待办更新失败，已保留原数据';
         const todos = todosFrom(await device.read('todos', undefined, account));
@@ -257,7 +265,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         failure = 'LNT 进行中签到更新失败，已保留原数据';
         const rollcalls = rollcallsFrom(await device.read('rollcalls', undefined, account));
         if (!current(version)) return false;
-        const sameAccount = state.account?.lntId === account.lntId && state.account.studentNumber === account.studentNumber;
+        const sameAccount = login || (state.account?.lntId === account.lntId && state.account.studentNumber === account.studentNumber);
         failure = 'LNT 当前学期读取失败，已保留原数据';
         const term = lntTermFrom(await device.read('lntTerms', undefined, account));
         if (!current(version)) return false;
@@ -409,7 +417,7 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     refresh: () => update(false),
     refreshHistory,
     async setRefreshSchedule(enabled: boolean): Promise<boolean> {
-      if (typeof enabled !== 'boolean' || clearing || cleanupFailed) return false;
+      if (typeof enabled !== 'boolean' || clearing || cleanupFailed || state.loggingIn) return false;
       const version = identity;
       await restore();
       const saved = writing.then(async () => {
