@@ -950,25 +950,59 @@ test('authentication, cookie snapshot or cache storage failure preserves cached 
   }
 });
 
-test('manual login rejects a profile for a different selected account and preserves its cache', async () => {
-  for (const otherProfile of [{ ...profile, id: 43 }, { ...profile, user_no: '009999' }]) {
-    const raw = cacheEnvelope(learningFixture());
-    const f = fixture(new Map([[cacheName, raw]]));
+test('manual login replaces the session and keeps learning or preferences only for their LNT id', async () => {
+  const oldLearning = learningFixture({ refreshSchedule: true, attendance: { 81: 'success' } });
+  const preferences = { version: 1, refreshSchedule: true };
+  for (const [cachedLearning, lntId, keepBatch, keepPreference] of [
+    [oldLearning, 43, false, false],
+    [oldLearning, 42, true, true],
+    [preferences, 43, false, false],
+    [preferences, 42, false, true],
+    [null, 43, false, false],
+  ]) {
+    const f = await boundFixture(cachedLearning);
     await f.learning.restore();
-    let authorized = 0;
-    f.handler = async url => url.endsWith('/profile') ? response(url, otherProfile) : undefined;
-    const login = f.learning.login(() => authorized++);
+    const account = { lntId, studentNumber: '009999', name: '本次登录同学' };
+    const business = deferred(), reading = deferred();
+    let authorized;
+    f.handler = async url => {
+      if (url.endsWith('/profile')) return response(url, { id: lntId, user_no: account.studentNumber, name: account.name });
+      if (url === academicProfileUrl) return response(url, { data: [{ XH: account.studentNumber }] });
+      if (url.includes('/todos')) { reading.resolve(); await business.promise; return response(url, {}, 503); }
+    };
+    const login = f.learning.login(() => { authorized = f.learning.getSnapshot(); });
     await authorize(f); await initialize(f);
+    try {
+      assert.equal(await Promise.race([reading.promise.then(() => true), login]), true, 'login starts business reads');
+      assert.equal(authorized.authenticated, true);
+      assert.deepEqual({ ...authorized.account }, account);
+      assert.deepEqual(authorized.todos, keepBatch ? [todo] : []);
+      assert.deepEqual(authorized.courses, keepBatch ? [course] : []);
+      assert.deepEqual(authorized.attendance, keepBatch ? { 81: 'success' } : {});
+      assert.equal(authorized.refreshSchedule, keepPreference);
+      assert.equal(await f.learning.setRefreshSchedule(!keepPreference), false);
+      assert.deepEqual(f.cacheMoves, [cacheName]);
+    } finally { business.resolve(); }
     assert.equal(await login, false);
-    assert.equal(authorized, 0);
-    assert.equal(f.learning.getSnapshot().authenticated, false);
-    assert.equal(f.learning.getSnapshot().needsLogin, true);
-    assert.deepEqual(f.learning.getSnapshot().account, recoveryAccount);
-    assert.deepEqual(f.learning.getSnapshot().todos, [todo]);
-    assert.equal(f.files.get('school-learning.json'), raw);
-    assert.equal(savedSession(f), null);
-    assert.deepEqual(f.cacheMoves, []);
-    assert.equal(f.calls.at(-1).url, lntRoot + 'api/profile');
+    assert.equal(f.learning.getSnapshot().authenticated, true);
+    assert.deepEqual(f.learning.getSnapshot().todos, keepBatch ? [todo] : []);
+    assert.deepEqual(f.cacheMoves, [cacheName]);
+    const reopened = fixture(f.files);
+    const expected = keepBatch ? { ...oldLearning, account } : keepPreference ? preferences : null;
+    assert.deepEqual(JSON.parse(f.files.get(cacheName)).learning, expected);
+    assert.equal(CookieJar.deserializeSync(savedSession(f).cookies).getCookieStringSync(lntRoot), 'lnt_session=manual-lnt');
+    if (lntId !== recoveryAccount.lntId) await assert.rejects(f.schoolDevice.save(JSON.stringify(oldLearning)), { code: 'AUTH_REQUIRED' });
+    await reopened.learning.restore();
+    assert.deepEqual({ ...reopened.learning.getSnapshot().account }, account);
+    if (!keepBatch) {
+      assert.equal(await reopened.learning.refresh(), true);
+      const batch = reopened.learning.getSnapshot();
+      assert.ok(batch.scheduleAt !== null && batch.historyAt !== null);
+      assert.ok(reopened.calls.some(({ url }) => url.includes(`/student/${lntId}/rollcalls`)));
+      assert.ok(reopened.calls.some(({ url }) => url.endsWith('/queryXspkjg.do')));
+      assert.equal(reopened.calls.some(({ url }) => url.endsWith('/profile')), false);
+      assert.deepEqual(JSON.parse(f.files.get(cacheName)).learning.account, account);
+    }
   }
 });
 
@@ -1405,8 +1439,8 @@ test('every login button opens the WebView directly; cancellation stays on the c
     const login = app.loginButton(page).props.onPress();
     await authorize(f); await initialize(f); assert.equal(await login, false);
     const failed = app.render();
-    assert.equal(failed.state.loggedIn, true, 'authentication is visible even before the first saved account');
-    assert.equal(failed.data.account, null); assert.equal(failed.data.needsLogin, false);
+    assert.equal(failed.state.loggedIn, true, 'authentication is visible before the first saved business batch');
+    assert.deepEqual({ ...failed.data.account }, recoveryAccount); assert.equal(failed.data.needsLogin, false);
     assert.equal(app.loginButton('profile'), undefined);
     assert.equal(f.schoolBrowser.getSnapshot(), null);
     const refresh = app.refreshButton(); assert.ok(refresh); assert.equal(refresh.props.disabled, false);
@@ -1925,7 +1959,7 @@ test('provider startup shows cache and refreshes once using the restored setting
     f.handler = async url => { if (url.includes('/my-courses')) { await gate.promise; return response(url, { courses: [{ ...course, name: '启动刷新课程' }], pages: 1, total: 1 }); } };
     app.render(); app.runStartupEffects(); await tick();
     const cached = app.render();
-    assert.equal(cached.data.account.name, '缓存账号');
+    assert.equal(cached.data.account.name, recoveryAccount.name);
     assert.equal(cached.data.todosAt, 1000);
     assert.equal(cached.refreshing, true);
     gate.resolve(); assert.equal(await f.learning.refresh(), true);

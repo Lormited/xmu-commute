@@ -10,22 +10,30 @@ const record = { rollcall_id: 11, student_rollcall_id: 111, rollcall_time: '2026
 const scheduleRow = { WID: 'row-1', BJDM: '001-A', KCMC: '学校课程', JASMC: '教学楼 101', JSXM: '张老师', XQ: 2, KSJCDM: 1, JSJCDM: 1, KSSJ: '0800', JSSJ: '0845', ZCMC: '8周', JCFADM: 'a' };
 const saved = { version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [], todosAt: 1000, term, courses: [course, otherCourse], coursesAt: 1000,
   schedule: null, scheduleAt: null, history: [], historyAt: null, rollcalls: [], attendance: {}, refreshSchedule: false };
+const otherAccount = { lntId: 99, studentNumber: '009999', name: '另一同学' };
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
-function fixture(raw = JSON.stringify(saved)) {
+function fixture(raw = JSON.stringify(saved), account = JSON.parse(raw)?.account ?? null) {
   const calls = [];
+  let loginAccount = saved.account;
   const device = {
-    load: async () => ({ raw, account: raw ? saved.account : null }), save: async value => { raw = value; }, clear: async () => { raw = null; }, authenticate: async callback => callback?.(),
+    load: async () => ({ raw, account }), save: async value => { raw = value; }, clear: async () => { raw = null; account = null; },
+    authenticate: async () => {
+      const previous = JSON.parse(raw);
+      account = loginAccount;
+      raw = previous?.account?.lntId === account.lntId ? JSON.stringify({ ...previous, account }) : null;
+      return { raw, account };
+    },
     read: async (action, params) => {
       calls.push([action, params]);
       if (action === 'history') return { rollcalls: params.courseId === 3 ? [record] : [{ ...record, rollcall_id: 12, student_rollcall_id: 112, rollcall_time: '2026-11-08T01:00:00Z', student_status: 'absent', status: 'absent', student_status_detail: '未到课堂', is_number: false, type: 'qr_rollcall' }] };
-      return { profile: { id: 42, user_no: '001234', name: '测试同学' }, todos: { todo_list: [] }, rollcalls: { rollcalls: [] }, courses: { courses: [course, otherCourse] },
+      return { todos: { todo_list: [] }, rollcalls: { rollcalls: [] }, courses: { courses: [course, otherCourse] },
         lntTerms: { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] },
         jwTerms: { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '秋季学期' }] } } }, jwWeek: { success: true, currentZc: 8, zcList: [{ ZC: 8 }] },
         jwSchedule: { success: true, pkjgList: [scheduleRow] } }[action];
     },
   };
-  return { device, calls, stored: () => raw, learning: createLearning(device, () => 2000) };
+  return { device, calls, loginAs: next => { loginAccount = next; }, stored: () => raw, learning: createLearning(device, () => 2000) };
 }
 
 test('history display uses UTC+8 dates and times and keeps actual-instant sorting', () => {
@@ -69,7 +77,7 @@ test('login reads every course history and caches the complete batch before publ
   try {
     assert.deepEqual([...started], [{ courseId: 3, studentId: 42 }, { courseId: 4, studentId: 42 }]);
     assert.equal(f.learning.getSnapshot().authenticated, true);
-    assert.equal(f.learning.getSnapshot().account, null);
+    assert.deepEqual(f.learning.getSnapshot().account, saved.account);
     assert.equal(f.learning.getSnapshot().coursesAt, null);
     assert.equal(f.learning.getSnapshot().term, null);
     assert.equal(f.learning.getSnapshot().todosAt, null);
@@ -80,7 +88,7 @@ test('login reads every course history and caches the complete batch before publ
     gates.get(4).resolve(); await tick();
     assert.deepEqual(f.learning.getSnapshot().history, []); assert.equal(f.stored(), null);
     gates.get(3).resolve(); await tick();
-    assert.equal(f.learning.getSnapshot().account, null); assert.equal(f.stored(), null);
+    assert.deepEqual(f.learning.getSnapshot().history, []); assert.equal(f.stored(), null);
     saving.resolve(); assert.equal(await pending, true);
     const snapshot = f.learning.getSnapshot(), cache = JSON.parse(f.stored());
     assert.deepEqual(snapshot.history.map(item => item.rollcall_id), [12, 11]);
@@ -99,30 +107,31 @@ test('login reads every course history and caches the complete batch before publ
   } finally { for (const gate of gates.values()) gate.resolve(); saving.resolve(); await pending; }
 });
 
-test('a profile without a bound account keeps the saved batch and does not start history queries', async () => {
-  for (const profile of [{ user_no: '001234' }, { id: 42 }]) {
-    const f = fixture(); await f.learning.restore();
-    const previous = f.stored(), before = f.learning.getSnapshot(), read = f.device.read;
-    f.device.read = async (action, params) => action === 'profile' ? profile : read(action, params);
-    assert.equal(await f.learning.login(), false);
-    assert.equal(f.learning.getSnapshot().authenticated, true);
-    assert.equal(f.learning.getSnapshot().needsLogin, false);
-    assert.equal(f.stored(), previous);
-    assert.deepEqual(f.learning.getSnapshot().account, before.account);
-    assert.deepEqual(f.learning.getSnapshot().courses, before.courses);
-    assert.equal(f.calls.some(([action]) => action === 'history'), false);
-    assert.match(f.learning.getSnapshot().message, /个人资料读取失败/);
-  }
+test('session rejection during refresh keeps the saved batch and does not start history queries', async () => {
+  const f = fixture(); await f.learning.restore();
+  const previous = f.stored(), before = f.learning.getSnapshot(), read = f.device.read;
+  f.device.read = async (action, params) => {
+    if (action === 'todos') throw Object.assign(Error('AUTH_REQUIRED'), { code: 'AUTH_REQUIRED' });
+    return read(action, params);
+  };
+  assert.equal(await f.learning.refresh(), false);
+  assert.equal(f.learning.getSnapshot().authenticated, false);
+  assert.equal(f.learning.getSnapshot().needsLogin, true);
+  assert.equal(f.stored(), previous);
+  assert.strictEqual(f.learning.getSnapshot().account, before.account);
+  assert.strictEqual(f.learning.getSnapshot().courses, before.courses);
+  assert.equal(f.calls.some(([action]) => action === 'history'), false);
 });
 
-test('login history read, parse, and save failures retain the entire old batch, including late responses', async () => {
-  for (const failure of ['read', 'parse', 'save', 'expired']) {
+test('login history and save failures retain the batch only for the same account, including late responses', async () => {
+  for (const account of [saved.account, otherAccount]) for (const failure of ['read', 'parse', 'save', 'expired']) {
     const f = await combinedFixture(true);
     assert.equal((await f.learning.submitNumber('81', '0007')).result, 'success');
     f.learning.attendanceDismissed({ ids: ['81'] }); await tick();
     const previous = f.stored(), before = f.learning.getSnapshot(), late = deferred(), read = f.device.read;
+    f.loginAs(account);
+    f.calls.length = 0;
     f.device.read = async (action, params) => {
-      if (action === 'profile') return { id: 99, user_no: '009999', name: '另一同学' };
       if (action === 'history' && params.courseId === 3 && failure !== 'save') await late.promise;
       if (action === 'history' && params.courseId === 4) {
         if (failure === 'read') throw Error('NETWORK');
@@ -136,10 +145,14 @@ test('login history read, parse, and save failures retain the entire old batch, 
     try {
       await tick(); late.resolve();
       assert.equal(await pending, false);
-      assert.equal(f.stored(), previous);
-      for (const key of ['account', 'todos', 'todosAt', 'term', 'courses', 'coursesAt', 'schedule', 'scheduleAt', 'rollcalls', 'attendance', 'refreshSchedule', 'history', 'historyAt']) {
-        assert.deepEqual(f.learning.getSnapshot()[key], before[key], key);
+      const sameAccount = account === saved.account;
+      assert.equal(f.stored(), sameAccount ? previous : null);
+      const emptyBatch = { account, todos: [], todosAt: null, term: null, courses: [], coursesAt: null,
+        schedule: null, scheduleAt: null, rollcalls: [], attendance: {}, refreshSchedule: false, history: [], historyAt: null };
+      for (const [key, empty] of Object.entries(emptyBatch)) {
+        assert.deepEqual(f.learning.getSnapshot()[key], sameAccount ? before[key] : empty, key);
       }
+      assert.ok(f.calls.some(([action, params]) => action === 'history' && params.studentId === account.lntId));
       assert.equal(f.learning.getSnapshot().authenticated, failure !== 'expired');
       assert.equal(f.learning.getSnapshot().needsLogin, failure === 'expired');
       assert.match(f.learning.getSnapshot().message, failure === 'expired' ? /登录失效/ : failure === 'save' ? /保存失败/ : /历史签到读取失败/);
@@ -288,8 +301,8 @@ test('logout and replacement login cannot be undone by late history reads or wri
   const gate = deferred(), read = f.device.read;
   f.device.read = async (action, params) => { if (action === 'history') await gate.promise; return read(action, params); };
   const pending = f.learning.refreshHistory(); await tick();
-  f.device.read = async (action, params) => action === 'profile' ? { id: 99, user_no: '009999', name: '另一同学' }
-    : action === 'history' && params.studentId === 99 ? { rollcalls: [] } : read(action, params);
+  f.loginAs(otherAccount);
+  f.device.read = async (action, params) => action === 'history' && params.studentId === otherAccount.lntId ? { rollcalls: [] } : read(action, params);
   assert.equal(await f.learning.login(), true);
   gate.resolve(); assert.equal(await pending, false);
   assert.equal(f.learning.getSnapshot().account.lntId, 99); assert.deepEqual(JSON.parse(f.stored()).history, []);
@@ -350,7 +363,7 @@ test('ordinary and history refresh preserve both collections in either order and
     const before = f.learning.getSnapshot(); f.calls.length = 0;
     const first = f.learning[order[0]](), second = f.learning[order[1]]();
     assert.equal(await first, true); assert.equal(await second, true);
-    const ordinary = ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses'], history = ['history', 'history'];
+    const ordinary = ['todos', 'rollcalls', 'lntTerms', 'courses'], history = ['history', 'history'];
     assert.deepEqual(f.calls.map(([action]) => action), order[0] === 'refreshHistory' ? [...history, ...ordinary] : [...ordinary, ...history]);
     const stored = JSON.parse(f.stored()); assert.equal(stored.history.length, 2);
     assert.deepEqual(stored.schedule, before.schedule); assert.equal(stored.scheduleAt, before.scheduleAt);
@@ -387,7 +400,7 @@ test('both ordinary/history orders preserve all collections, accepted receipts a
     const before = f.learning.getSnapshot(); f.calls.length = 0;
     const first = f.learning[order[0]](), second = f.learning[order[1]]();
     assert.equal(await first, true); assert.equal(await second, true);
-    const ordinary = ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : [])];
+    const ordinary = ['todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : [])];
     const history = ['history', 'history'];
     assert.deepEqual(f.calls.map(([action]) => action), order[0] === 'refreshHistory' ? [...history, ...ordinary] : [...ordinary, ...history]);
     const stored = JSON.parse(f.stored());
@@ -428,13 +441,12 @@ test('every failed ordinary request or save keeps the complete combined cache an
     const setup = await combinedFixture(enabled);
     await setup.learning.submitNumber('81', '0007'); await tick();
     const saved = setup.stored();
-    for (const failure of ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : []), 'save']) {
+    for (const failure of ['todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : []), 'save']) {
       const f = fixture(saved); await f.learning.restore();
       const before = f.learning.getSnapshot(), seen = [], read = f.device.read;
       f.learning.subscribe(() => seen.push(f.learning.getSnapshot()));
       f.device.read = async (action, params) => {
         if (action === failure) throw Error('NETWORK');
-        if (action === 'profile') return { id: 42, user_no: '001234', name: '本批新资料' };
         if (action === 'courses') return { courses: [{ ...course, name: '本批新课程' }] };
         if (action === 'jwSchedule') return { success: true, pkjgList: [] };
         return read(action, params);
