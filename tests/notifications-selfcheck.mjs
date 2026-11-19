@@ -62,17 +62,23 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
   const pending = { rollcall_id: 81, course_id: 1, is_number: true, course_title: '隐私课程' };
   const job = { async schedule(at) { scheduled.push(at); }, async cancel() { current = null; },
     async finish(token, at) { finished.push([token, at]); }, isCurrent: token => token === current,
+    post: (...args) => fixture.post(...args),
     addListener(_event, listener) { onStop = listener; return { remove() { onStop = undefined; } }; } };
   const fixture = { files, scheduled, finished, notices, dismissed, calls, account, permission: true, isCurrent: job.isCurrent,
     readFile: uri => files.get(uri),
     deleteFile: uri => files.delete(uri),
     getPermissions: async () => ({ granted: fixture.permission }),
+    loadLearning: async () => ({ raw: JSON.stringify(cached), account }),
     async advance(at) { now = at; for (const [timer, time] of timers) if (time <= now) { timers.delete(timer); timer(); } await flush(); },
     stop(token = current) { if (current === token) current = null; onStop?.({ token }); },
     read: async () => ({ rollcalls: [pending, { ...pending, rollcall_id: 82, status: 'on_call_fine' }, { ...pending, rollcall_id: 83 }] }),
-    notify: async notice => { notices.push(notice); return notice.identifier; },
+    async post(token, identifier, endAt) {
+      if (!job.isCurrent(token) || now >= endAt) return false;
+      notices.push(identifier);
+      return true;
+    },
   };
-  const device = { load: async () => ({ raw: JSON.stringify(cached), account }),
+  const device = { load: () => fixture.loadLearning(),
     async save() {},
     async clear() {},
     async read(action, _params, expected, signal) {
@@ -91,7 +97,6 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
     'expo-notifications': { AndroidImportance: { HIGH: 4, NONE: 0 }, AndroidNotificationVisibility: { PRIVATE: 0 },
       setNotificationChannelAsync: async () => ({ importance: 4 }), getNotificationChannelAsync: async () => ({ importance: 4 }),
       getPermissionsAsync: () => fixture.getPermissions(), requestPermissionsAsync: async () => ({ granted: fixture.permission }),
-      scheduleNotificationAsync: notice => fixture.notify(notice),
       dismissNotificationAsync: async identifier => { dismissed.push(identifier); } },
     './learning': learning, './school-device': { schoolDevice: device }, './schedule': schedule,
   }, { AbortController, Date: { now: () => now },
@@ -112,9 +117,7 @@ test('the persisted enabled Job reads only pending LNT activities and dedupes af
   assert.equal(headless.calls[0][0], 'rollcalls');
   assert.equal(headless.calls[0][1].lntId, 41);
   assert.equal(headless.notices.length, 1);
-  assert.equal(headless.notices[0].content.data.source, 'school');
-  assert.equal(headless.notices[0].content.data.rollcallId, undefined);
-  assert.doesNotMatch(JSON.stringify(headless.notices), /隐私课程|个人信息|0041/);
+  assert.match(headless.notices[0], /^[\da-f-]{36}$/);
   headless.stop();
   await running;
   assert.deepEqual(headless.finished, []);
@@ -133,14 +136,15 @@ test('an unacknowledged notice remains tappable and retries with the same identi
   await fixture.schoolLearning.restore();
   await fixture.setSchoolReminders(true);
   await fixture.advance(monday(10));
-  fixture.notify = notice => {
-    fixture.notices.push(notice);
+  const post = fixture.post;
+  fixture.post = async (...args) => {
+    assert.equal(await post(...args), true);
     return new Promise(() => {});
   };
   void fixture.runSchoolReminderJob('job-1');
   await flush();
   assert.equal(fixture.notices.length, 1);
-  const { identifier } = fixture.notices[0];
+  const [identifier] = fixture.notices;
   const restarted = schoolFixture(new Map(fixture.files));
   assert.equal(await restarted.openSchoolReminder(identifier, new AbortController().signal), '81');
   await restarted.advance(monday(10, 1));
@@ -148,30 +152,32 @@ test('an unacknowledged notice remains tappable and retries with the same identi
   await flush();
   restarted.stop();
   await running;
-  assert.deepEqual(restarted.notices.map(notice => notice.identifier), [identifier]);
+  assert.deepEqual(restarted.notices, [identifier]);
 });
 
 test('failed notification dispatch retries the same identifier within its window', async () => {
   const fixture = schoolFixture();
   await fixture.schoolLearning.restore();
   assert.equal(await fixture.setSchoolReminders(true), true);
-  const send = fixture.notify;
+  const post = fixture.post;
   const attempts = [];
-  fixture.notify = async notice => {
-    attempts.push(notice.identifier);
+  fixture.post = async (token, identifier, endAt) => {
+    attempts.push(identifier);
     if (attempts.length === 1) throw Error('UNAVAILABLE');
-    return send(notice);
+    return post(token, identifier, endAt);
   };
   await fixture.advance(monday(10));
   const running = fixture.runSchoolReminderJob('job-1');
   await flush();
   assert.equal(attempts.length, 1);
   assert.equal(fixture.notices.length, 0);
+  assert.deepEqual(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'], { identifier: attempts[0], delivered: false });
+  assert.deepEqual(fixture.dismissed, []);
   await fixture.advance(monday(10) + 30000);
   assert.equal(fixture.calls.length, 1);
   await fixture.advance(monday(10, 1));
   assert.equal(fixture.notices.length, 1);
-  assert.deepEqual(attempts, [fixture.notices[0].identifier, fixture.notices[0].identifier]);
+  assert.deepEqual(attempts, [fixture.notices[0], fixture.notices[0]]);
   fixture.stop();
   await running;
 });
@@ -192,6 +198,39 @@ test('Job preflight leaves transient permission and storage errors to native ret
   denied.permission = false;
   await denied.runSchoolReminderJob('job-1');
   assert.deepEqual(denied.finished, [['job-1', null]]);
+});
+
+test('a failed learning load leaves the Job retryable in the same process', async () => {
+  const foreground = schoolFixture();
+  await foreground.schoolLearning.restore();
+  await foreground.setSchoolReminders(true);
+  const headless = schoolFixture(foreground.files);
+  await headless.advance(monday(10));
+  const loadLearning = headless.loadLearning;
+  let loads = 0;
+  headless.loadLearning = async () => {
+    if (++loads === 1) throw Error('TEMPORARILY_UNAVAILABLE');
+    return loadLearning();
+  };
+  const failed = headless.runSchoolReminderJob('job-1');
+  await failed;
+  assert.equal(loads, 1);
+  assert.equal(headless.schoolLearning.getSnapshot().ready, true);
+  assert.match(headless.schoolLearning.getSnapshot().message, /读取失败/);
+  assert.deepEqual(headless.calls, []);
+  assert.deepEqual(headless.finished, []);
+  const retry = headless.runSchoolReminderJob('job-1');
+  await flush();
+  assert.equal(loads, 2);
+  assert.equal(headless.schoolLearning.getSnapshot().message, null);
+  assert.equal(headless.notices.length, 1);
+  await headless.advance(monday(11));
+  await retry;
+  assert.deepEqual(headless.finished, [['job-1', null]]);
+  const signedOut = schoolFixture();
+  signedOut.loadLearning = async () => ({ raw: null, account: null });
+  await signedOut.runSchoolReminderJob('job-1');
+  assert.deepEqual(signedOut.finished, [['job-1', null]]);
 });
 
 test('the window deadline aborts a slow query and hands off once to the overlapping course', async () => {
@@ -259,36 +298,46 @@ for (const [action, stop] of [
   ['system stop', fixture => fixture.stop()],
   ['disable', fixture => fixture.setSchoolReminders(false)],
   ['logout', fixture => fixture.clearSchoolReminders()],
+  ['window expiry', fixture => fixture.advance(monday(11))],
 ]) {
-  test(`${action} stops the Job before Expo resolves and dismisses the late notification`, async () => {
+  test(`${action} drops a queued native post without marking it delivered`, async () => {
     const fixture = schoolFixture();
     await fixture.schoolLearning.restore();
     await fixture.setSchoolReminders(true);
     await fixture.advance(monday(10));
-    let deliver, stopped = false;
-    fixture.notify = notice => new Promise(resolve => { deliver = () => resolve(notice.identifier); fixture.notices.push(notice); });
+    let deliver, identifier, stopped = false;
+    const post = fixture.post;
+    fixture.post = (token, id, endAt) => new Promise(resolve => {
+      assert.equal(token, 'job-1');
+      assert.equal(endAt, monday(11));
+      identifier = id;
+      deliver = async () => resolve(await post(token, id, endAt));
+    });
     const running = fixture.runSchoolReminderJob('job-1').then(() => { stopped = true; });
     await flush();
-    assert.equal(fixture.notices.length, 1);
+    assert.ok(deliver);
+    assert.equal(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'].identifier, identifier);
     const cancellation = stop(fixture);
     await flush();
     const wasCurrent = fixture.isCurrent('job-1'), hadStopped = stopped;
-    deliver();
+    await deliver();
     await cancellation;
     await running;
     await flush();
-    const { identifier } = fixture.notices[0];
-    assert.equal(wasCurrent, false, 'native Job is cancelled while Expo is pending');
-    assert.equal(hadStopped, true, 'headless task returns while Expo is pending');
-    assert.deepEqual(fixture.dismissed, [identifier]);
-    assert.deepEqual(fixture.finished, []);
+    assert.equal(wasCurrent, action === 'window expiry');
+    assert.equal(hadStopped, true, 'headless task returns while the native post is pending');
+    assert.deepEqual(fixture.notices, []);
+    assert.deepEqual(fixture.dismissed, []);
+    assert.deepEqual(fixture.finished, action === 'window expiry' ? [['job-1', null]] : []);
+    if (action !== 'logout') assert.equal(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'].delivered, false);
+    if (action === 'window expiry') return;
     const restarted = schoolFixture(fixture.files);
     await restarted.advance(monday(10, 1));
     const retry = restarted.runSchoolReminderJob('job-1');
     await flush();
     restarted.stop();
     await retry;
-    assert.deepEqual(restarted.notices.map(notice => notice.identifier), action === 'system stop' ? [identifier] : []);
+    assert.deepEqual(restarted.notices, action === 'system stop' ? [identifier] : []);
   });
 }
 
@@ -301,7 +350,7 @@ test('school taps resolve an issued notice through a fresh pending read across p
   await flush();
   fixture.stop();
   await running;
-  const { identifier, content } = fixture.notices[0];
+  const [identifier] = fixture.notices;
   const restarted = schoolFixture(fixture.files);
   const other = schoolFixture(fixture.files, 42);
   const scope = new AbortController();
@@ -323,7 +372,7 @@ test('school taps resolve an issued notice through a fresh pending read across p
   const response = (id, data) => ({ actionIdentifier: 'default', notification: { request: { identifier: id, content: { data } } } });
   const api = { DEFAULT_ACTION_IDENTIFIER: 'default', setNotificationHandler() {},
     addNotificationResponseReceivedListener(listener) { responseListener = listener; return { remove() {} }; },
-    getLastNotificationResponseAsync: async () => response(identifier, { ...content.data, rollcallId: 'forged' }),
+    getLastNotificationResponseAsync: async () => response(identifier, { source: 'school', rollcallId: 'forged' }),
     clearLastNotificationResponseAsync: async () => {},
   };
   const bridge = load('../src/attendance-notification-bridge.tsx', {

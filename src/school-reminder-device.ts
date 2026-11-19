@@ -12,6 +12,7 @@ type NativeJob = {
   schedule(at: number): Promise<void>;
   cancel(): Promise<void>;
   finish(token: string, nextAt: number | null): Promise<void>;
+  post(token: string, identifier: string, endAt: number): Promise<boolean>;
   isCurrent(token: string): boolean;
   addListener(event: 'onStop', listener: (data: JobData) => void): { remove(): void };
 };
@@ -123,7 +124,7 @@ export function clearSchoolReminders() {
 
 export async function openSchoolReminder(identifier: string, signal: AbortSignal) {
   if (!schoolRemindersAvailable || typeof identifier !== 'string' || identifier.length !== 36 || signal.aborted) return null;
-  await schoolLearning.restore();
+  if (!await schoolLearning.restore()) return null;
   const account = currentAccount();
   if (!account || signal.aborted) return null;
   const { issued } = await pending.then(() => load(account.lntId));
@@ -150,20 +151,18 @@ async function untilAborted(task: Promise<void>, signal: AbortSignal) {
   finally { signal.removeEventListener('abort', abort); }
 }
 
-async function notify(account: Account, rollcallId: string, valid: () => boolean) {
+async function notify(job: NativeJob, token: string, account: Account, rollcallId: string, endAt: number, valid: () => boolean) {
   await serialize(async () => {
     if (!valid() || rollcallId.startsWith('trial-')) return;
     const saved = await load(account.lntId);
     const notice = Object.hasOwn(saved.issued, rollcallId) ? saved.issued[rollcallId] : undefined;
     if (!saved.enabled || notice?.delivered || !valid() || !await permitted()) return;
     if (!valid()) return;
-    const api = await notifications();
     const identifier = notice?.identifier ?? randomUUID();
     if (!notice) await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: false } } });
     if (!valid()) return;
-    await api.scheduleNotificationAsync({ identifier, content: { title: '有新的签到活动', body: '点按打开签到，由你确认提交',
-      data: { source: 'school' }, sound: 'default' }, trigger: { channelId } });
-    if (!valid()) { await api.dismissNotificationAsync(identifier); return; }
+    if (!await job.post(token, identifier, endAt)) return;
+    if (!valid()) { await (await notifications()).dismissNotificationAsync(identifier); return; }
     await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: true } } });
   });
 }
@@ -185,7 +184,7 @@ export function runSchoolReminderJob(token: string): Promise<void> {
       await previous?.task;
       await untilAborted(pending, signal);
       if (!active()) return null;
-      await schoolLearning.restore();
+      if (!await schoolLearning.restore()) throw Error('LEARNING_RESTORE');
       const account = currentAccount();
       if (!active() || !account || !(await load(account.lntId)).enabled || !await permitted() || !active()) return null;
       const now = Date.now();
@@ -199,7 +198,7 @@ export function runSchoolReminderJob(token: string): Promise<void> {
           const rollcalls = await schoolLearning.readPendingRollcalls(account, signal);
           for (const { id } of rollcalls) {
             if (!valid()) break;
-            await untilAborted(notify(account, id, valid), signal);
+            await untilAborted(notify(job, token, account, id, window.end, valid), signal);
           }
         } catch (error) {
           const { code, needsLogin } = (error as { code?: string; needsLogin?: boolean }) ?? {};
