@@ -306,7 +306,7 @@ async function notificationScreen(app, learning, id) {
     if (name === './demo-context') return { useDemo: () => app.context };
     if (name === 'expo-notifications') return { DEFAULT_ACTION_IDENTIFIER: 'default',
       addNotificationResponseReceivedListener: listener => { click = listener; return { remove() {} }; },
-      getLastNotificationResponseAsync: async () => null, clearLastNotificationResponseAsync: async () => {} };
+      getLastNotificationResponse: () => null, clearLastNotificationResponse: () => {} };
     return require(name);
   } });
   bridge.AttendanceNotificationBridge();
