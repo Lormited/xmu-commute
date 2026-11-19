@@ -399,8 +399,12 @@ test('enabled refresh preserves the calendar across weeks and recalibrates beyon
   assert.deepEqual(f.calls.filter(action => action.startsWith('jw')), ['jwSchedule']);
   assert.equal(f.learning.getSnapshot().schedule.weekAt, initial.weekAt);
   assert.equal(schoolScheduleView(f.learning.getSnapshot(), new Date(clock)).currentWeek, 9);
-  const reopened = fixture(f.stored()); await reopened.learning.restore();
-  assert.deepEqual(reopened.learning.getSnapshot().schedule, f.learning.getSnapshot().schedule);
+  const current = JSON.parse(f.stored());
+  const reopened = fixture(JSON.stringify({ ...current, schedule: { ...current.schedule, extra: ['unused'] } }));
+  await reopened.learning.restore();
+  assert.deepEqual(reopened.learning.getSnapshot().schedule, current.schedule);
+  assert.equal(await reopened.learning.setRefreshSchedule(false), true);
+  assert.deepEqual(JSON.parse(reopened.stored()).schedule, current.schedule);
   clock += 20 * 7 * 86400000;
   for (const failedAction of ['jwTerms', 'jwWeek', 'jwSchedule']) {
     const before = f.learning.getSnapshot(), raw = f.stored(), read = f.device.read;
@@ -462,6 +466,7 @@ test('damaged timetable caches are rejected without modifying the file', async (
   const saved = JSON.parse(f.stored());
   for (const patch of [
     { scheduleAt: null }, { schedule: { ...saved.schedule, jwTermCode: 'invalid' } },
+    { schedule: { ...saved.schedule, weekAt: undefined } },
     { schedule: { ...saved.schedule, rows: [{ ...saved.schedule.rows[0], ZCMC: 'unknown' }] } },
   ]) {
     const raw = JSON.stringify({ ...saved, ...patch }), reopened = fixture(raw);

@@ -123,7 +123,7 @@ const loginFailures: Record<string, string> = {
 function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSchedule'> {
   const data = JSON.parse(raw) as SavedLearning;
   if (data?.version !== 1 || typeof data.refreshSchedule !== 'boolean') throw Error('INVALID_CACHE');
-  const { account, term, schedule, scheduleAt, historyAt, rollcalls, attendance, refreshSchedule } = data;
+  const { account, term, schedule: cachedSchedule, scheduleAt, historyAt, rollcalls, attendance, refreshSchedule } = data;
   if (!Object.hasOwn(data, 'account') && Object.keys(data).length === 2) return { refreshSchedule };
   if (!account || !Number.isSafeInteger(account.lntId) || account.lntId <= 0
     || typeof account.studentNumber !== 'string' || !account.studentNumber.trim() || typeof account.name !== 'string'
@@ -131,10 +131,15 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
     || !Number.isFinite(data.todosAt) || !Number.isFinite(data.coursesAt)) throw Error('INVALID_CACHE');
   const courses = coursesFrom({ courses: data.courses }, term);
   if (courses.length !== data.courses.length) throw Error('INVALID_CACHE');
-  if (schedule === null ? scheduleAt !== null
-    : !schedule || typeof schedule.jwTermCode !== 'string' || !/^\d{4}[123]$/.test(schedule.jwTermCode) || typeof schedule.name !== 'string'
-      || !Number.isSafeInteger(schedule.currentWeek) || !Array.isArray(schedule.weeks) || !schedule.weeks.every(week => Number.isSafeInteger(week) && week > 0)
-      || !schedule.weeks.includes(schedule.currentWeek) || !Number.isFinite(schedule.weekAt) || !Number.isFinite(scheduleAt)) throw Error('INVALID_CACHE');
+  let schedule: SchoolSchedule | null = null;
+  if (cachedSchedule !== null) {
+    if (!cachedSchedule || !Number.isFinite(scheduleAt)) throw Error('INVALID_CACHE');
+    const { jwTermCode, name, currentWeek, weeks, weekAt, rows } = cachedSchedule;
+    if (typeof jwTermCode !== 'string' || !/^\d{4}[123]$/.test(jwTermCode) || typeof name !== 'string'
+      || !Number.isSafeInteger(currentWeek) || !Array.isArray(weeks) || !weeks.every(week => Number.isSafeInteger(week) && week > 0)
+      || !weeks.includes(currentWeek) || !Number.isFinite(weekAt)) throw Error('INVALID_CACHE');
+    schedule = { jwTermCode, name, currentWeek, weeks, weekAt, rows: scheduleRowsFrom({ success: true, pkjgList: rows }) };
+  } else if (scheduleAt !== null) throw Error('INVALID_CACHE');
   if (!Array.isArray(data.history) || !(historyAt === null ? data.history.length === 0 : Number.isFinite(historyAt))) throw Error('INVALID_CACHE');
   const history = sortHistory(data.history.flatMap(item => {
     const course = courses.find(course => course.id === item?.course_id);
@@ -145,9 +150,8 @@ function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSch
     && typeof item.courseId === 'string' && item.courseId.trim() && typeof item.title === 'string' && typeof item.time === 'string'
     && ['number', 'qr', 'radar'].includes(item.method)) || !attendance || typeof attendance !== 'object' || Array.isArray(attendance)
     || !Object.values(attendance).every(result => result === 'success' || result === 'ended')) throw Error('INVALID_CACHE');
-  return { version: 1, account, term, courses, coursesAt: data.coursesAt,
-    schedule: schedule && { ...schedule, rows: scheduleRowsFrom({ success: true, pkjgList: schedule.rows }) },
-    todos: todosFrom({ todo_list: data.todos }), todosAt: data.todosAt, scheduleAt, refreshSchedule, rollcalls, attendance, history, historyAt };
+  return { version: 1, account, term, courses, coursesAt: data.coursesAt, schedule, scheduleAt,
+    todos: todosFrom({ todo_list: data.todos }), todosAt: data.todosAt, refreshSchedule, rollcalls, attendance, history, historyAt };
 }
 
 export function createLearning(device: SchoolDevice, now = Date.now) {
