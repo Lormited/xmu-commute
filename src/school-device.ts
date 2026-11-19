@@ -1,7 +1,6 @@
 import * as Crypto from 'expo-crypto';
 import { File, Paths } from 'expo-file-system';
 import { moveAsync } from 'expo-file-system/legacy';
-import { Platform } from 'react-native';
 import { CALLBACK, CAS_LOGIN, IDENTITY, LNT_HOME, createSchoolBrowser } from './school-browser';
 import type { Account, SchoolDevice } from './learning';
 import { captureSchoolCookies, schoolHttpUrl, schoolJarFrom, setSchoolCookies } from './school-cookies';
@@ -11,6 +10,8 @@ import { isPosition } from './location-attendance.ts';
 import { qrReceipt } from './qr.ts';
 
 const fail = (code: string, httpStatus?: number) => Object.assign(Error(code), { code, httpStatus });
+const validId = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+const validStudentNumber = (value: unknown): value is string => typeof value === 'string' && !!value.trim();
 const cache = () => new File(Paths.document, 'school-learning.json');
 const temporary = () => new File(Paths.document, 'school-learning.tmp');
 const logoutMarker = () => new File(Paths.document, 'school-logout');
@@ -29,10 +30,9 @@ let authenticating: Promise<void> | null = null;
 let clearing: Promise<void> | null = null;
 let mustClear = false;
 let verifiedTerms: unknown = null;
-type BoundAccount = Account & { lntId: number };
-type BoundSession = { account: BoundAccount; jar: CookieJar; recovery?: Promise<void> };
+type BoundSession = { account: Account; jar: CookieJar; recovery?: Promise<void> };
 type CachedLearning = { version: 1; account?: Account };
-type CachedSession = { account: BoundAccount; cookies: unknown };
+type CachedSession = { account: Account; cookies: unknown };
 type SchoolResponse = { httpStatus: number; contentType: string; text: string; location: string | null; headers: readonly (readonly [string, string])[] };
 const lntOrigin = new URL(LNT_HOME).origin;
 const renewalHosts = new Set(['lnt.xmu.edu.cn', 'ids.xmu.edu.cn', 'c-identity.xmu.edu.cn', 'c-mobile.xmu.edu.cn']);
@@ -52,8 +52,7 @@ function check(version: number, signal?: AbortSignal) {
   if (generation !== version || mustClear || signal?.aborted) throw fail('CANCELLED');
 }
 function assertLntAccount(expected: Account, actual: Account) {
-  if (expected.lntId !== null && expected.lntId !== actual.lntId
-    || expected.studentNumber && expected.studentNumber !== actual.studentNumber) throw fail('AUTH_REQUIRED');
+  if (expected.lntId !== actual.lntId || expected.studentNumber !== actual.studentNumber) throw fail('AUTH_REQUIRED');
 }
 function boundSession(version: number, account?: Account) {
   check(version);
@@ -128,11 +127,10 @@ async function persistSession(session: BoundSession, version: number, signal?: A
     throw fail('COOKIE_STORAGE');
   }
 }
-function profileAccount(value: unknown): BoundAccount {
+function profileAccount(value: unknown): Account {
   const profile = value as { id?: unknown; user_no?: unknown; name?: unknown; success?: boolean } | null;
-  if (profile?.success === false || !Number.isSafeInteger(profile?.id) || (profile?.id as number) <= 0
-    || typeof profile?.user_no !== 'string' || !profile.user_no.trim()) throw fail('INVALID_RESPONSE');
-  return { lntId: profile.id as number, studentNumber: profile.user_no, name: typeof profile.name === 'string' ? profile.name : '' };
+  if (profile?.success === false || !validId(profile?.id) || !validStudentNumber(profile.user_no)) throw fail('INVALID_RESPONSE');
+  return { lntId: profile.id, studentNumber: profile.user_no, name: typeof profile.name === 'string' ? profile.name : '' };
 }
 async function verifyProfile(jar: CookieJar, version: number) {
   const url = endpoints.profile;
@@ -350,41 +348,30 @@ async function authenticate(expected: Account | undefined, onAuthorized?: () => 
   }
 }
 type LocalCache = { learning: CachedLearning | null; session: CachedSession | null };
-const validId = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 function learningAccount(learning: CachedLearning | null) {
-  const account = learning?.account;
-  if (account && typeof account.studentNumber === 'string'
-    && (validId(account.lntId) || account.lntId === null && account.studentNumber.trim())) return account;
+  if (!learning || !Object.hasOwn(learning, 'account')) return;
+  const { account } = learning;
+  if (!validId(account?.lntId) || !validStudentNumber(account.studentNumber)) throw fail('INVALID_CACHE');
+  return account;
 }
 async function readCache(): Promise<LocalCache> {
   const file = cache();
-  const contents = file.exists ? await file.text() : null;
+  if (!file.exists) return { learning: null, session: null };
+  const contents = await file.text();
+  let data;
+  try { data = JSON.parse(contents); } catch { throw fail('INVALID_CACHE'); }
+  if (data?.version !== 3 || (data.learning !== null && data.learning?.version !== 1)
+    || (data.session !== null && (!data.session || typeof data.session !== 'object' || Array.isArray(data.session)))) throw fail('INVALID_CACHE');
+  const { learning, session: saved } = data;
+  const expected = learningAccount(learning);
+  if (saved === null) return { learning, session: null };
   try {
-    const data = JSON.parse(contents ?? 'null');
-    if (data?.version === 1) return { learning: data, session: null };
-    if (data?.version === 2) {
-      const id = data.activeAccountId;
-      if (validId(id) && Object.hasOwn(data.accounts ?? {}, String(id)) && data.accounts[id]?.version === 1
-        && data.accounts[id]?.account?.lntId === id) return { learning: data.accounts[id], session: null };
-    }
-    if (data?.version === 3 && (data.learning === null || data.learning?.version === 1)) {
-      const { learning } = data;
-      let session = null;
-      try {
-        const saved = data.session;
-        const account = profileAccount({ id: saved?.account?.lntId, user_no: saved?.account?.studentNumber, name: saved?.account?.name });
-        const expected = learningAccount(learning);
-        if (expected) assertLntAccount(expected, account);
-        else if (learning && Object.hasOwn(learning, 'account')) throw fail('INVALID_CACHE');
-        session = { account, cookies: saved.cookies };
-      } catch { /* Invalid sessions leave learning data available for manual login. */ }
-      return { learning, session };
-    }
+    const account = profileAccount({ id: saved.account?.lntId, user_no: saved.account?.studentNumber, name: saved.account?.name });
+    if (expected) assertLntAccount(expected, account);
+    return { learning, session: { account, cookies: saved.cookies } };
   } catch {
-    throw fail('INVALID_CACHE');
+    return { learning, session: null };
   }
-  if (contents !== null) throw fail('INVALID_CACHE');
-  return { learning: null, session: null };
 }
 function persistCache(update: (previous: LocalCache) => LocalCache, version: number, signal?: AbortSignal, beforeCommit?: () => void) {
   const saved = persistence.then(async () => {
@@ -392,7 +379,7 @@ function persistCache(update: (previous: LocalCache) => LocalCache, version: num
     const previous = await readCache();
     check(version, signal);
     const { learning, session } = update(previous);
-    const value = JSON.stringify(session ? { version: 3, learning, session } : learning);
+    const value = JSON.stringify({ version: 3, learning, session });
     const file = temporary();
     try {
       try { await file.write(value); } catch { throw fail('CACHE_STORAGE'); }
@@ -425,12 +412,7 @@ function clear(): Promise<void> {
     await Promise.allSettled(pending);
     const results = await Promise.allSettled([
       (async () => {
-        const files = [cache(), temporary()];
-        if (Platform.OS === 'android') files.push(
-          new File(Paths.document, '../shared_prefs/SecureStore.xml.bak'),
-          new File(Paths.document, '../shared_prefs/SecureStore.xml'),
-        );
-        for (const file of files) if (file.exists) file.delete();
+        for (const file of [cache(), temporary()]) if (file.exists) file.delete();
       })(),
       // shortcut: Site storage and HTTP auth data are not covered; revisit library support if full erasure is required.
       import('@preeternal/react-native-cookie-manager').then(({ default: cookies }) => cookies.clearAllStores()),
@@ -444,7 +426,7 @@ function clear(): Promise<void> {
 async function answerRollcall(rollcallId: string, kind: 'number' | 'qr' | 'location', payload: Record<string, unknown>, receipt: typeof numberReceipt, account: Account) {
   if (typeof rollcallId !== 'string' || !rollcallId.trim()) throw fail('INVALID_ATTENDANCE');
   const version = generation;
-  if (!account || (account.lntId === null && !account.studentNumber.trim())) throw fail('AUTH_REQUIRED');
+  if (!account) throw fail('AUTH_REQUIRED');
   const recovery = recovering;
   if (recovery) await recovery.result;
   const session = boundSession(version, account);
@@ -485,15 +467,10 @@ export const schoolDevice: SchoolDevice = {
     return persistCache(previous => {
       const learning = JSON.parse(value) as CachedLearning;
       if (learning?.version !== 1) throw fail('INVALID_CACHE');
-      if (Object.hasOwn(learning, 'account')) {
-        const expected = learningAccount(previous.learning);
-        const bound = previous.session?.account;
-        const account = learningAccount(learning);
-        if (expected || bound) {
-          if (!account) throw fail('AUTH_REQUIRED');
-          if (expected) assertLntAccount(expected, account);
-          if (bound) assertLntAccount(account, bound);
-        }
+      const account = learningAccount(learning);
+      if (account) {
+        const expected = learningAccount(previous.learning) ?? previous.session?.account;
+        if (expected) assertLntAccount(expected, account);
       }
       return { learning, session: previous.session };
     }, generation);

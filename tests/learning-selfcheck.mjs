@@ -9,12 +9,13 @@ const boundAccount = { lntId: 42, studentNumber: '001234', name: '测试同学' 
 const todo = { id: 7, course_id: 3, course_name: '测试课程', title: '学校待办', type: 'homework', end_time: '2026-11-10T12:00:00Z', is_locked: false };
 const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9, extra: 'preserved' };
 const terms = { datas: { kfdxnxqcx: { rows: [{ XNXQDM: '20261', XNXQDM_DISPLAY: '2026 秋季学期' }] } } };
-const lntTerms = { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] };
+const term = { id: 9, name: 'LNT 秋季' };
+const lntTerms = { semesters: [{ ...term, is_active: true }] };
 const weeks = { success: true, currentZc: '8', zcList: Array.from({ length: 18 }, (_, i) => ({ ZC: String(i + 1) })) };
 const scheduleRow = { WID: 'row-1', BJDM: '001-A', KCMC: '学校课程', JASMC: '教学楼 101', JSXM: '张老师', XQ: '1', KSJCDM: '1', JSJCDM: '2', KSSJ: '0800', JSSJ: '0940', ZCMC: '1-2,7-9周', JCFADM: 'plan-a' };
-const schedulePeriods = [{ DM: '1', MC: '第一节', KSSJ: '0800', JSSJ: '0845', JCFADM: 'plan-a' }, { DM: '2', MC: '第二节', KSSJ: '0855', JSSJ: '0940', JCFADM: 'plan-a' }];
 const schoolData = action => ({ profile, todos: { todo_list: [todo] }, rollcalls: { rollcalls: [] }, lntTerms, jwTerms: terms, jwWeek: weeks, courses: { courses: [course] }, history: { rollcalls: [] }, jwSchedule: { success: true, pkjgList: [scheduleRow] } })[action];
-const previous = JSON.stringify({ version: 1, account: boundAccount, todos: [todo], todosAt: 1000 });
+const previous = JSON.stringify({ version: 1, account: boundAccount, todos: [todo], todosAt: 1000, term, courses: [], coursesAt: 1000,
+  schedule: null, scheduleAt: null, history: [], historyAt: null, rollcalls: [], attendance: {}, refreshSchedule: false });
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 function fixture(raw = null, account = raw ? boundAccount : null) {
@@ -52,10 +53,8 @@ test('login saves one account, preserves the school collection, and publishes on
   assert.equal(f.learning.getSnapshot().historyAt, 2000);
   assert.equal(f.learning.getSnapshot().term.id, 9);
   assert.equal(todoView(todo).id, 'homework:3:7');
-  f.device.read = async action => action === 'profile' ? { id: 99 } : action === 'todos' ? { todo_list: [{ ...todo, type: 'unknown' }, todo] } : schoolData(action);
-  assert.equal(await f.learning.login(), true, 'a missing student number is not a save gate');
-  assert.equal(JSON.parse(f.stored()).account.studentNumber, '');
-  assert.equal(JSON.parse(f.stored()).accounts, undefined);
+  f.device.read = async action => action === 'todos' ? { todo_list: [{ ...todo, type: 'unknown' }, todo] } : schoolData(action);
+  assert.equal(await f.learning.refresh(), true);
   assert.equal(f.learning.getSnapshot().todos.length, 2, 'no type, status, or deadline filtering');
 });
 test('todos are ordered by deadline for cached, login, and refreshed data without changing school items', async () => {
@@ -74,7 +73,7 @@ test('todos are ordered by deadline for cached, login, and refreshed data withou
   }
 });
 
-test('reopen publishes cache before one refresh; old test formats are discarded', async () => {
+test('reopen publishes the saved batch before refreshing', async () => {
   const f = fixture(previous), gate = deferred();
   await f.learning.restore();
   assert.deepEqual(f.calls, ['load']);
@@ -88,18 +87,26 @@ test('reopen publishes cache before one refresh; old test formats are discarded'
   assert.equal(await refreshing, true);
   assert.deepEqual(f.learning.getSnapshot().todos, []);
   assert.equal(f.calls.filter(x => x === 'load').length, 1, 'saving does not read the file back');
-  for (const raw of ['{}', JSON.stringify({ accounts: {}, activeStudentNumber: '001234' }), JSON.stringify({ account: { studentNumber: '001234' }, todos: [] })]) {
-    const old = fixture(raw, null); await old.learning.restore();
-    assert.equal(old.learning.getSnapshot().account, null);
-    assert.equal(old.learning.getSnapshot().authenticated, false);
-    assert.equal(old.learning.getSnapshot().ready, true);
-  }
-  const malformed = fixture(JSON.stringify({ ...JSON.parse(previous), account: 'invalid' }), null);
-  await malformed.learning.restore();
-  assert.equal(malformed.learning.getSnapshot().account, null);
-  assert.match(malformed.learning.getSnapshot().message, /读取失败/);
 });
-test('legacy cache without a bound account remains visible and requires manual login', async () => {
+
+test('incomplete and obsolete learning snapshots are rejected without changing the file', async () => {
+  const saved = JSON.parse(previous);
+  for (const invalid of [
+    { ...saved, coursesAt: undefined },
+    { ...saved, attendance: undefined },
+    { ...saved, account: { ...boundAccount, lntId: null } },
+    { ...saved, term: { id: null, name: term.name } },
+    { ...saved, term: { jwTermCode: '20261', lntTermCode: '2026-1', name: term.name }, courses: [{ ...course, semester: { code: '2026-1' } }] },
+  ]) {
+    const raw = JSON.stringify(invalid), f = fixture(raw, null);
+    await f.learning.restore();
+    assert.equal(f.learning.getSnapshot().account, null);
+    assert.equal(f.learning.getSnapshot().ready, true);
+    assert.match(f.learning.getSnapshot().message, /读取失败/);
+    assert.equal(f.stored(), raw);
+  }
+});
+test('a current learning snapshot without a usable session requires manual login', async () => {
   const f = fixture(previous, null); await f.learning.restore();
   const restored = f.learning.getSnapshot();
   assert.deepEqual(restored.todos, [todo]);
@@ -257,8 +264,8 @@ test('the timetable selects its teaching term while LNT courses use their own se
   }
 });
 
-test('course cache reopens before refresh and T01 cache upgrades without losing its account or todos', async () => {
-  const f = fixture(previous); await f.learning.restore();
+test('courses and todos reopen from the current batch before any new requests', async () => {
+  const f = fixture(null, boundAccount); await f.learning.restore();
   assert.deepEqual(f.learning.getSnapshot().courses, []);
   assert.equal(f.learning.getSnapshot().term, null);
   assert.equal(await f.learning.refresh(), true);
@@ -381,7 +388,7 @@ test('first login saves school timetable without section metadata, then cache re
   assert.equal(reopened.learning.getSnapshot().scheduleAt, 2000);
 });
 
-test('enabled refresh preserves the calendar across weeks, recalibrates beyond its range, and ignores legacy periods', async () => {
+test('enabled refresh preserves the calendar across weeks and recalibrates beyond its range', async () => {
   let clock = new Date(2026, 9, 26, 12).getTime();
   const f = fixture(); f.learning = createLearning(f.device, () => clock);
   assert.equal(await f.learning.login(), true);
@@ -392,12 +399,8 @@ test('enabled refresh preserves the calendar across weeks, recalibrates beyond i
   assert.deepEqual(f.calls.filter(action => action.startsWith('jw')), ['jwSchedule']);
   assert.equal(f.learning.getSnapshot().schedule.weekAt, initial.weekAt);
   assert.equal(schoolScheduleView(f.learning.getSnapshot(), new Date(clock)).currentWeek, 9);
-  const saved = JSON.parse(f.stored());
-  for (const periods of [schedulePeriods, null, 'obsolete invalid field']) {
-    const reopened = fixture(JSON.stringify({ ...saved, schedule: { ...saved.schedule, periods } }));
-    await reopened.learning.restore();
-    assert.deepEqual(reopened.learning.getSnapshot().schedule, saved.schedule);
-  }
+  const reopened = fixture(f.stored()); await reopened.learning.restore();
+  assert.deepEqual(reopened.learning.getSnapshot().schedule, f.learning.getSnapshot().schedule);
   clock += 20 * 7 * 86400000;
   for (const failedAction of ['jwTerms', 'jwWeek', 'jwSchedule']) {
     const before = f.learning.getSnapshot(), raw = f.stored(), read = f.device.read;
@@ -914,56 +917,6 @@ test('timetable stays cached across terms and when the device rejects a session'
     assert.deepEqual(reopened.learning.getSnapshot().schedule, before.schedule);
   }
 });
-
-test('legacy cache keeps timetable dates, history and update time across ordinary refresh and all save paths', async () => {
-  const at = new Date(2026, 10, 2, 12).getTime(), later = at + 7 * 86400000;
-  const legacy = { ...JSON.parse(previous), term: { jwTermCode: '20261', lntTermCode: '2026-1', name: '旧教务学期', currentWeek: 8, weeks: Array.from({ length: 18 }, (_, i) => i + 1) },
-    courses: [{ ...course, semester_id: undefined, semester: { code: '2026-1' } }], coursesAt: at, scheduleAt: at - 7 * 86400000,
-    schedule: { jwTermCode: '20261', rows: [scheduleRow], periods: schedulePeriods },
-    history: [{ course_id: 3, course_name: course.name, rollcall_id: 11, rollcall_time: '2026-11-02T00:00:00Z', title: '签到', student_status: 'on_call', status: 'on_call_fine', student_status_detail: null }], historyAt: at };
-  for (const calendar of [{ currentWeek: undefined, weeks: undefined }, { currentWeek: 0, weeks: [] }]) for (const schedule of [null, legacy.schedule]) {
-    const raw = JSON.stringify({ ...legacy, term: { ...legacy.term, ...calendar }, schedule,
-      courses: [{ ...course, semester: { code: '2026-1' } }] }), reopened = fixture(raw);
-    await reopened.learning.restore();
-    const data = reopened.learning.getSnapshot();
-    assert.equal(data.authenticated, true);
-    assert.equal(!!data.account, schedule === null, 'only a timetable needs a valid calendar');
-    if (schedule === null) {
-      assert.deepEqual(data.term, { id: 9, name: legacy.term.name });
-      assert.deepEqual(data.history, legacy.history);
-      assert.deepEqual([data.coursesAt, data.historyAt], [at, at]);
-    } else assert.match(data.message, /读取失败/);
-    assert.equal(reopened.stored(), raw);
-  }
-  const f = fixture(JSON.stringify(legacy)); f.learning = createLearning(f.device, () => later);
-  await f.learning.restore();
-  assert.equal(f.learning.getSnapshot().authenticated, true);
-  assert.equal(schoolScheduleView(f.learning.getSnapshot(), new Date(later)).currentWeek, 9);
-  assert.equal(await f.learning.setRefreshSchedule(false), true);
-  assert.equal(await f.learning.refresh(), true);
-  assert.equal(f.calls.some(action => action.startsWith('jw')), false);
-  assert.equal(f.learning.getSnapshot().history.length, 1);
-  assert.equal(f.learning.getSnapshot().scheduleAt, legacy.scheduleAt);
-  assert.equal(schoolScheduleView(f.learning.getSnapshot(), new Date(later)).currentWeek, 9);
-  const reopened = fixture(f.stored()); await reopened.learning.restore();
-  assert.equal(schoolScheduleView(reopened.learning.getSnapshot(), new Date(later)).currentWeek, 9);
-  assert.equal(reopened.learning.getSnapshot().scheduleAt, legacy.scheduleAt);
-});
-
-
-test('changing the timetable setting preserves an existing account before its first complete course refresh', async () => {
-  const f = fixture(previous); await f.learning.restore();
-  assert.equal(await f.learning.setRefreshSchedule(true), true);
-  const reopened = fixture(f.stored()); await reopened.learning.restore();
-  const data = reopened.learning.getSnapshot();
-  assert.equal(data.authenticated, true);
-  assert.equal(data.refreshSchedule, true);
-  assert.deepEqual(data.account, { lntId: 42, studentNumber: '001234', name: '测试同学' });
-  assert.deepEqual(data.todos, [todo]);
-  assert.equal(data.term, null);
-  assert.equal(data.schedule, null);
-});
-
 
 test('any request or save failure retains every collection and timestamp in the ordinary batch', async () => {
   const initial = fixture(); initial.learning = createLearning(initial.device, () => 1000);

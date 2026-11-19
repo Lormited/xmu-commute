@@ -31,7 +31,6 @@ const academicTerms = { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '测试�
 const profile = { id: 42, user_no: '001234', name: '测试同学' };
 const recoveryAccount = { lntId: 42, studentNumber: '001234', name: '测试同学' };
 const cacheName = 'school-learning.json';
-const retiredPrefs = '../shared_prefs/SecureStore.xml';
 const savedSession = f => JSON.parse(f.files.get(cacheName) ?? 'null')?.session;
 const lntRoot = 'https://lnt.xmu.edu.cn/';
 const rollcallsUrl = lntRoot + 'api/radar/rollcalls?api_version=1.1.0';
@@ -45,6 +44,13 @@ const webCookies = [
 ].map(cookie => ({ ...cookie, secure: true, httpOnly: true }));
 const todo = { id: 7, course_id: 3, course_name: '课程', title: '学校返回的作业', type: 'homework', end_time: null, is_locked: false };
 const course = { id: 3, course_code: '001-A', name: '学校课程', semester_id: 9 };
+const learningFixture = (overrides = {}) => ({
+  version: 1, account: recoveryAccount, todos: [todo], todosAt: 1000,
+  term: { id: 9, name: 'LNT 秋季' }, courses: [course], coursesAt: 1000,
+  schedule: null, scheduleAt: null, refreshSchedule: false, rollcalls: [], attendance: {},
+  history: [], historyAt: null, ...overrides,
+});
+const cacheEnvelope = (learning, session = null) => JSON.stringify({ version: 3, learning, session });
 const academicWeeks = { success: true, currentZc: '8', zcList: Array.from({ length: 18 }, (_, i) => ({ ZC: i + 1 })) };
 const authorization = IDENTITY + '/auth?' + new URLSearchParams({ redirect_uri: CALLBACK, state: 'test-state' });
 // RNCWebViewClient.createWebViewEvent: direct Android requests omit a frame flag.
@@ -67,7 +73,7 @@ function response(url, body, status = 200, contentType = 'application/json', hea
 const redirect = (url, location, headers = []) => response(url, '', 302, 'text/html', [['location', location], ...headers]);
 const requestCookie = call => new Headers(call.options.headers).get('cookie') ?? '';
 const requestPaths = f => f.calls.map(call => new URL(call.url).pathname);
-function fixture(files = new Map(), { timers = {}, platform = 'android' } = {}) {
+function fixture(files = new Map(), { timers = {} } = {}) {
   const calls = [], cookieCalls = [], cacheMoves = [], logs = [];
   const cookies = new Map(webCookies.map(cookie => [cookie.name, cookie]));
   const document = '/private/app/files';
@@ -125,7 +131,6 @@ function fixture(files = new Map(), { timers = {}, platform = 'android' } = {}) 
         clearAllStores: async () => { cookieCalls.push('clearAllStores'); if (f.failClear) throw Error('COOKIE_STORAGE'); cookies.clear(); return true; },
       } };
     },
-    'react-native': { Platform: { OS: platform } },
     'expo-file-system': { File, Paths: { document } },
     'expo-file-system/legacy': { moveAsync: async ({ from, to }) => {
       f.beforeMove?.();
@@ -149,14 +154,12 @@ function fixture(files = new Map(), { timers = {}, platform = 'android' } = {}) 
   }, { Headers, console: f.console, ...timers });
   return Object.assign(f, deviceModule, { learning: createLearning(deviceModule.schoolDevice) });
 }
-async function boundFixture(files = new Map(), options) {
+async function boundFixture(learning = null, options) {
   const jar = new CookieJar();
   for (const { name, value, domain, path } of webCookies) {
     jar.setCookieSync(`${name}=${value}; Path=${path}; Secure; HttpOnly`, `https://${domain}${path}`);
   }
-  const learning = JSON.parse(files.get(cacheName) ?? 'null');
-  files.set(cacheName, JSON.stringify({ version: 3, learning, session: { account: recoveryAccount, cookies: jar.serializeSync() } }));
-  const f = fixture(files, options);
+  const f = fixture(new Map([[cacheName, cacheEnvelope(learning, { account: recoveryAccount, cookies: jar.serializeSync() })]]), options);
   assert.deepEqual(JSON.parse(JSON.stringify((await f.schoolDevice.load()).account)), recoveryAccount);
   return f;
 }
@@ -181,9 +184,23 @@ async function initialize(f) {
   f.schoolBrowser.loaded(page, academicPage);
   await tick();
 }
-test('legacy learning data loads without an authenticated school session or network request', async () => {
-  const raw = JSON.stringify({ version: 1, account: recoveryAccount, todos: [todo], todosAt: 1000 });
-  const f = fixture(new Map([['school-learning.json', raw]]));
+test('unsupported top-level cache versions reach the invalid-cache path without deleting the file', async () => {
+  const learning = learningFixture();
+  for (const data of [learning, { version: 2, activeAccountId: 42, accounts: { 42: learning } }]) {
+    const raw = JSON.stringify(data);
+    const f = fixture(new Map([[cacheName, raw]]));
+    await assert.rejects(f.schoolDevice.load(), { code: 'INVALID_CACHE' });
+    await f.learning.restore();
+    assert.match(f.learning.getSnapshot().message, /本机数据读取失败/);
+    assert.equal(f.files.get(cacheName), raw);
+    assert.deepEqual(f.calls, []);
+  }
+});
+
+test('current learning data loads without an authenticated school session or network request', async () => {
+  const learning = learningFixture();
+  const raw = JSON.stringify(learning);
+  const f = fixture(new Map([[cacheName, cacheEnvelope(learning)]]));
   const loaded = await f.schoolDevice.load();
   assert.equal(loaded.raw, raw);
   assert.equal(loaded.account, null);
@@ -194,9 +211,9 @@ test('legacy learning data loads without an authenticated school session or netw
   assert.deepEqual(f.calls, []);
 });
 
-test('a legacy learning cache keeps its data and gains a durable session on manual login', async () => {
-  const learning = { version: 1, account: recoveryAccount, todos: [todo], todosAt: 1000 };
-  const files = new Map([['school-learning.json', JSON.stringify({ version: 2, activeAccountId: 42, accounts: { 42: learning } })]]);
+test('a current learning cache keeps its data and gains a durable session on manual login', async () => {
+  const learning = learningFixture();
+  const files = new Map([[cacheName, cacheEnvelope(learning)]]);
   const f = fixture(files);
   await f.learning.restore();
   assert.equal(f.learning.getSnapshot().needsLogin, true);
@@ -213,17 +230,28 @@ test('a legacy learning cache keeps its data and gains a durable session on manu
   assert.deepEqual([...files.keys()], ['school-learning.json']);
 });
 
+test('pre-login preferences round-trip in a v3 envelope with a null session', async () => {
+  const f = fixture();
+  const preferences = { version: 1, refreshSchedule: true };
+  const raw = JSON.stringify(preferences);
+  await f.schoolDevice.save(raw);
+  assert.deepEqual(JSON.parse(f.files.get(cacheName)), { version: 3, learning: preferences, session: null });
+  const loaded = await fixture(f.files).schoolDevice.load();
+  assert.equal(loaded.raw, raw);
+  assert.equal(loaded.account, null);
+});
+
 test('the device rejects wrong-account reads, submissions and saves, and never restores mismatched cookies', async () => {
   const other = { ...recoveryAccount, lntId: 43 };
   const f = await boundFixture();
   const previous = f.files.get(cacheName);
-  const learning = { version: 1, account: other, todos: [todo], todosAt: 1000 };
+  const learning = learningFixture({ account: other });
   await assert.rejects(f.schoolDevice.read('todos', undefined, other), { code: 'AUTH_REQUIRED' });
   await assert.rejects(f.schoolDevice.answerNumber('81', '0007', other), { code: 'AUTH_REQUIRED' });
   await assert.rejects(f.schoolDevice.save(JSON.stringify(learning)), { code: 'AUTH_REQUIRED' });
   assert.deepEqual(f.calls, []);
   assert.equal(f.files.get(cacheName), previous);
-  const reopened = fixture(new Map([[cacheName, JSON.stringify({ ...JSON.parse(previous), learning })]]));
+  const reopened = fixture(new Map([[cacheName, cacheEnvelope(learning, savedSession(f))]]));
   await reopened.learning.restore();
   assert.deepEqual(reopened.learning.getSnapshot().account, other);
   assert.equal(reopened.learning.getSnapshot().needsLogin, true);
@@ -234,7 +262,7 @@ test('the device rejects wrong-account reads, submissions and saves, and never r
 test('overlapping learning and cookie writes preserve the latest data and session in either order', async () => {
   for (const cookiesFirst of [false, true]) {
     const f = await boundFixture(), commit = deferred(), committing = deferred();
-    const learning = { version: 1, account: recoveryAccount, todos: [todo], todosAt: 2000 };
+    const learning = learningFixture({ todosAt: 2000 });
     f.moveGate = commit;
     f.beforeMove = committing.resolve;
     f.handler = async url => response(url, { todo_list: [todo] }, 200, 'application/json', [
@@ -419,10 +447,9 @@ test('recovery waits for an in-flight attendance PUT to settle', async () => {
 test('failed renewal or an expired retry keeps the confirmed learning batch', async () => {
   for (const failure of ['interactive', 'write', 'move', 'expired todos', 'expired history']) {
     const history = failure === 'expired history';
-    const cache = { version: 1, account: recoveryAccount, todos: [todo], todosAt: 1000,
-      term: { id: 9, name: 'LNT 秋季' }, courses: [course], coursesAt: 1000, history: [], historyAt: 1000 };
+    const cache = learningFixture({ historyAt: 1000 });
     const target = history ? '/student/42/' : '/todos';
-    const f = await boundFixture(new Map([['school-learning.json', JSON.stringify(cache)]]));
+    const f = await boundFixture(cache);
     await f.learning.restore();
     const raw = f.files.get(cacheName), before = f.learning.getSnapshot();
     const replayed = failure.startsWith('expired');
@@ -519,7 +546,7 @@ test('recovery timeout retains the previous session on restart after a late scho
 test('a renewal that crosses its deadline during staging keeps the prior session and skips replay', async () => {
   let now = Date.now();
   class Clock extends Date { static now() { return now; } }
-  const f = await boundFixture(new Map(), { timers: { Date: Clock } });
+  const f = await boundFixture(null, { timers: { Date: Clock } });
   const previous = f.files.get(cacheName);
   const stage = deferred();
   f.writeGate = stage;
@@ -637,9 +664,10 @@ test('invalid or failed later course pages retain the entire saved learning batc
 
 test('two-site login uses PKCE, waits for authentication and cookie saving, then reads and saves todos', async () => {
   const f = fixture(); let authorized = 0;
+  let authorizedCache;
   const verification = deferred();
   f.handler = async url => { if (url.endsWith('/profile')) await verification.promise; };
-  const login = f.learning.login(() => authorized++);
+  const login = f.learning.login(() => { authorized++; authorizedCache = f.files.get(cacheName); });
   const auth = await authorize(f);
   assert.equal(authorized, 0, 'a callback or token alone is not authentication success');
   const body = new URLSearchParams(f.calls[0].options.body);
@@ -664,6 +692,10 @@ test('two-site login uses PKCE, waits for authentication and cookie saving, then
   assert.equal(f.schoolBrowser.getSnapshot(), null);
   assert.deepEqual(f.cookieCalls, ['flush']);
   const stored = savedSession(f);
+  assert.deepEqual(JSON.parse(authorizedCache), { version: 3, learning: null, session: stored });
+  const sessionOnly = await fixture(new Map([[cacheName, authorizedCache]])).schoolDevice.load();
+  assert.equal(sessionOnly.raw, null);
+  assert.deepEqual({ ...sessionOnly.account }, recoveryAccount);
   assert.deepEqual(stored.account, recoveryAccount);
   assert.equal(CookieJar.deserializeSync(stored.cookies).getCookieStringSync(lntRoot), 'lnt_session=manual-lnt');
   assert.ok(stored.cookies.cookies.some(cookie => cookie.key === 'TGC' && cookie.path === '/authserver' && cookie.httpOnly));
@@ -832,12 +864,13 @@ test('callback validation is centralized and stale pages cannot complete a later
   }
 });
 test('failed file replacement keeps the old cache and removes temporary data', async () => {
-  const previous = JSON.stringify({ version: 1, refreshSchedule: false });
+  const previous = { version: 1, refreshSchedule: false };
   const replacement = JSON.stringify({ version: 1, refreshSchedule: true });
-  const f = fixture(new Map([['school-learning.json', previous]]));
+  const f = fixture(new Map([[cacheName, cacheEnvelope(previous)]]));
   f.failMove = true;
   await assert.rejects(f.schoolDevice.save(replacement), { code: 'CACHE_STORAGE' });
-  assert.equal((await f.schoolDevice.load()).raw, previous);
+  assert.equal(f.files.get(cacheName), cacheEnvelope(previous));
+  assert.equal((await f.schoolDevice.load()).raw, JSON.stringify(previous));
   assert.equal(f.files.has('school-learning.tmp'), false);
   f.failMove = false; await f.schoolDevice.save(replacement);
   assert.equal((await f.schoolDevice.load()).raw, replacement);
@@ -874,7 +907,7 @@ test('cookie library failures remain visible and failed logout can be retried', 
 });
 
 test('authentication, cookie snapshot or cache storage failure preserves cached data and allows manual retry', async () => {
-  const saved = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [todo], todosAt: 1000 });
+  const saved = cacheEnvelope(learningFixture());
   for (const cached of [false, true]) for (const phase of ['token', 'flush', 'snapshot', 'storage']) {
     const f = fixture(cached ? new Map([['school-learning.json', saved]]) : undefined), app = pages(f);
     await f.learning.restore(); app.render();
@@ -895,7 +928,7 @@ test('authentication, cookie snapshot or cache storage failure preserves cached 
     assert.equal(f.files.get('school-learning.json'), cached ? saved : undefined);
     if (phase !== 'token') assert.equal(failed.data.message, '登录状态保存失败，请重新登录');
     assert.equal(f.calls.some(call => call.url.endsWith('/profile')), phase === 'storage');
-    assert.equal(savedSession(f), undefined);
+    assert.equal(savedSession(f), cached ? null : undefined);
     const requestCount = f.calls.length, flushCount = f.cookieCalls.length;
     failed.refresh(); await tick();
     assert.equal(await f.learning.refresh(), false);
@@ -914,13 +947,9 @@ test('authentication, cookie snapshot or cache storage failure preserves cached 
 });
 
 test('manual login rejects a profile for a different selected account and preserves its cache', async () => {
-  for (const [account, otherProfile] of [
-    [recoveryAccount, { ...profile, id: 43 }],
-    [recoveryAccount, { ...profile, user_no: '009999' }],
-    [{ ...recoveryAccount, lntId: null }, { ...profile, user_no: '009999' }],
-  ]) {
-    const raw = JSON.stringify({ version: 1, account, todos: [todo], todosAt: 1000 });
-    const f = fixture(new Map([['school-learning.json', raw]]));
+  for (const otherProfile of [{ ...profile, id: 43 }, { ...profile, user_no: '009999' }]) {
+    const raw = cacheEnvelope(learningFixture());
+    const f = fixture(new Map([[cacheName, raw]]));
     await f.learning.restore();
     let authorized = 0;
     f.handler = async url => url.endsWith('/profile') ? response(url, otherProfile) : undefined;
@@ -930,10 +959,10 @@ test('manual login rejects a profile for a different selected account and preser
     assert.equal(authorized, 0);
     assert.equal(f.learning.getSnapshot().authenticated, false);
     assert.equal(f.learning.getSnapshot().needsLogin, true);
-    assert.deepEqual(f.learning.getSnapshot().account, account);
+    assert.deepEqual(f.learning.getSnapshot().account, recoveryAccount);
     assert.deepEqual(f.learning.getSnapshot().todos, [todo]);
     assert.equal(f.files.get('school-learning.json'), raw);
-    assert.equal(savedSession(f), undefined);
+    assert.equal(savedSession(f), null);
     assert.deepEqual(f.cacheMoves, []);
     assert.equal(f.calls.at(-1).url, lntRoot + 'api/profile');
   }
@@ -1106,21 +1135,6 @@ test('QR PUT preserves opaque data, shares the session and only accepts HTTP 200
     assert.equal(f.calls.length, 1); assert.equal(f.logs.length, 0);
   }
 });
-test('Android logout removes only the retired SecureStore preferences and their backup', async () => {
-  for (const platform of ['android', 'web']) {
-    const files = new Map([[retiredPrefs, 'legacy'], [retiredPrefs + '.bak', 'backup'], ['../shared_prefs/other.xml', 'other'], ['SecureStore.xml', 'unrelated']]);
-    const f = await boundFixture(files, { platform });
-    await f.schoolDevice.clear();
-    assert.equal(files.has(retiredPrefs), platform !== 'android');
-    assert.equal(files.has(retiredPrefs + '.bak'), platform !== 'android');
-    assert.equal(files.get('../shared_prefs/other.xml'), 'other');
-    assert.equal(files.get('SecureStore.xml'), 'unrelated');
-    assert.equal(files.has(cacheName), false);
-    assert.equal(files.has('school-logout'), false);
-    assert.deepEqual(f.calls, []);
-  }
-});
-
 test('logout drains late requests before removing both sessions; pending logout survives reopen', async () => {
   const f = fixture(), gate = deferred();
   f.handler = async url => { if (url.endsWith('/token')) { await gate.promise; f.cookies.set('late', 'late-session'); return response(url, { access_token: 'late-token' }); } };
@@ -1134,8 +1148,8 @@ test('logout drains late requests before removing both sessions; pending logout 
   assert.equal(f.cookies.size, 0, 'a late response cannot restore cookies after logout');
   assert.equal(f.schoolBrowser.getSnapshot(), null);
   assert.equal(f.calls.length, 1);
-  for (const blockedFile of [null, cacheName, retiredPrefs]) {
-    const broken = await boundFixture(new Map([[retiredPrefs, 'legacy']]));
+  for (const blockedFile of [null, cacheName]) {
+    const broken = await boundFixture();
     broken.failClear = blockedFile === null;
     broken.failDelete = blockedFile;
     await assert.rejects(broken.schoolDevice.clear(), { code: 'CLEANUP_FAILED' });
@@ -1363,8 +1377,7 @@ test('signed-out home shows only local trial activities and removes one after it
 
 test('local trial entries preserve the logged-in homepage empty-data state before and after completion', async () => {
   const id = 'trial-100-1';
-  const saved = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [], todosAt: 1000 });
-  const f = fixture(new Map([['school-learning.json', saved]]));
+  const f = fixture(new Map([[cacheName, cacheEnvelope(learningFixture({ todos: [] }))]]));
   const app = pages(f, false, JSON.stringify({ version: 1, logs: [], events: [
     { id, method: 'number', outcome: 'success', availableAt: 100, discoveredAt: 101, notifiedAt: 101 },
   ] }));
@@ -1394,8 +1407,7 @@ test('direct preview login restores demo data without school requests or route c
 });
 
 test('the real homepage refresh renders separate school activities and opens each exact id without fixture course lookup', async () => {
-  const saved = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [], todosAt: 1000 });
-  const f = await boundFixture(new Map([['school-learning.json', saved]])), app = pages(f);
+  const f = await boundFixture(learningFixture({ todos: [] })), app = pages(f);
   await f.learning.restore(); app.render();
   f.handler = async url => url === rollcallsUrl ? response(url, { rollcalls: [
     { rollcall_id: 81, course_id: 301, course_title: '学校数字码活动', is_number: true },
@@ -1839,8 +1851,8 @@ test('history page entry, toolbar and pull context refresh history independently
 
 test('settings timetable switch controls the real saved preference and preview stays local', async () => {
   for (const preview of [false, true]) {
-    const raw = JSON.stringify({ version: 1, refreshSchedule: false });
-    const f = fixture(preview ? undefined : new Map([['school-learning.json', raw]]));
+    const raw = cacheEnvelope({ version: 1, refreshSchedule: false });
+    const f = fixture(preview ? undefined : new Map([[cacheName, raw]]));
     if (!preview) await f.learning.restore();
     const app = pages(f, preview); app.render();
     const setting = () => app.find(app.settings(), props => props?.title === '刷新课表')?.props.trailing;
@@ -1853,7 +1865,7 @@ test('settings timetable switch controls the real saved preference and preview s
       assert.equal(f.files.size, 0);
       assert.equal(f.calls.length, 0);
     } else {
-      assert.deepEqual(JSON.parse(f.files.get('school-learning.json')), { version: 1, refreshSchedule: true });
+      assert.deepEqual(JSON.parse(f.files.get(cacheName)), { version: 3, learning: { version: 1, refreshSchedule: true }, session: null });
       const reopened = fixture(f.files); await reopened.learning.restore();
       assert.equal(pages(reopened).render().state.refreshSchedule, true);
     }
@@ -1865,8 +1877,7 @@ const ordinaryPaths = ['/api/my-courses', '/api/semesters', '/api/radar/rollcall
 const timetablePaths = ['/gsapp/sys/wdkbapp/modules/xskcb/kfdxnxqcx.do', '/gsapp/sys/wdkbapp/wdkcb/getZcxx.do', '/gsapp/sys/wdkbapp/wdkcb/queryXspkjg.do'];
 test('every ordinary page header and pull callback uses the same setting-controlled batch and school todo previews', async () => {
   for (const enabled of [false, true]) {
-    const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [todo], todosAt: 1000, refreshSchedule: enabled });
-    const f = await boundFixture(new Map([['school-learning.json', raw]])); await f.learning.restore();
+    const f = await boundFixture(learningFixture({ refreshSchedule: enabled })); await f.learning.restore();
     const app = pages(f);
     const schoolTodos = [null, '2026-11-14T12:00:00Z', '2026-11-12T12:00:00Z', '2026-11-13T12:00:00Z']
       .map((end_time, index) => ({ ...todo, id: index + 1, title: '学校待办' + (index + 1), end_time, type: '学校类型', is_locked: true }));
@@ -1891,8 +1902,8 @@ test('every ordinary page header and pull callback uses the same setting-control
 
 test('provider startup shows cache and makes exactly one ordinary refresh using the restored setting', async () => {
   for (const enabled of [false, true]) {
-    const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: [todo], todosAt: 1000, refreshSchedule: enabled });
-    const f = await boundFixture(new Map([['school-learning.json', raw]])), gate = deferred(), app = pages(f);
+    const learning = learningFixture({ account: { ...recoveryAccount, name: '缓存账号' }, refreshSchedule: enabled });
+    const f = await boundFixture(learning), gate = deferred(), app = pages(f);
     f.handler = async url => { if (url.includes('/my-courses')) { await gate.promise; return response(url, { courses: [{ ...course, name: '启动刷新课程' }], pages: 1, total: 1 }); } };
     app.render(); app.runStartupEffects(); await tick();
     const cached = app.render();
@@ -1946,9 +1957,9 @@ test('today shows the same empty card with no classes today or no timetable', as
   const monday = new Date(2026, 10, 16, 9, 30).getTime();
   const tuesday = { WID: 'tuesday', BJDM: '001-A', KCMC: '周二课程', JASMC: '教室', JSXM: '张老师', XQ: 2, KSJCDM: 1, JSJCDM: 2, KSSJ: '0800', JSSJ: '0940', ZCMC: '8周', JCFADM: 'a' };
   for (const [scenario, rows] of [['classes on another day', [tuesday]], ['empty timetable', []], ['no timetable cache', null]]) {
-    const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: [todo], todosAt: monday,
+    const learning = learningFixture({ todosAt: monday,
       ...(rows && { schedule: { jwTermCode: '20261', name: '测试学期', currentWeek: 8, weeks: [8], weekAt: monday, rows }, scheduleAt: monday }) });
-    const f = fixture(new Map([['school-learning.json', raw]]));
+    const f = fixture(new Map([[cacheName, cacheEnvelope(learning)]]));
     await f.learning.restore();
     const app = pages(f);
     app.todoClock.now = app.todayClock.now = monday;
@@ -2021,9 +2032,9 @@ test('today keeps the initial lesson until an ordinary refresh, then uses the ca
 test('today advances the heading across days on resume and keeps the course card until refresh', async () => {
   const monday = new Date(2026, 10, 16, 9, 30).getTime();
   const row = { WID: 'monday', BJDM: '001-A', KCMC: '周一课程', JASMC: '教室', JSXM: '张老师', XQ: 1, KSJCDM: 1, JSJCDM: 2, KSSJ: '0800', JSSJ: '0940', ZCMC: '8周', JCFADM: 'a' };
-  const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: [todo], todosAt: monday,
+  const learning = learningFixture({ todosAt: monday,
     schedule: { jwTermCode: '20261', name: '测试学期', currentWeek: 8, weeks: [8], weekAt: monday, rows: [row] }, scheduleAt: monday });
-  const f = fixture(new Map([['school-learning.json', raw]])), app = pages(f);
+  const f = fixture(new Map([[cacheName, cacheEnvelope(learning)]])), app = pages(f);
   app.todoClock.now = app.todayClock.now = monday;
   app.render(); app.runStartupEffects(); await tick(); await f.learning.refresh(); app.render();
   const carousel = page => app.find(page, props => props?.horizontal);
@@ -2047,10 +2058,9 @@ test('shared todo dates update at midnight and resume; missing deadlines leave n
   const items = [
     { ...todo, id: 1, end_time: new Date(2026, 10, 17, 18).toISOString() },
     { ...todo, id: 2, end_time: new Date(2026, 10, 18, 8, 5).toISOString() },
-    { ...todo, id: 3 },
+    { ...todo, id: 3, end_time: null },
   ];
-  const raw = JSON.stringify({ version: 1, account: { lntId: 42, studentNumber: '001234', name: '缓存账号' }, todos: items, todosAt: 1000 });
-  const f = fixture(new Map([['school-learning.json', raw]]));
+  const f = fixture(new Map([[cacheName, cacheEnvelope(learningFixture({ todos: items }))]]));
   await f.learning.restore();
   f.handler = async url => url.includes('/todos') ? response(url, { todo_list: items }) : undefined;
   const app = pages(f);

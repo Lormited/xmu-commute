@@ -8,7 +8,8 @@ const otherCourse = { ...course, id: 4, name: '另一课程' };
 const term = { id: 9, name: '秋季学期' };
 const record = { rollcall_id: 11, student_rollcall_id: 111, rollcall_time: '2026-11-08T08:00:00+08:00', title: '课堂签到', student_status: 'on_call', status: 'on_call_fine', student_status_detail: null, is_number: true, is_radar: false, type: 'manual', rollcall_status: 'closed', is_expired: true };
 const scheduleRow = { WID: 'row-1', BJDM: '001-A', KCMC: '学校课程', JASMC: '教学楼 101', JSXM: '张老师', XQ: 2, KSJCDM: 1, JSJCDM: 1, KSSJ: '0800', JSSJ: '0845', ZCMC: '8周', JCFADM: 'a' };
-const saved = { version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [], todosAt: 1000, term, courses: [course, otherCourse], coursesAt: 1000 };
+const saved = { version: 1, account: { lntId: 42, studentNumber: '001234', name: '测试同学' }, todos: [], todosAt: 1000, term, courses: [course, otherCourse], coursesAt: 1000,
+  schedule: null, scheduleAt: null, history: [], historyAt: null, rollcalls: [], attendance: {}, refreshSchedule: false };
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 function fixture(raw = JSON.stringify(saved)) {
@@ -98,12 +99,11 @@ test('login reads every course history and caches the complete batch before publ
   } finally { for (const gate of gates.values()) gate.resolve(); saving.resolve(); await pending; }
 });
 
-test('login without a profile id keeps the old batch and never invents a history student id', async () => {
-  for (const courses of [[course], []]) {
+test('a profile without a bound account keeps the saved batch and does not start history queries', async () => {
+  for (const profile of [{ user_no: '001234' }, { id: 42 }]) {
     const f = fixture(); await f.learning.restore();
     const previous = f.stored(), before = f.learning.getSnapshot(), read = f.device.read;
-    f.device.read = async (action, params) => action === 'profile' ? { user_no: '009999', name: '另一同学' }
-      : action === 'courses' ? { courses } : read(action, params);
+    f.device.read = async (action, params) => action === 'profile' ? profile : read(action, params);
     assert.equal(await f.learning.login(), false);
     assert.equal(f.learning.getSnapshot().authenticated, true);
     assert.equal(f.learning.getSnapshot().needsLogin, false);
@@ -111,7 +111,7 @@ test('login without a profile id keeps the old batch and never invents a history
     assert.deepEqual(f.learning.getSnapshot().account, before.account);
     assert.deepEqual(f.learning.getSnapshot().courses, before.courses);
     assert.equal(f.calls.some(([action]) => action === 'history'), false);
-    assert.match(f.learning.getSnapshot().message, /历史签到读取失败/);
+    assert.match(f.learning.getSnapshot().message, /个人资料读取失败/);
   }
 });
 
@@ -288,7 +288,7 @@ test('logout and replacement login cannot be undone by late history reads or wri
   const gate = deferred(), read = f.device.read;
   f.device.read = async (action, params) => { if (action === 'history') await gate.promise; return read(action, params); };
   const pending = f.learning.refreshHistory(); await tick();
-  f.device.read = async (action, params) => action === 'profile' ? { id: 99, name: '另一同学' }
+  f.device.read = async (action, params) => action === 'profile' ? { id: 99, user_no: '009999', name: '另一同学' }
     : action === 'history' && params.studentId === 99 ? { rollcalls: [] } : read(action, params);
   assert.equal(await f.learning.login(), true);
   gate.resolve(); assert.equal(await pending, false);

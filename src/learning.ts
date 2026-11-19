@@ -4,15 +4,15 @@ import { methodLabel, type HistoryItem, type Rollcall } from './demo-data.ts';
 import { isPosition, type Position } from './location-attendance.ts';
 import { qrData } from './qr.ts';
 
-export type Account = { lntId: number | null; studentNumber: string; name: string };
+export type Account = { lntId: number; studentNumber: string; name: string };
 export type SchoolTodo = {
   id: number; course_id: number; course_name: string;
   title: string; type: string; end_time: string | null; is_locked: boolean;
   [key: string]: unknown;
 };
-export type SchoolTerm = { id: number | null; name: string };
+export type SchoolTerm = { id: number; name: string };
 export type SchoolCourse = {
-  id: number; course_code: string; name: string; semester_id?: number;
+  id: number; course_code: string; name: string; semester_id: number;
   [key: string]: unknown;
 };
 export type SchoolHistory = {
@@ -61,13 +61,11 @@ export function historyView(item: SchoolHistory): HistoryItem {
     type, status: item.status === 'absent' ? 'absent' : 'success', detail: item.student_status_detail };
 }
 function accountFrom(value: unknown): Account {
-  const p = value as Record<string, unknown> | null;
-  if (!p || typeof p !== 'object' || Array.isArray(p) || p.success === false) throw Error('INVALID_PROFILE');
-  return { lntId: Number.isSafeInteger(p.id) ? p.id as number : null, studentNumber: typeof p.user_no === 'string' ? p.user_no : '', name: typeof p.name === 'string' ? p.name : '' };
+  const profile = value as { id?: unknown; user_no?: unknown; name?: unknown; success?: unknown } | null;
+  if (profile?.success === false || typeof profile?.id !== 'number' || !Number.isSafeInteger(profile.id) || profile.id <= 0
+    || typeof profile.user_no !== 'string' || !profile.user_no.trim()) throw Error('INVALID_PROFILE');
+  return { lntId: profile.id, studentNumber: profile.user_no, name: typeof profile.name === 'string' ? profile.name : '' };
 }
-const matchesLntAccount = (expected: Account, actual: Pick<Account, 'lntId' | 'studentNumber'>) =>
-  (expected.lntId === null || expected.lntId === actual.lntId)
-  && (!expected.studentNumber || expected.studentNumber === actual.studentNumber);
 const loginRetryMessage = (code?: string, needsLogin?: boolean) => code === 'COOKIE_STORAGE' ? '学校登录状态保存失败，请重新登录'
   : code === 'SESSION_DRAINING' ? '学校登录状态仍在处理，请稍后重试'
   : code === 'AUTH_REQUIRED' || needsLogin ? '学校登录失效，请重新登录' : null;
@@ -94,9 +92,9 @@ function coursesFrom(value: unknown, term: SchoolTerm): SchoolCourse[] {
   const list = (value as { courses?: unknown } | null)?.courses;
   if ((value as { success?: unknown } | null)?.success === false || !Array.isArray(list) || !list.every(item => item && Number.isSafeInteger(item.id)
     && typeof item.course_code === 'string' && typeof item.name === 'string'
-    && (term.id === null || Number.isSafeInteger(item.semester_id) && item.semester_id > 0))) throw Error('INVALID_COURSES');
+    && Number.isSafeInteger(item.semester_id) && item.semester_id > 0)) throw Error('INVALID_COURSES');
   if (new Set(list.map(item => item.id)).size !== list.length) throw Error('INVALID_COURSES');
-  return term.id === null ? list : list.filter(item => item.semester_id === term.id);
+  return list.filter(item => item.semester_id === term.id);
 }
 function historyFrom(value: unknown, course: SchoolCourse): SchoolHistory[] {
   const list = (value as { rollcalls?: unknown } | null)?.rollcalls;
@@ -111,7 +109,7 @@ function historyFrom(value: unknown, course: SchoolCourse): SchoolHistory[] {
 }
 const sortHistory = (items: SchoolHistory[]) => items.sort((a, b) => Date.parse(b.rollcall_time) - Date.parse(a.rollcall_time));
 type SavedLearning = { version: 1; account: Account; todos: SchoolTodo[]; todosAt: number;
-  term: SchoolTerm | null; courses: SchoolCourse[]; coursesAt: number | null; schedule: SchoolSchedule | null; scheduleAt: number | null; refreshSchedule: boolean; rollcalls: Rollcall[]; attendance: CompletedAttendance; history: SchoolHistory[]; historyAt: number | null };
+  term: SchoolTerm; courses: SchoolCourse[]; coursesAt: number; schedule: SchoolSchedule | null; scheduleAt: number | null; refreshSchedule: boolean; rollcalls: Rollcall[]; attendance: CompletedAttendance; history: SchoolHistory[]; historyAt: number | null };
 const loginFailures: Record<string, string> = {
   native: '学校登录组件加载失败，请检查安装版本',
   pkce: '学校登录准备失败，请重试',
@@ -122,67 +120,34 @@ const loginFailures: Record<string, string> = {
   lnt: 'LNT 登录失败，请重试',
   flush: '登录状态保存失败，请重新登录',
 };
-function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSchedule'> | null {
+function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSchedule'> {
   const data = JSON.parse(raw) as SavedLearning;
-  if (data?.version !== 1) return null;
-  if (data.refreshSchedule !== undefined && typeof data.refreshSchedule !== 'boolean') throw Error('INVALID_CACHE');
-  const refreshSchedule = data.refreshSchedule ?? false;
-  if (!Object.hasOwn(data, 'account') && data.refreshSchedule !== undefined) return { refreshSchedule };
-  const account = data.account;
-  if (!account || typeof account !== 'object' || Array.isArray(account) || typeof account.studentNumber !== 'string'
-    || typeof account.name !== 'string' || (account.lntId !== null && !Number.isSafeInteger(account.lntId))
-    || !Number.isFinite(data.todosAt)) throw Error('INVALID_CACHE');
-  let term: SchoolTerm | null = null, courses: SchoolCourse[] = [], coursesAt: number | null = null;
-  // T01 caches remain readable until the first complete course refresh.
-  if (data.term !== undefined || data.courses !== undefined || data.coursesAt !== undefined) {
-    const saved = data.term as SchoolTerm & Partial<SchoolSchedule> & { lntTermCode?: string };
-    if (!saved || typeof saved.name !== 'string' || !Number.isFinite(data.coursesAt)) throw Error('INVALID_CACHE');
-    if (saved.jwTermCode !== undefined) {
-      if (!/^\d{4}[123]$/.test(saved.jwTermCode) || saved.lntTermCode !== saved.jwTermCode.slice(0, 4) + '-' + saved.jwTermCode.slice(4)) throw Error('INVALID_CACHE');
-      if (!Array.isArray(data.courses) || !data.courses.every(course => (course.semester as { code?: unknown } | null)?.code === saved.lntTermCode)) throw Error('INVALID_CACHE');
-      const semesterId = data.courses[0]?.semester_id;
-      const knownId = Number.isSafeInteger(semesterId) && semesterId! > 0 && data.courses.every(course => course.semester_id === semesterId);
-      term = { id: knownId ? semesterId! : null, name: saved.name };
-    } else {
-      if (!(saved.id === null || Number.isSafeInteger(saved.id) && saved.id > 0)) throw Error('INVALID_CACHE');
-      term = { id: saved.id, name: saved.name };
-    }
-    courses = coursesFrom({ courses: data.courses }, term);
-    if (courses.length !== data.courses.length) throw Error('INVALID_CACHE');
-    coursesAt = data.coursesAt;
-  }
-  let schedule: SchoolSchedule | null = null, scheduleAt: number | null = null;
-  if (data.schedule != null) {
-    const legacy = data.term as unknown as Partial<SchoolSchedule> | null;
-    const metadata = legacy?.jwTermCode ? legacy : data.schedule;
-    const weekAt = legacy?.jwTermCode ? data.coursesAt : data.schedule.weekAt;
-    if (typeof metadata.jwTermCode !== 'string' || !/^\d{4}[123]$/.test(metadata.jwTermCode) || typeof metadata.name !== 'string'
-      || !Number.isSafeInteger(metadata.currentWeek) || !Array.isArray(metadata.weeks) || !metadata.weeks.every(week => Number.isSafeInteger(week) && week > 0)
-      || !metadata.weeks.includes(metadata.currentWeek!) || data.schedule.jwTermCode !== metadata.jwTermCode
-      || !Number.isFinite(weekAt) || !Number.isFinite(data.scheduleAt)) throw Error('INVALID_CACHE');
-    schedule = { jwTermCode: metadata.jwTermCode, rows: scheduleRowsFrom({ success: true, pkjgList: data.schedule.rows }),
-      name: metadata.name, currentWeek: metadata.currentWeek!, weeks: metadata.weeks, weekAt: weekAt! };
-    scheduleAt = data.scheduleAt;
-  }
-  let history: SchoolHistory[] = [], historyAt: number | null = null;
-  if (data.history !== undefined || data.historyAt !== undefined) {
-    if (!Array.isArray(data.history) || !(data.historyAt === null || Number.isFinite(data.historyAt))
-      || (data.history.length && data.historyAt === null)) throw Error('INVALID_CACHE');
-    history = sortHistory(data.history.flatMap(item => {
-      const course = courses.find(course => course.id === item.course_id);
-      if (!course) throw Error('INVALID_CACHE');
-      return historyFrom({ rollcalls: [item] }, course);
-    }));
-    historyAt = data.historyAt;
-  }
-  const rollcalls = data.rollcalls === undefined ? [] : data.rollcalls;
-  const attendance = data.attendance === undefined ? {} : data.attendance;
+  if (data?.version !== 1 || typeof data.refreshSchedule !== 'boolean') throw Error('INVALID_CACHE');
+  const { account, term, schedule, scheduleAt, historyAt, rollcalls, attendance, refreshSchedule } = data;
+  if (!Object.hasOwn(data, 'account') && Object.keys(data).length === 2) return { refreshSchedule };
+  if (!account || !Number.isSafeInteger(account.lntId) || account.lntId <= 0
+    || typeof account.studentNumber !== 'string' || !account.studentNumber.trim() || typeof account.name !== 'string'
+    || !term || !Number.isSafeInteger(term.id) || term.id <= 0 || typeof term.name !== 'string' || !term.name.trim()
+    || !Number.isFinite(data.todosAt) || !Number.isFinite(data.coursesAt)) throw Error('INVALID_CACHE');
+  const courses = coursesFrom({ courses: data.courses }, term);
+  if (courses.length !== data.courses.length) throw Error('INVALID_CACHE');
+  if (schedule === null ? scheduleAt !== null
+    : !schedule || typeof schedule.jwTermCode !== 'string' || !/^\d{4}[123]$/.test(schedule.jwTermCode) || typeof schedule.name !== 'string'
+      || !Number.isSafeInteger(schedule.currentWeek) || !Array.isArray(schedule.weeks) || !schedule.weeks.every(week => Number.isSafeInteger(week) && week > 0)
+      || !schedule.weeks.includes(schedule.currentWeek) || !Number.isFinite(schedule.weekAt) || !Number.isFinite(scheduleAt)) throw Error('INVALID_CACHE');
+  if (!Array.isArray(data.history) || !(historyAt === null ? data.history.length === 0 : Number.isFinite(historyAt))) throw Error('INVALID_CACHE');
+  const history = sortHistory(data.history.flatMap(item => {
+    const course = courses.find(course => course.id === item?.course_id);
+    if (!course) throw Error('INVALID_CACHE');
+    return historyFrom({ rollcalls: [item] }, course);
+  }));
   if (!Array.isArray(rollcalls) || !rollcalls.every(item => item && typeof item.id === 'string' && item.id.trim()
     && typeof item.courseId === 'string' && item.courseId.trim() && typeof item.title === 'string' && typeof item.time === 'string'
     && ['number', 'qr', 'radar'].includes(item.method)) || !attendance || typeof attendance !== 'object' || Array.isArray(attendance)
     || !Object.values(attendance).every(result => result === 'success' || result === 'ended')) throw Error('INVALID_CACHE');
-  return { version: 1, account: accountFrom({ id: data.account.lntId, user_no: data.account.studentNumber, name: data.account.name }),
-    todos: todosFrom({ todo_list: data.todos }), todosAt: data.todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, rollcalls, attendance, history, historyAt };
+  return { version: 1, account, term, courses, coursesAt: data.coursesAt,
+    schedule: schedule && { ...schedule, rows: scheduleRowsFrom({ success: true, pkjgList: schedule.rows }) },
+    todos: todosFrom({ todo_list: data.todos }), todosAt: data.todosAt, scheduleAt, refreshSchedule, rollcalls, attendance, history, historyAt };
 }
 
 export function createLearning(device: SchoolDevice, now = Date.now) {
@@ -201,8 +166,6 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
   let cleanupFailed = false;
   let restoreFailed = false;
   const current = (version: number) => generation === version;
-  const cacheMatches = (account: Account | null) => !!(state.account && account
-    && (state.account.lntId !== null || state.account.studentNumber.trim()) && matchesLntAccount(state.account, account));
   const completed = () => ({ ...state.attendance, ...state.pendingAttendance });
   function rememberAttendance() {
     const version = identity;
@@ -233,7 +196,6 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
   }
   async function readHistory(courses: SchoolCourse[], account: Account): Promise<SchoolHistory[]> {
     const studentId = account.lntId;
-    if (studentId === null || studentId <= 0) throw Error('INVALID_PROFILE');
     const responses = await Promise.allSettled(courses.map(async course => historyFrom(await device.read('history', { courseId: course.id, studentId }, account), course)));
     const failures = responses.filter(result => result.status === 'rejected');
     const authFailure = failures.find(({ reason }) => loginRetryMessage(reason?.code, reason?.needsLogin));
@@ -273,19 +235,18 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         failure = 'LNT 进行中签到更新失败，已保留原数据';
         const rollcalls = rollcallsFrom(await device.read('rollcalls', undefined, account));
         if (!current(version)) return false;
-        const sameAccount = cacheMatches(account);
+        const sameAccount = state.account?.lntId === account.lntId && state.account.studentNumber === account.studentNumber;
         failure = 'LNT 当前学期读取失败，已保留原数据';
         const term = lntTermFrom(await device.read('lntTerms', undefined, account));
         if (!current(version)) return false;
         failure = 'LNT 课程更新失败，已保留原数据';
-        const courses = coursesFrom(await device.read('courses', { semesterId: term.id! }, account), term);
+        const courses = coursesFrom(await device.read('courses', { semesterId: term.id }, account), term);
         if (!current(version)) return false;
         failure = '教务课表更新失败，已保留原数据';
-        const cachedSchedule = state.account?.studentNumber === account.studentNumber && state.account?.lntId === account.lntId ? state.schedule : null;
+        const cachedSchedule = sameAccount ? state.schedule : null;
         const schedule = includeSchedule ? await readSchedule(device, account.studentNumber, now, login ? null : cachedSchedule) : cachedSchedule;
         if (!current(version)) return false;
-        const keepHistory = sameAccount && (state.term?.id === term.id
-          || state.term?.id === null && courses.some(course => state.courses.some(previous => previous.id === course.id)));
+        const keepHistory = sameAccount && state.term?.id === term.id;
         if (login) failure = '历史签到读取失败，已保留原数据';
         const history = login ? await readHistory(courses, account)
           : keepHistory ? state.history.filter(item => courses.some(course => course.id === item.course_id)) : [];
@@ -364,8 +325,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     if (operation) return operation.then(refreshHistory);
     if (historyOperation) return historyOperation;
     if (!state.authenticated) return Promise.resolve(false);
-    const { account, term, courses } = state;
-    if (!account || !Number.isSafeInteger(account.lntId) || !term) {
+    const { account, term, courses, todosAt, coursesAt } = state;
+    if (!account || !term || todosAt === null || coursesAt === null) {
       publish({ historyMessage: '请先刷新个人资料和当前学期课程' });
       return Promise.resolve(false);
     }
@@ -380,8 +341,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         failure = '历史签到保存失败，已保留原数据';
         const saved = writing.then(async () => {
           if (!current(version)) return false;
-          const next: SavedLearning = { version: 1, account, term, courses, coursesAt: state.coursesAt,
-            todos: state.todos, todosAt: state.todosAt!, schedule: state.schedule, scheduleAt: state.scheduleAt, refreshSchedule: state.refreshSchedule, rollcalls: state.rollcalls, attendance: completed(), history, historyAt };
+          const next: SavedLearning = { version: 1, account, term, courses, coursesAt,
+            todos: state.todos, todosAt, schedule: state.schedule, scheduleAt: state.scheduleAt, refreshSchedule: state.refreshSchedule, rollcalls: state.rollcalls, attendance: completed(), history, historyAt };
           await device.save(JSON.stringify(next));
           if (!current(version)) return false;
           publish({ history, historyAt });
@@ -417,8 +378,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       const saved = writing.then(async () => {
         if (version !== identity || clearing || cleanupFailed || restoreFailed) return false;
         const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, rollcalls, history, historyAt } = state;
-        const data = account && todosAt !== null
-          ? { version: 1, account, todos, todosAt, ...(term ? { term, courses, coursesAt, schedule, scheduleAt, history, historyAt } : {}), rollcalls, attendance: completed(), refreshSchedule: enabled }
+        const data = account && term && todosAt !== null && coursesAt !== null
+          ? { version: 1, account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, history, historyAt, rollcalls, attendance: completed(), refreshSchedule: enabled }
           : { version: 1, refreshSchedule: enabled };
         await device.save(JSON.stringify(data));
         if (version !== identity) return false;
