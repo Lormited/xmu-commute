@@ -29,7 +29,6 @@ let generation = 0;
 let authenticating: Promise<void> | null = null;
 let clearing: Promise<void> | null = null;
 let mustClear = false;
-let verifiedTerms: unknown = null;
 type BoundSession = { account: Account; jar: CookieJar; recovery?: Promise<void> };
 type CachedLearning = { version: 1; account?: Account };
 type CachedSession = { account: Account; cookies: unknown };
@@ -188,10 +187,6 @@ async function query(url: string, version: number, init: RequestInit, account?: 
   const pending = recovering?.result;
   if (pending) await pending;
   const session = boundSession(version, account);
-  if (url === endpoints.jwTerms && verifiedTerms !== null) {
-    const terms = verifiedTerms; verifiedTerms = null;
-    return terms;
-  }
   const response = await request(url, version, init, session.jar);
   check(version);
   const lnt = new URL(url).origin === lntOrigin;
@@ -263,7 +258,6 @@ function jsonResponse(response: { contentType: string; text: string }): unknown 
 async function authenticate(expected: Account | undefined, onAuthorized?: () => void) {
   const version = generation;
   check(version);
-  verifiedTerms = null;
   let stage = 'native';
   try {
     const { default: cookies } = await import('@preeternal/react-native-cookie-manager');
@@ -295,19 +289,12 @@ async function authenticate(expected: Account | undefined, onAuthorized?: () => 
     stage = 'flush';
     let jar: CookieJar;
     try {
-      await cookies.flush();
-      check(version);
       jar = await captureSchoolCookies(url => cookies.getAsArray(url));
     } catch {
       check(version);
       throw fail('COOKIE_STORAGE');
     }
     check(version);
-    stage = 'academic-probe';
-    const academicResponse = schoolResult(endpoints.jwTerms, await request(endpoints.jwTerms, version, { headers: { Accept: 'application/json' } }, jar));
-    const academic = jsonResponse(academicResponse) as { success?: boolean; datas?: { kfdxnxqcx?: { rows?: unknown } } } | null;
-    if (academic?.success === false || !Array.isArray(academic?.datas?.kfdxnxqcx?.rows)) throw fail('INVALID_ACADEMIC_SESSION');
-    setSchoolCookies(jar, endpoints.jwTerms, academicResponse.headers);
     stage = 'lnt';
     const loginUrl = LNT_HOME + 'api/login?login=access_token';
     const login = schoolResult(loginUrl, await request(loginUrl, version, {
@@ -329,7 +316,6 @@ async function authenticate(expected: Account | undefined, onAuthorized?: () => 
     active = session;
     restored = true;
     sessionFailure = 'AUTH_REQUIRED';
-    verifiedTerms = academic;
     schoolBrowser.close();
     onAuthorized?.();
   } catch (cause) {
@@ -399,7 +385,6 @@ function clear(): Promise<void> {
   active = null;
   restored = false;
   sessionFailure = 'AUTH_REQUIRED';
-  verifiedTerms = null;
   const recovery = recovering;
   recovery?.abort();
   schoolBrowser.close();
