@@ -159,7 +159,7 @@ async function notify(job: NativeJob, token: string, account: Account, rollcallI
     if (!valid()) return;
     const identifier = notice?.identifier ?? randomUUID();
     if (!notice) await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: false } } });
-    if (!valid()) return;
+    if (!valid() || !schoolLearning.canNotifyRollcall(rollcallId)) return;
     if (!await job.post(token, identifier, endAt, rollcallId)) return;
     if (!valid()) { await (await notifications()).dismissNotificationAsync(identifier); return; }
     await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: true } } });
