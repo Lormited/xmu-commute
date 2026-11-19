@@ -48,6 +48,7 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
   const fixture = { files, scheduled, finished, notices, dismissed, calls, account, permission: true, isCurrent: job.isCurrent,
     readFile: uri => files.get(uri),
     deleteFile: uri => files.delete(uri),
+    async moveFile({ from, to }) { files.set(to, files.get(from)); files.delete(from); },
     getPermissions: async () => ({ granted: fixture.permission }),
     loadLearning: async () => ({ raw: files.get('learning') ?? JSON.stringify(cached), account }),
     saveLearning: async value => { files.set('learning', value); },
@@ -78,7 +79,7 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
   Object.assign(fixture, load('../src/school-reminder-device.ts', {
     'react-native': { Platform: { OS: 'android' } }, expo: { requireOptionalNativeModule: () => job },
     'expo-crypto': { randomUUID }, 'expo-file-system': { File, Paths: { document: '' } },
-    'expo-file-system/legacy': { moveAsync: async ({ from, to }) => { files.set(to, files.get(from)); files.delete(from); } },
+    'expo-file-system/legacy': { moveAsync: options => fixture.moveFile(options) },
     'expo-notifications': { AndroidImportance: { HIGH: 4, NONE: 0 }, AndroidNotificationVisibility: { PRIVATE: 0 },
       setNotificationChannelAsync: async () => ({ importance: 4 }), getNotificationChannelAsync: async () => ({ importance: 4 }),
       getPermissionsAsync: () => fixture.getPermissions(), requestPermissionsAsync: async () => ({ granted: fixture.permission }),
@@ -119,6 +120,47 @@ test('the Job saves and publishes pending activities before posting, then saves 
   fixture.stop();
   await running;
 });
+
+for (const stage of ['submitting', 'receipt open', 'receipt dismissed']) {
+  test(`the Job skips posting when attendance is ${stage} during notice saving`, async () => {
+    const fixture = schoolFixture();
+    await fixture.schoolLearning.restore();
+    await fixture.setSchoolReminders(true);
+    await fixture.advance(monday(10));
+    const moveFile = fixture.moveFile;
+    const noticeSave = Promise.withResolvers();
+    fixture.moveFile = async options => { await noticeSave.promise; await moveFile(options); };
+    const running = fixture.runSchoolReminderJob('job-1');
+    await flush();
+    assert.ok(fixture.files.has('school-reminders.tmp'), 'the Job is saving the notice before posting');
+    assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id), ['81']);
+
+    const receipt = Promise.withResolvers();
+    fixture.answerNumber = () => receipt.promise;
+    const submitted = fixture.schoolLearning.submitNumber('81', '0206');
+    const complete = () => receipt.resolve({ result: 'success', message: '签到成功' });
+    if (stage !== 'submitting') {
+      complete();
+      assert.equal((await submitted).result, 'success');
+    }
+    if (stage === 'receipt dismissed') fixture.schoolLearning.attendanceDismissed({ ids: ['81'] });
+
+    noticeSave.resolve();
+    await flush();
+    assert.deepEqual(fixture.notices, []);
+    if (stage === 'submitting') {
+      complete();
+      assert.equal((await submitted).result, 'success');
+    }
+    if (stage === 'receipt dismissed') {
+      await fixture.advance(monday(10) + 30000);
+      assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
+      assert.deepEqual(JSON.parse(fixture.files.get('learning')).rollcalls, []);
+    }
+    fixture.stop();
+    await running;
+  });
+}
 
 test('cold-start refresh queries activities unless reminders are enabled for the restored account', async () => {
   const fixture = schoolFixture();

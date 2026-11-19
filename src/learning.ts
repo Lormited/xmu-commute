@@ -169,6 +169,9 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, history, historyAt } = state;
     return device.save(JSON.stringify({ version: 1, account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, rollcalls, history, historyAt, attendance: completed() }));
   }
+  function canNotifyRollcall(id: string) {
+    return !Object.hasOwn(state.attendance, id) && !Object.hasOwn(state.pendingAttendance, id) && !submissions.has(id);
+  }
   async function refreshPendingRollcalls(account: Account, signal: AbortSignal, valid: () => boolean) {
     const version = identity;
     const sameIdentity = () => version === identity && state.account?.lntId === account.lntId;
@@ -181,8 +184,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
       await saveAttendance(rollcalls);
       if (!sameIdentity()) return [];
       publish({ rollcalls });
-      if (!valid() || !sameSession()) return [];
-      return rollcalls.filter(({ id }) => !Object.hasOwn(state.attendance, id) && !Object.hasOwn(state.pendingAttendance, id) && !submissions.has(id));
+      return valid() && sameSession() ? rollcalls : [];
     });
     writing = saved.then(() => {}, () => {});
     return saved;
@@ -406,6 +408,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     restore,
     refreshPendingRollcalls,
+    canNotifyRollcall,
     login: (onAuthorized?: () => void) => update(true, onAuthorized),
     refresh: (options?: { keepRollcalls?: boolean }) => update(false, undefined, options?.keepRollcalls),
     refreshHistory,
