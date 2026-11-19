@@ -78,8 +78,8 @@ function fixture(files = new Map(), { timers = {} } = {}) {
   const cookies = new Map(webCookies.map(cookie => [cookie.name, cookie]));
   const document = '/private/app/files';
   const f = { files, calls, cookieCalls, cacheMoves, cookies, logs, cookieLoads: 0, cookieUnavailable: false,
-    failWrite: false, failMove: false, failClear: false, failFlush: false, failCapture: false, failDelete: null,
-    failCrypto: false, flushGate: null, writeGate: null, moveGate: null, beforeMove: null, handler: null,
+    failWrite: false, failMove: false, failClear: false, failCapture: false, failDelete: null,
+    failCrypto: false, captureGate: null, writeGate: null, moveGate: null, beforeMove: null, handler: null,
     console: Object.fromEntries(['info', 'warn'].map(level => [level, (...args) => logs.push([level, ...args])])) };
   class File {
     constructor(root, name) { this.name = posix.relative(document, posix.resolve(root, name)); }
@@ -122,12 +122,13 @@ function fixture(files = new Map(), { timers = {} } = {}) {
       if (f.cookieUnavailable) throw Error('Native CookieManager is unavailable');
       return { __esModule: true, default: {
         getAsArray: async url => {
+          if (f.captureGate) await f.captureGate.promise;
           if (f.failCapture) throw Error('COOKIE_SNAPSHOT');
           const { hostname, pathname } = new URL(url);
           return [...cookies.values()].filter(cookie => hostname === cookie.domain &&
             (pathname === cookie.path || pathname.startsWith(cookie.path.endsWith('/') ? cookie.path : cookie.path + '/')));
         },
-        flush: async () => { cookieCalls.push('flush'); if (f.flushGate) await f.flushGate.promise; if (f.failFlush) throw Error('COOKIE_STORAGE'); },
+        flush: async () => { cookieCalls.push('flush'); },
         clearAllStores: async () => { cookieCalls.push('clearAllStores'); if (f.failClear) throw Error('COOKIE_STORAGE'); cookies.clear(); return true; },
       } };
     },
@@ -662,12 +663,17 @@ test('invalid or failed later course pages retain the entire saved learning batc
   }
 });
 
-test('two-site login uses PKCE, waits for authentication and cookie saving, then reads and saves todos', async () => {
+test('two-site login saves the verified session before success and the first timetable request', async () => {
   const f = fixture(); let authorized = 0;
-  let authorizedCache;
-  const verification = deferred();
-  f.handler = async url => { if (url.endsWith('/profile')) await verification.promise; };
-  const login = f.learning.login(() => { authorized++; authorizedCache = f.files.get(cacheName); });
+  let authorizedCache, authorizedRequests;
+  const commit = deferred();
+  f.moveGate = commit;
+  const login = f.learning.login(() => {
+    authorized++;
+    authorizedCache = f.files.get(cacheName);
+    authorizedRequests = f.calls.map(call => call.url);
+  });
+  const loginRequests = [IDENTITY + '/token', lntRoot + 'api/login?login=access_token', lntRoot + 'api/profile', academicProfileUrl];
   const auth = await authorize(f);
   assert.equal(authorized, 0, 'a callback or token alone is not authentication success');
   const body = new URLSearchParams(f.calls[0].options.body);
@@ -678,19 +684,25 @@ test('two-site login uses PKCE, waits for authentication and cookie saving, then
   await initialize(f);
   try {
     assert.equal(authorized, 0);
-    assert.deepEqual(requestPaths(f), [new URL(IDENTITY + '/token').pathname, timetablePaths[0], '/api/login', '/api/profile']);
-    assert.equal(requestCookie(f.calls[1]), 'JSESSIONID=web-jw');
-    assert.deepEqual(JSON.parse(f.calls[2].options.body), { access_token: 'one-use-access-token', org_id: 1 });
-    assert.match(requestCookie(f.calls[3]), /lnt_session=manual-lnt/);
+    assert.deepEqual(f.calls.map(call => call.url), loginRequests);
+    assert.deepEqual(JSON.parse(f.calls[1].options.body), { access_token: 'one-use-access-token', org_id: 1 });
+    assert.match(requestCookie(f.calls[2]), /lnt_session=manual-lnt/);
+    assert.equal(requestCookie(f.calls[3]), 'JSESSIONID=web-jw');
+    assert.equal(f.files.has('school-learning.tmp'), true);
     assert.equal(f.files.has(cacheName), false);
     assert.deepEqual(f.cacheMoves, []);
-  } finally { verification.resolve(); }
+  } finally { commit.resolve(); }
   assert.equal(await login, true);
   assert.deepEqual(f.cacheMoves, [cacheName, cacheName]);
-  assert.equal(f.calls.filter(call => call.url.includes('kfdxnxqcx')).length, 1, 'the first timetable consumes the verified academic term response');
   assert.equal(authorized, 1);
+  assert.deepEqual(authorizedRequests, loginRequests);
+  assert.deepEqual(f.calls.map(call => call.url), [
+    ...loginRequests, lntRoot + 'api/todos?no-intercept=true', rollcallsUrl, lntRoot + 'api/semesters', lntRoot + 'api/my-courses',
+    'https://jw.xmu.edu.cn' + timetablePaths[0], 'https://jw.xmu.edu.cn' + timetablePaths[1] + '?XNXQDM=20261',
+    'https://jw.xmu.edu.cn' + timetablePaths[2], lntRoot + 'api/course/3/student/42/rollcalls?page=1&page_size=100',
+  ]);
   assert.equal(f.schoolBrowser.getSnapshot(), null);
-  assert.deepEqual(f.cookieCalls, ['flush']);
+  assert.deepEqual(f.cookieCalls, [], 'session saving does not flush the WebView cookie store');
   const stored = savedSession(f);
   assert.deepEqual(JSON.parse(authorizedCache), { version: 3, learning: null, session: stored });
   const sessionOnly = await fixture(new Map([[cacheName, authorizedCache]])).schoolDevice.load();
@@ -708,27 +720,24 @@ test('two-site login uses PKCE, waits for authentication and cookie saving, then
   assert.deepEqual(learning.account, recoveryAccount);
   assert.deepEqual(learning.history, []);
   assert.equal(learning.historyAt, learning.todosAt);
-  assert.deepEqual(f.calls.filter(call => /\/course\/\d+\/student\//.test(call.url)).map(call => call.url), ['https://lnt.xmu.edu.cn/api/course/3/student/42/rollcalls?page=1&page_size=100']);
   assert.doesNotMatch(saved, /single-code|access-token|code_verifier/);
   assert.doesNotMatch(raw, /manual-lnt|web-(lnt|ids|identity|mobile|jw)|TGC|JSESSIONID|cookies/i);
-  await f.schoolDevice.read('jwTerms');
-  assert.equal(f.calls.filter(call => call.url.includes('kfdxnxqcx')).length, 2, 'the authentication probe is consumed only once');
   const reopened = fixture(f.files); await reopened.learning.restore();
   assert.deepEqual(reopened.learning.getSnapshot().todos, [todo]);
   assert.equal(reopened.learning.getSnapshot().authenticated, true);
   assert.equal(await reopened.learning.refresh(), true);
-  assert.equal(reopened.calls.some(call => call.url.endsWith('/profile')), false);
+  assert.deepEqual(reopened.calls.map(call => call.url), [lntRoot + 'api/todos?no-intercept=true', rollcallsUrl, lntRoot + 'api/semesters', lntRoot + 'api/my-courses']);
   assert.equal(await f.learning.logout(), true);
   assert.equal(f.files.size, 0);
-  assert.deepEqual(f.cookieCalls, ['flush', 'clearAllStores']);
+  assert.deepEqual(f.cookieCalls, ['clearAllStores']);
   assert.equal(f.cookies.size, 0);
 });
-test('failed authentication, invalid token, and academic probe errors cannot report success', async () => {
+test('invalid token, failed LNT login, and failed JW identity checks cannot report success', async () => {
   for (const phase of ['token', 'academic', 'login']) {
     const f = fixture(); let authorized = 0;
     f.handler = async url => {
       if (phase === 'token' && url.endsWith('/token')) return response(url, {});
-      if (phase === 'academic' && url.includes('kfdxnxqcx')) return response(url, '<html>login</html>', 200, 'text/html');
+      if (phase === 'academic' && url === academicProfileUrl) return response(url, '<html>login</html>', 200, 'text/html');
       if (phase === 'login' && url.includes('/api/login')) return response(url, {}, 201);
     };
     const login = f.learning.login(() => authorized++);
@@ -737,26 +746,23 @@ test('failed authentication, invalid token, and academic probe errors cannot rep
     assert.equal(await login, false);
     assert.equal(authorized, 0);
     assert.equal(f.files.size, 0);
-    assert.equal(f.calls.some(call => call.url.endsWith('/profile')), false);
+    assert.equal(f.calls.some(call => call.url.endsWith('/profile')), phase === 'academic');
     assert.equal(f.schoolBrowser.getSnapshot(), null);
   }
 });
-test('academic probe accepts the school envelope and rejects invalid session responses', async () => {
-  for (const [body, valid] of [
-    [academicTerms, true],
-    [[], false], [null, false], [{}, false], [{ datas: { kfdxnxqcx: { rows: {} } } }, false],
-    [{ ...academicTerms, success: false }, false],
-  ]) {
-    const f = fixture();
-    let probes = 0;
-    f.handler = async url => { if (url.includes('kfdxnxqcx') && probes++ === 0) return response(url, body); };
-    const login = f.learning.login();
-    await authorize(f); await initialize(f);
-    assert.equal(await login, valid);
-    assert.equal(f.calls.some(call => call.url.includes('/api/login')), valid, 'only a valid academic response may continue to LNT');
-    assert.equal(f.learning.getSnapshot().authenticated, valid);
-    if (!valid) assert.match(f.learning.getSnapshot().message, /教务会话验证失败/);
-  }
+test('an invalid JW term response fails the first timetable update after authorization', async () => {
+  const f = fixture(); let authorized = 0;
+  const termsUrl = 'https://jw.xmu.edu.cn' + timetablePaths[0];
+  f.handler = async url => { if (url === termsUrl) return response(url, {}); };
+  const login = f.learning.login(() => authorized++);
+  await authorize(f); await initialize(f);
+  assert.equal(await login, false);
+  assert.equal(authorized, 1);
+  assert.equal(f.learning.getSnapshot().authenticated, true);
+  assert.match(f.learning.getSnapshot().message, /教务课表更新失败/);
+  assert.equal(f.calls.at(-1).url, termsUrl);
+  assert.deepEqual(f.cacheMoves, [cacheName]);
+  assert.equal(JSON.parse(f.files.get(cacheName)).learning, null);
 });
 test('manual login verifies the JW session own student number and only saves scoped cookies', async () => {
   for (const [body, valid] of [
@@ -814,11 +820,11 @@ test('login failures identify their stage without logging credentials or externa
   ];
   for (const [stage, code, message] of cases) {
     const f = fixture();
-    f.cookieUnavailable = stage === 'native'; f.failCrypto = stage === 'pkce'; f.failFlush = stage === 'flush';
+    f.cookieUnavailable = stage === 'native'; f.failCrypto = stage === 'pkce'; f.failCapture = stage === 'flush';
     f.handler = async url => {
       if (url.endsWith('/token') && stage === 'network') throw Error('https://secret.test/?code=private-code&token=private-token');
       if (url.endsWith('/token') && stage === 'token') return response(url, {});
-      if (url.includes('kfdxnxqcx') && stage === 'academic-probe') return response(url, {});
+      if (url === academicProfileUrl && stage === 'academic-probe') return response(url, {});
       if (url.includes('/api/login') && stage === 'lnt') return response(url, {}, 503);
     };
     const login = f.learning.login();
@@ -908,10 +914,9 @@ test('cookie library failures remain visible and failed logout can be retried', 
 
 test('authentication, cookie snapshot or cache storage failure preserves cached data and allows manual retry', async () => {
   const saved = cacheEnvelope(learningFixture());
-  for (const cached of [false, true]) for (const phase of ['token', 'flush', 'snapshot', 'storage']) {
+  for (const cached of [false, true]) for (const phase of ['token', 'snapshot', 'storage']) {
     const f = fixture(cached ? new Map([['school-learning.json', saved]]) : undefined), app = pages(f);
     await f.learning.restore(); app.render();
-    f.failFlush = phase === 'flush';
     f.failCapture = phase === 'snapshot';
     f.failMove = phase === 'storage';
     f.handler = async url => phase === 'token' && url.endsWith('/token') ? response(url, {}, 503) : undefined;
@@ -929,17 +934,16 @@ test('authentication, cookie snapshot or cache storage failure preserves cached 
     if (phase !== 'token') assert.equal(failed.data.message, '登录状态保存失败，请重新登录');
     assert.equal(f.calls.some(call => call.url.endsWith('/profile')), phase === 'storage');
     assert.equal(savedSession(f), cached ? null : undefined);
-    const requestCount = f.calls.length, flushCount = f.cookieCalls.length;
+    const requestCount = f.calls.length;
     failed.refresh(); await tick();
     assert.equal(await f.learning.refresh(), false);
     assert.equal(f.calls.length, requestCount, 'ordinary refresh cannot bypass an unfinished login');
-    assert.equal(f.cookieCalls.length, flushCount);
     app.render();
     const retry = app.loginButton('profile'); assert.ok(retry); assert.equal(retry.props.busy, false);
-    f.failFlush = false; f.failCapture = false; f.failMove = false; f.handler = null;
+    f.failCapture = false; f.failMove = false; f.handler = null;
     const retried = retry.props.onPress(); await authorize(f); await initialize(f);
     assert.equal(await retried, true);
-    assert.equal(f.cookieCalls.length, flushCount + 1, 'explicit login retries cookie saving');
+    assert.deepEqual(savedSession(f).account, recoveryAccount, 'explicit login retries cookie saving');
     assert.equal(app.render().data.authenticated, true);
     assert.equal(app.loginButton('profile'), undefined);
     assert.deepEqual(app.navigations, []);
@@ -1556,7 +1560,7 @@ test('one modal stays open across both pages, token exchange, LNT login and cook
   assert.deepEqual(host.disposed, ['stop', 'history', 'form', 'cache', 'stop', 'history', 'form', 'cache']);
 });
 
-test('cancelling between pages aborts requests and cannot reopen the modal or publish late data', async () => {
+test('cancelling during token exchange or cookie capture cannot reopen the modal or publish late data', async () => {
   const f = fixture(), gate = deferred();
   f.handler = async url => { if (url.endsWith('/token')) await gate.promise; };
   const login = f.learning.login(); await authorize(f);
@@ -1570,20 +1574,20 @@ test('cancelling between pages aborts requests and cannot reopen the modal or pu
   assert.equal(f.calls.length, 1); assert.equal(f.files.size, 0);
   assert.equal(f.schoolBrowser.getSnapshot(), null);
 
-  for (const failFlush of [false, true]) {
-    const flushing = fixture(); flushing.flushGate = deferred(); flushing.failFlush = failFlush;
+  for (const failCapture of [false, true]) {
+    const capturing = fixture(); capturing.captureGate = deferred(); capturing.failCapture = failCapture;
     let authorized = 0;
-    const finishing = flushing.learning.login(() => authorized++); await authorize(flushing); await initialize(flushing);
-    assert.deepEqual(flushing.cookieCalls, ['flush']);
-    flushing.schoolBrowser.cancel(); flushing.flushGate.resolve();
+    const finishing = capturing.learning.login(() => authorized++); await authorize(capturing); await initialize(capturing);
+    assert.equal(capturing.calls.length, 1);
+    capturing.schoolBrowser.cancel(); capturing.captureGate.resolve();
     assert.equal(await finishing, false);
     assert.equal(authorized, 0);
-    assert.equal(flushing.learning.getSnapshot().authenticated, false);
-    assert.equal(flushing.learning.getSnapshot().message, '已取消学校登录');
-    assert.equal(flushing.calls.some(call => call.url.endsWith('/profile')), false);
-    assert.equal(flushing.files.size, 0);
-    assert.equal(flushing.schoolBrowser.getSnapshot(), null);
-    assert.equal(flushing.logs.some(([, tag]) => tag === '[school-login]'), false);
+    assert.equal(capturing.learning.getSnapshot().authenticated, false);
+    assert.equal(capturing.learning.getSnapshot().message, '已取消学校登录');
+    assert.equal(capturing.calls.length, 1);
+    assert.equal(capturing.files.size, 0);
+    assert.equal(capturing.schoolBrowser.getSnapshot(), null);
+    assert.equal(capturing.logs.some(([, tag]) => tag === '[school-login]'), false);
   }
 });
 
