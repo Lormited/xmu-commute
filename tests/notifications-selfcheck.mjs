@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import * as schedule from '../src/schedule.ts';
 import * as learning from '../src/learning.ts';
-import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
@@ -55,9 +54,8 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
     async advance(at) { now = at; for (const [timer, time] of timers) if (time <= now) { timers.delete(timer); timer(); } await flush(); },
     stop(token = current) { if (current === token) current = null; onStop?.({ token }); },
     read: async () => ({ rollcalls: [pending, { ...pending, rollcall_id: 82, status: 'on_call_fine' }, { ...pending, rollcall_id: 83 }] }),
-    async post(token, identifier, endAt, rollcallId) {
+    async post(token, identifier, endAt) {
       if (!job.isCurrent(token) || now >= endAt) return false;
-      assert.equal(rollcallId, '81');
       notices.push(identifier);
       return true;
     },
@@ -79,7 +77,7 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
     } };
   Object.assign(fixture, load('../src/school-reminder-device.ts', {
     'react-native': { Platform: { OS: 'android' } }, expo: { requireOptionalNativeModule: () => job },
-    'expo-crypto': { randomUUID }, 'expo-file-system': { File, Paths: { document: '' } },
+    'expo-file-system': { File, Paths: { document: '' } },
     'expo-file-system/legacy': { moveAsync: options => fixture.moveFile(options) },
     'expo-notifications': { AndroidImportance: { HIGH: 4, NONE: 0 }, AndroidNotificationVisibility: { PRIVATE: 0 },
       setNotificationChannelAsync: async () => ({ importance: 4 }), getNotificationChannelAsync: async () => ({ importance: 4 }),
@@ -91,7 +89,7 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
   return fixture;
 }
 
-test('the Job saves and publishes pending activities before posting, then saves an empty result', async () => {
+test('the Job saves and publishes changes before posting and skips unchanged lists', async () => {
   const fixture = schoolFixture();
   await fixture.schoolLearning.restore();
   await fixture.setSchoolReminders(true);
@@ -99,8 +97,8 @@ test('the Job saves and publishes pending activities before posting, then saves 
   const published = [];
   const unsubscribe = fixture.schoolLearning.subscribe(() => published.push(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id)));
   const save = fixture.saveLearning;
-  let release;
-  fixture.saveLearning = value => new Promise(resolve => { release = () => resolve(save(value)); });
+  let release, saves = 0;
+  fixture.saveLearning = value => new Promise(resolve => { saves++; release = () => resolve(save(value)); });
   const running = fixture.runSchoolReminderJob('job-1');
   await flush();
   assert.equal(typeof release, 'function');
@@ -111,10 +109,23 @@ test('the Job saves and publishes pending activities before posting, then saves 
   assert.deepEqual(published, [['81']]);
   assert.deepEqual(JSON.parse(fixture.files.get('learning')).rollcalls.map(item => item.id), ['81']);
   assert.equal(fixture.notices.length, 1);
-  fixture.saveLearning = save;
+  fixture.saveLearning = value => { saves++; return save(value); };
+  await fixture.advance(monday(10) + 59999);
+  assert.equal(fixture.calls.length, 1);
+  await fixture.advance(monday(10, 1));
+  assert.equal(fixture.calls.length, 2);
+  assert.equal(saves, 1);
+  assert.deepEqual(published, [['81']]);
+  fixture.read = async () => ({ rollcalls: [{ rollcall_id: 81, course_id: 1, is_radar: true }] });
+  await fixture.advance(monday(10, 2));
+  assert.equal(fixture.schoolLearning.getSnapshot().rollcalls.at(0).method, 'radar');
+  assert.equal(JSON.parse(fixture.files.get('learning')).rollcalls.at(0).method, 'radar');
   fixture.read = async () => ({ rollcalls: [] });
-  await fixture.advance(monday(10) + 30000);
-  assert.deepEqual(published, [['81'], []]);
+  await fixture.advance(monday(10, 3));
+  await fixture.advance(monday(10, 4));
+  assert.equal(fixture.calls.length, 5);
+  assert.equal(saves, 3);
+  assert.deepEqual(published, [['81'], ['81'], []]);
   assert.deepEqual(JSON.parse(fixture.files.get('learning')).rollcalls, []);
   assert.equal(fixture.notices.length, 1);
   unsubscribe();
@@ -123,17 +134,17 @@ test('the Job saves and publishes pending activities before posting, then saves 
 });
 
 for (const stage of ['submitting', 'receipt open', 'receipt dismissed']) {
-  test(`the Job skips posting when attendance is ${stage} during notice saving`, async () => {
+  test(`the Job skips posting when attendance is ${stage} during the permission check`, async () => {
     const fixture = schoolFixture();
     await fixture.schoolLearning.restore();
     await fixture.setSchoolReminders(true);
     await fixture.advance(monday(10));
-    const moveFile = fixture.moveFile;
-    const noticeSave = Promise.withResolvers();
-    fixture.moveFile = async options => { await noticeSave.promise; await moveFile(options); };
+    const permission = Promise.withResolvers();
+    let permissionReads = 0;
+    fixture.getPermissions = async () => ++permissionReads === 1 ? { granted: true } : permission.promise;
     const running = fixture.runSchoolReminderJob('job-1');
     await flush();
-    assert.ok(fixture.files.has('school-reminders.tmp'), 'the Job is saving the notice before posting');
+    assert.equal(permissionReads, 2);
     assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id), ['81']);
 
     const receipt = Promise.withResolvers();
@@ -146,7 +157,7 @@ for (const stage of ['submitting', 'receipt open', 'receipt dismissed']) {
     }
     if (stage === 'receipt dismissed') fixture.schoolLearning.attendanceDismissed({ ids: ['81'] });
 
-    noticeSave.resolve();
+    permission.resolve({ granted: true });
     await flush();
     assert.deepEqual(fixture.notices, []);
     if (stage === 'submitting') {
@@ -154,7 +165,7 @@ for (const stage of ['submitting', 'receipt open', 'receipt dismissed']) {
       assert.equal((await submitted).result, 'success');
     }
     if (stage === 'receipt dismissed') {
-      await fixture.advance(monday(10) + 30000);
+      await fixture.advance(monday(10, 1));
       assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
       assert.deepEqual(JSON.parse(fixture.files.get('learning')).rollcalls, []);
     }
@@ -182,7 +193,7 @@ test('a starting Job shares the foreground activity read and a newer poll still 
   assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id), ['81']);
   assert.equal(fixture.notices.length, 1);
   fixture.read = async () => ({ rollcalls: [] });
-  await fixture.advance(monday(10) + 30000);
+  await fixture.advance(monday(10, 1));
   terms.resolve({ semesters: [{ id: 1, name: '本学期', is_active: true }] });
   assert.equal(await refreshing, true);
   assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
@@ -196,6 +207,26 @@ test('a starting Job shares the foreground activity read and a newer poll still 
   fixture.read = async () => ({ rollcalls: [{ id: 81, course_id: 1, is_number: true }] });
   assert.equal(await fixture.schoolLearning.refresh(), true);
   assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id), ['81']);
+});
+
+test('an unchanged Job result still supersedes an older ordinary batch', async () => {
+  const fixture = schoolFixture(), terms = Promise.withResolvers();
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  fixture.readTerms = () => terms.promise;
+  const refreshing = fixture.schoolLearning.refresh();
+  await flush();
+  assert.equal(fixture.calls.at(-1)[0], 'lntTerms');
+
+  fixture.read = async () => ({ rollcalls: [] });
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  fixture.stop();
+  await running;
+  terms.resolve({ semesters: [{ id: 1, name: '本学期', is_active: true }] });
+  assert.equal(await refreshing, true);
+  assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
 });
 
 test('stopping a starting Job releases its shared wait while foreground keeps its batch result', async () => {
@@ -259,7 +290,7 @@ test('history and a live receipt preserve an empty Job result when saving', asyn
   const submitted = fixture.schoolLearning.submitNumber('81', '0206');
   const history = fixture.schoolLearning.refreshHistory();
   fixture.read = async () => ({ rollcalls: [] });
-  await fixture.advance(monday(10) + 30000);
+  await fixture.advance(monday(10, 1));
   assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
   finishHistory({ rollcalls: [] });
   assert.equal(await history, true);
@@ -289,7 +320,8 @@ test('the persisted enabled Job reads only pending LNT activities and dedupes af
   assert.equal(headless.calls[0][0], 'rollcalls');
   assert.equal(headless.calls[0][1].lntId, 41);
   assert.equal(headless.notices.length, 1);
-  assert.match(headless.notices[0], /^[\da-f-]{36}$/);
+  assert.equal(headless.notices[0], 'school-attendance:41:81');
+  assert.deepEqual(JSON.parse(headless.files.get('school-reminders.json')).sent, ['81']);
   headless.stop();
   await running;
   assert.deepEqual(headless.finished, []);
@@ -301,6 +333,69 @@ test('the persisted enabled Job reads only pending LNT activities and dedupes af
   await restarted.advance(monday(11));
   await resumed;
   assert.deepEqual(restarted.finished, [['job-1', null]]);
+});
+
+test('one poll reads reminder records once and saves each posted activity before the next', async () => {
+  const fixture = schoolFixture(), reminderFile = 'school-reminders.json';
+  const activities = async () => ({ rollcalls: [81, 84, 85].map(rollcall_id => ({ rollcall_id, course_id: 1 })) });
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  let reads = 0;
+  fixture.read = async () => { reads = 0; return activities(); };
+  const readFile = fixture.readFile, post = fixture.post;
+  fixture.readFile = uri => { if (uri === reminderFile) reads++; return readFile(uri); };
+  const sentBeforePost = [];
+  fixture.post = async (...args) => {
+    sentBeforePost.push(JSON.parse(fixture.files.get(reminderFile)).sent);
+    if (args[3] === '85') throw Error('UNAVAILABLE');
+    return post(...args);
+  };
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  fixture.stop();
+  await running;
+  assert.equal(reads, 1);
+  assert.deepEqual(sentBeforePost, [[], ['81'], ['81', '84']]);
+  assert.deepEqual(JSON.parse(fixture.files.get(reminderFile)).sent, ['81', '84']);
+
+  const restarted = schoolFixture(fixture.files);
+  restarted.read = activities;
+  await restarted.advance(monday(10, 1));
+  const resumed = restarted.runSchoolReminderJob('job-1');
+  await flush();
+  restarted.stop();
+  await resumed;
+  assert.deepEqual(restarted.notices, ['school-attendance:41:85']);
+  assert.deepEqual(JSON.parse(fixture.files.get(reminderFile)).sent, ['81', '84', '85']);
+});
+
+test('a timetable change can replace the Job between notices in the same poll', async () => {
+  const fixture = schoolFixture(), firstPosted = Promise.withResolvers();
+  await fixture.schoolLearning.restore();
+  await fixture.schoolLearning.setRefreshSchedule(true);
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  fixture.read = async () => ({ rollcalls: [81, 84].map(rollcall_id => ({ rollcall_id, course_id: 1 })) });
+  const post = fixture.post;
+  fixture.post = async (...args) => {
+    const posted = await post(...args);
+    if (args[3] === '81') await firstPosted.promise;
+    return posted;
+  };
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  assert.deepEqual(fixture.notices, ['school-attendance:41:81']);
+
+  fixture.scheduleRows = [lesson('course', '14:00', '14:50')];
+  assert.equal(await fixture.schoolLearning.refresh(), true);
+  const rescheduling = fixture.syncSchoolReminders();
+  firstPosted.resolve();
+  assert.equal(await rescheduling, true);
+  await running;
+  assert.deepEqual(fixture.scheduled, [monday(9, 50), monday(13, 50)]);
+  assert.deepEqual(fixture.notices, ['school-attendance:41:81']);
+  assert.deepEqual(JSON.parse(fixture.files.get('school-reminders.json')).sent, ['81']);
 });
 
 test('an unacknowledged notice retries with the same identifier after restart', async () => {
@@ -330,6 +425,10 @@ test('failed notification dispatch retries the same identifier within its window
   const fixture = schoolFixture();
   await fixture.schoolLearning.restore();
   assert.equal(await fixture.setSchoolReminders(true), true);
+  const reminderSettings = fixture.files.get('school-reminders.json');
+  const move = fixture.moveFile;
+  let savedNotices = 0;
+  fixture.moveFile = options => { savedNotices++; return move(options); };
   const post = fixture.post;
   const attempts = [];
   fixture.post = async (...args) => {
@@ -343,13 +442,17 @@ test('failed notification dispatch retries the same identifier within its window
   await flush();
   assert.equal(attempts.length, 1);
   assert.equal(fixture.notices.length, 0);
-  assert.deepEqual(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'], { identifier: attempts[0], delivered: false });
+  assert.equal(fixture.files.get('school-reminders.json'), reminderSettings);
+  assert.equal(savedNotices, 0);
   assert.deepEqual(fixture.dismissed, []);
-  await fixture.advance(monday(10) + 30000);
-  assert.equal(fixture.calls.length, 1);
   await fixture.advance(monday(10, 1));
+  assert.equal(fixture.calls.length, 1);
+  const published = fixture.schoolLearning.getSnapshot();
+  await fixture.advance(monday(10, 2));
   assert.equal(fixture.notices.length, 1);
   assert.deepEqual(attempts, [fixture.notices[0], fixture.notices[0]]);
+  assert.equal(savedNotices, 1);
+  assert.strictEqual(fixture.schoolLearning.getSnapshot(), published);
   fixture.stop();
   await running;
 });
@@ -509,7 +612,7 @@ for (const [action, stop] of [
     const running = fixture.runSchoolReminderJob('job-1').then(() => { stopped = true; });
     await flush();
     assert.ok(deliver);
-    assert.equal(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'].identifier, identifier);
+    assert.deepEqual(JSON.parse(fixture.files.get('school-reminders.json')).sent, []);
     const cancellation = stop(fixture);
     await flush();
     const wasCurrent = fixture.isCurrent('job-1'), hadStopped = stopped;
@@ -522,7 +625,7 @@ for (const [action, stop] of [
     assert.deepEqual(fixture.notices, []);
     assert.deepEqual(fixture.dismissed, []);
     assert.deepEqual(fixture.finished, action === 'window expiry' ? [['job-1', null]] : []);
-    if (action !== 'logout') assert.equal(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'].delivered, false);
+    if (action !== 'logout') assert.deepEqual(JSON.parse(fixture.files.get('school-reminders.json')).sent, []);
     if (action === 'window expiry') return;
     const restarted = schoolFixture(fixture.files);
     await restarted.advance(monday(10, 1));

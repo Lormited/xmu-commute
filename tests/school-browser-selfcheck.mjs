@@ -664,18 +664,18 @@ test('invalid or failed later course pages retain the entire saved learning batc
 });
 
 test('two-site login saves the verified session before success and the first timetable request', async () => {
-  const f = fixture(); let authorized = 0;
-  let authorizedCache, authorizedRequests;
+  const f = fixture(); let authorized;
   const commit = deferred();
   f.moveGate = commit;
-  const login = f.learning.login(() => {
-    authorized++;
-    authorizedCache = f.files.get(cacheName);
-    authorizedRequests = f.calls.map(call => call.url);
+  const unsubscribe = f.learning.subscribe(() => {
+    if (f.learning.getSnapshot().authenticated) {
+      authorized ??= { cache: f.files.get(cacheName), requests: f.calls.map(call => call.url) };
+    }
   });
+  const login = f.learning.login();
   const loginRequests = [IDENTITY + '/token', lntRoot + 'api/login?login=access_token', lntRoot + 'api/profile', academicProfileUrl];
   const auth = await authorize(f);
-  assert.equal(authorized, 0, 'a callback or token alone is not authentication success');
+  assert.equal(authorized, undefined, 'a callback or token alone is not authentication success');
   const body = new URLSearchParams(f.calls[0].options.body);
   assert.equal(body.get('code'), 'single-code');
   assert.equal(body.get('client_id'), 'TronClassH5');
@@ -683,7 +683,7 @@ test('two-site login saves the verified session before success and the first tim
   assert.equal(createHash('sha256').update(body.get('code_verifier')).digest('base64url'), auth.searchParams.get('code_challenge'));
   await initialize(f);
   try {
-    assert.equal(authorized, 0);
+    assert.equal(authorized, undefined);
     assert.deepEqual(f.calls.map(call => call.url), loginRequests);
     assert.deepEqual(JSON.parse(f.calls[1].options.body), { access_token: 'one-use-access-token', org_id: 1 });
     assert.match(requestCookie(f.calls[2]), /lnt_session=manual-lnt/);
@@ -693,9 +693,9 @@ test('two-site login saves the verified session before success and the first tim
     assert.deepEqual(f.cacheMoves, []);
   } finally { commit.resolve(); }
   assert.equal(await login, true);
+  unsubscribe();
   assert.deepEqual(f.cacheMoves, [cacheName, cacheName]);
-  assert.equal(authorized, 1);
-  assert.deepEqual(authorizedRequests, loginRequests);
+  assert.deepEqual(authorized.requests, loginRequests);
   assert.deepEqual(f.calls.map(call => call.url), [
     ...loginRequests, lntRoot + 'api/todos?no-intercept=true', rollcallsUrl, lntRoot + 'api/semesters', lntRoot + 'api/my-courses',
     'https://jw.xmu.edu.cn' + timetablePaths[0], 'https://jw.xmu.edu.cn' + timetablePaths[1] + '?XNXQDM=20261',
@@ -704,8 +704,8 @@ test('two-site login saves the verified session before success and the first tim
   assert.equal(f.schoolBrowser.getSnapshot(), null);
   assert.deepEqual(f.cookieCalls, [], 'session saving does not flush the WebView cookie store');
   const stored = savedSession(f);
-  assert.deepEqual(JSON.parse(authorizedCache), { version: 3, learning: null, session: stored });
-  const sessionOnly = await fixture(new Map([[cacheName, authorizedCache]])).schoolDevice.load();
+  assert.deepEqual(JSON.parse(authorized.cache), { version: 3, learning: null, session: stored });
+  const sessionOnly = await fixture(new Map([[cacheName, authorized.cache]])).schoolDevice.load();
   assert.equal(sessionOnly.raw, null);
   assert.deepEqual({ ...sessionOnly.account }, recoveryAccount);
   assert.deepEqual(stored.account, recoveryAccount);
@@ -734,30 +734,29 @@ test('two-site login saves the verified session before success and the first tim
 });
 test('invalid token, failed LNT login, and failed JW identity checks cannot report success', async () => {
   for (const phase of ['token', 'academic', 'login']) {
-    const f = fixture(); let authorized = 0;
+    const f = fixture();
     f.handler = async url => {
       if (phase === 'token' && url.endsWith('/token')) return response(url, {});
       if (phase === 'academic' && url === academicProfileUrl) return response(url, '<html>login</html>', 200, 'text/html');
       if (phase === 'login' && url.includes('/api/login')) return response(url, {}, 201);
     };
-    const login = f.learning.login(() => authorized++);
+    const login = f.learning.login();
     await authorize(f);
     if (phase !== 'token') await initialize(f);
     assert.equal(await login, false);
-    assert.equal(authorized, 0);
+    assert.equal(f.learning.getSnapshot().authenticated, false);
     assert.equal(f.files.size, 0);
     assert.equal(f.calls.some(call => call.url.endsWith('/profile')), phase === 'academic');
     assert.equal(f.schoolBrowser.getSnapshot(), null);
   }
 });
 test('an invalid JW term response fails the first timetable update after authorization', async () => {
-  const f = fixture(); let authorized = 0;
+  const f = fixture();
   const termsUrl = 'https://jw.xmu.edu.cn' + timetablePaths[0];
   f.handler = async url => { if (url === termsUrl) return response(url, {}); };
-  const login = f.learning.login(() => authorized++);
+  const login = f.learning.login();
   await authorize(f); await initialize(f);
   assert.equal(await login, false);
-  assert.equal(authorized, 1);
   assert.equal(f.learning.getSnapshot().authenticated, true);
   assert.match(f.learning.getSnapshot().message, /教务课表更新失败/);
   assert.equal(f.calls.at(-1).url, termsUrl);
@@ -774,7 +773,6 @@ test('manual login verifies the JW session own student number and only saves sco
   ]) {
     const f = await boundFixture(), identity = deferred();
     const previous = f.files.get(cacheName);
-    let authorized = 0;
     f.handler = async url => {
       if (url !== academicProfileUrl) return;
       await identity.promise;
@@ -783,7 +781,7 @@ test('manual login verifies the JW session own student number and only saves sco
         ['Set-Cookie', 'wrong=scope; Domain=lnt.xmu.edu.cn; Path=/; Secure'],
       ]);
     };
-    const login = f.learning.login(() => authorized++);
+    const login = f.learning.login();
     await authorize(f); await initialize(f);
     try {
       const call = f.calls.at(-1);
@@ -791,11 +789,11 @@ test('manual login verifies the JW session own student number and only saves sco
       assert.equal(call.options.method ?? 'GET', 'GET');
       assert.equal(call.options.body, undefined);
       assert.equal(requestCookie(call), 'JSESSIONID=web-jw');
-      assert.equal(authorized, 0);
+      assert.equal(f.learning.getSnapshot().authenticated, false);
       assert.deepEqual(f.cacheMoves, []);
     } finally { identity.resolve(); }
     assert.equal(await login, valid);
-    assert.equal(authorized, Number(valid));
+    assert.equal(f.learning.getSnapshot().authenticated, valid);
     assert.equal(f.calls.filter(call => call.url === academicProfileUrl).length, 1);
     if (!valid) {
       assert.equal(f.learning.getSnapshot().needsLogin, true);
@@ -920,11 +918,9 @@ test('authentication, cookie snapshot or cache storage failure preserves cached 
     f.failCapture = phase === 'snapshot';
     f.failMove = phase === 'storage';
     f.handler = async url => phase === 'token' && url.endsWith('/token') ? response(url, {}, 503) : undefined;
-    let authorized = 0;
-    const login = f.learning.login(() => authorized++);
+    const login = f.learning.login();
     await authorize(f); if (phase !== 'token') await initialize(f);
     assert.equal(await login, false);
-    assert.equal(authorized, 0);
     const failed = app.render();
     assert.equal(failed.data.authenticated, false);
     assert.equal(failed.data.needsLogin, true);
@@ -964,16 +960,16 @@ test('manual login replaces the session and keeps learning or preferences only f
     await f.learning.restore();
     const account = { lntId, studentNumber: '009999', name: '本次登录同学' };
     const business = deferred(), reading = deferred();
-    let authorized;
     f.handler = async url => {
       if (url.endsWith('/profile')) return response(url, { id: lntId, user_no: account.studentNumber, name: account.name });
       if (url === academicProfileUrl) return response(url, { data: [{ XH: account.studentNumber }] });
       if (url.includes('/todos')) { reading.resolve(); await business.promise; return response(url, {}, 503); }
     };
-    const login = f.learning.login(() => { authorized = f.learning.getSnapshot(); });
+    const login = f.learning.login();
     await authorize(f); await initialize(f);
     try {
       assert.equal(await Promise.race([reading.promise.then(() => true), login]), true, 'login starts business reads');
+      const authorized = f.learning.getSnapshot();
       assert.equal(authorized.authenticated, true);
       assert.deepEqual({ ...authorized.account }, account);
       assert.deepEqual(authorized.todos, keepBatch ? [todo] : []);
@@ -1495,14 +1491,13 @@ function browserHost(f) {
 
 test('one modal stays open across both pages, token exchange, LNT login and cookie persistence', async () => {
   const f = fixture(), host = browserHost(f), token = deferred(), lnt = deferred();
-  let authorized = 0;
   const states = [];
   f.schoolBrowser.subscribe(() => states.push(f.schoolBrowser.getSnapshot()?.kind ?? null));
   f.handler = async url => {
     if (url.endsWith('/token')) await token.promise;
     if (url.includes('/api/login')) await lnt.promise;
   };
-  const login = f.learning.login(() => authorized++); await tick();
+  const login = f.learning.login(); await tick();
   const renderModal = () => {
     const node = host.SchoolBrowserHost();
     return typeof node?.type === 'function' ? node.type(node.props) : node;
@@ -1533,14 +1528,12 @@ test('one modal stays open across both pages, token exchange, LNT login and cook
   assert.equal(f.calls.some(call => call.url.endsWith('/profile')), false);
   f.beforeMove = () => {
     if (f.cacheMoves.length) return;
-    assert.equal(f.learning.getSnapshot().authenticated, false);
-    assert.equal(authorized, 0, 'success waits for cookie saving');
+    assert.equal(f.learning.getSnapshot().authenticated, false, 'success waits for cookie saving');
     assert.equal(f.calls.some(call => call.url.endsWith('/profile')), true);
     assert.equal(host.SchoolBrowserHost().type, modal.type, 'cookie persistence stays inside the same modal');
   };
   lnt.resolve(); assert.equal(await login, true);
   assert.deepEqual(f.cacheMoves, [cacheName, cacheName]);
-  assert.equal(authorized, 1);
   assert.equal(f.learning.getSnapshot().authenticated, true);
   assert.equal(host.SchoolBrowserHost(), null);
   assert.deepEqual(states, ['authorize', 'pending', 'academic', 'pending', null]);
@@ -1563,12 +1556,10 @@ test('cancelling during token exchange or cookie capture cannot reopen the modal
 
   for (const failCapture of [false, true]) {
     const capturing = fixture(); capturing.captureGate = deferred(); capturing.failCapture = failCapture;
-    let authorized = 0;
-    const finishing = capturing.learning.login(() => authorized++); await authorize(capturing); await initialize(capturing);
+    const finishing = capturing.learning.login(); await authorize(capturing); await initialize(capturing);
     assert.equal(capturing.calls.length, 1);
     capturing.schoolBrowser.cancel(); capturing.captureGate.resolve();
     assert.equal(await finishing, false);
-    assert.equal(authorized, 0);
     assert.equal(capturing.learning.getSnapshot().authenticated, false);
     assert.equal(capturing.learning.getSnapshot().message, '已取消学校登录');
     assert.equal(capturing.calls.length, 1);
@@ -1582,14 +1573,13 @@ test('cancelling manual verification preserves the previous session on restart',
   const f = await boundFixture(), verification = deferred();
   const previous = f.files.get(cacheName);
   f.handler = async url => { if (url.endsWith('/profile')) await verification.promise; };
-  let authorized = 0;
-  const login = f.learning.login(() => authorized++);
+  const login = f.learning.login();
   await authorize(f); await initialize(f);
   assert.equal(f.calls.at(-1).url, lntRoot + 'api/profile');
   f.schoolBrowser.cancel();
   verification.resolve();
   assert.equal(await login, false);
-  assert.equal(authorized, 0);
+  assert.equal(f.learning.getSnapshot().authenticated, false);
   assert.deepEqual(f.cacheMoves, []);
   assert.equal(f.files.get(cacheName), previous);
   const reopened = fixture(f.files);
@@ -1605,10 +1595,9 @@ test('Android Back cancels login staging but waits for a dispatched replacement 
     const previous = f.files.get(cacheName);
     const committing = phase === 'moveGate';
     const succeeds = committing && !failMove;
-    let authorized = 0;
     f[phase] = gate;
     f.failMove = failMove;
-    const login = f.learning.login(() => authorized++);
+    const login = f.learning.login();
     await authorize(f); await initialize(f);
     try {
       const modal = host.SchoolBrowserHost();
@@ -1617,10 +1606,10 @@ test('Android Back cancels login staging but waits for a dispatched replacement 
       assert.equal(f.files.get(cacheName), previous);
       modal.props.onRequestClose();
       assert.equal(host.SchoolBrowserHost()?.type ?? null, committing ? modal.type : null);
-      assert.equal(authorized, 0);
+      assert.equal(f.learning.getSnapshot().authenticated, false);
     } finally { gate.resolve(); }
     assert.equal(await login, succeeds);
-    assert.equal(authorized, Number(succeeds));
+    assert.equal(f.learning.getSnapshot().authenticated, succeeds);
     assert.deepEqual(f.cacheMoves, succeeds ? [cacheName, cacheName] : []);
     if (!succeeds) assert.equal(f.files.get(cacheName), previous);
     if (failMove) assert.equal(f.logs.find(([, tag]) => tag === '[school-login]')?.[2].code, 'COOKIE_STORAGE');

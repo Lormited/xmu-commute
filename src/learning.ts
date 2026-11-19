@@ -155,6 +155,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
   const publish = (patch: Partial<LearningSnapshot>) => { state = { ...state, ...patch }; listeners.forEach(listener => listener()); };
   let generation = 0;
   let identity = 0;
+  let pollRevision = 0;
   let foregroundRollcalls: { identity: number; accountId: number; result: Promise<Rollcall[]> } | undefined;
   const submissions = new Map<string, { dismissed: boolean; task: Promise<AttendanceReceipt> }>();
   let writing = Promise.resolve();
@@ -170,9 +171,10 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     publish({ authenticated: false, needsLogin: true, refreshing: false, historyRefreshing: false, message });
   }
   const completed = () => ({ ...state.attendance, ...state.pendingAttendance });
-  function saveAttendance(rollcalls = state.rollcalls) {
-    const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, history, historyAt } = state;
-    return device.save(JSON.stringify({ version: 1, account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, rollcalls, history, historyAt, attendance: completed() }));
+  function saveLearning(changes: Partial<SavedLearning> = {}) {
+    const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, rollcalls, history, historyAt } = state;
+    return device.save(JSON.stringify({ version: 1, account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt,
+      refreshSchedule, rollcalls, history, historyAt, attendance: completed(), ...changes }));
   }
   function canNotifyRollcall(id: string) {
     return !Object.hasOwn(state.attendance, id) && !Object.hasOwn(state.pendingAttendance, id) && !submissions.has(id);
@@ -197,9 +199,17 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     const saved = writing.then(async () => {
       if (!valid() || !sameSession() || state.todosAt === null) return [];
       const rollcalls = activities.filter(({ id }) => !Object.hasOwn(state.attendance, id));
-      await saveAttendance(rollcalls);
-      if (!sameIdentity()) return [];
-      publish({ rollcalls });
+      const unchanged = rollcalls.length === state.rollcalls.length && rollcalls.every((activity, index) => {
+        const previous = state.rollcalls[index];
+        return activity.id === previous.id && activity.courseId === previous.courseId && activity.method === previous.method
+          && activity.time === previous.time && activity.title === previous.title;
+      });
+      if (!unchanged) {
+        await saveLearning({ rollcalls });
+        if (!sameIdentity()) return [];
+      }
+      pollRevision++;
+      if (!unchanged) publish({ rollcalls });
       return valid() && sameSession() ? rollcalls : [];
     });
     writing = saved.then(() => {}, () => {});
@@ -209,7 +219,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     const version = identity;
     writing = writing.then(async () => {
       if (version !== identity || !state.account || state.todosAt === null) return;
-      await saveAttendance();
+      await saveLearning();
     }).catch(() => {
       if (version === identity) publish({ message: '签到结果已收到，但本机保存失败，请刷新核对' });
     });
@@ -252,7 +262,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     if (failure) throw failure.reason;
     return sortHistory(responses.flatMap(result => result.status === 'fulfilled' ? result.value : []));
   }
-  function update(login: boolean, onAuthorized?: () => void): Promise<boolean> {
+  function update(login: boolean): Promise<boolean> {
     if (clearing || cleanupFailed) return Promise.resolve(false);
     if (operation && (!login || state.loggingIn)) return operation;
     if (!login && !state.authenticated) return Promise.resolve(false);
@@ -278,7 +288,6 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
           } catch { restoreFailed = true; }
           authorized = true;
           publish({ ...empty, ...saved, account, loggingIn: true, refreshing: true, authenticated: true });
-          onAuthorized?.();
         }
         if (!current(version)) return false;
         const { account } = state;
@@ -287,7 +296,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
         const todos = todosFrom(await device.read('todos', undefined, account));
         if (!current(version)) return false;
         failure = 'LNT 进行中签到更新失败，已保留原数据';
-        const rollcallsAtReadStart = state.rollcalls;
+        const revisionAtReadStart = pollRevision;
         let rollcalls: Rollcall[] | null = null;
         if (fullBatch || !pollingRollcalls()) {
           const reading = { identity, accountId: account.lntId, result: device.read('rollcalls', undefined, account).then(rollcallsFrom) };
@@ -316,13 +325,14 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
         failure = '学校本机数据保存失败，已保留原数据';
         const saved = writing.then(async () => {
           if (!current(version)) return false;
-          const latestRollcalls = rollcalls === null || (!fullBatch && state.rollcalls !== rollcallsAtReadStart)
+          const latestRollcalls = rollcalls === null || (!fullBatch && pollRevision !== revisionAtReadStart)
             ? state.rollcalls : rollcalls;
-          const next: SavedLearning = { version: 1, account, todos, todosAt: updatedAt, term, courses, coursesAt: updatedAt, schedule, scheduleAt, refreshSchedule: state.refreshSchedule, rollcalls: latestRollcalls, attendance: completed(), history, historyAt };
-          await device.save(JSON.stringify(next));
+          const next = { todos, todosAt: updatedAt, term, courses, coursesAt: updatedAt, schedule, scheduleAt,
+            rollcalls: latestRollcalls, history, historyAt };
+          await saveLearning(next);
           if (!current(version)) return false;
           restoreFailed = false;
-          publish({ todos, rollcalls: next.rollcalls, todosAt: next.todosAt, term, courses, coursesAt: next.coursesAt, schedule, scheduleAt, history, historyAt, ready: true, needsLogin: false });
+          publish({ ...next, ready: true, needsLogin: false });
           return true;
         });
         writing = saved.then(() => {}, () => {});
@@ -382,8 +392,8 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     if (operation) return operation.then(refreshHistory);
     if (historyOperation) return historyOperation;
     if (!state.authenticated) return Promise.resolve(false);
-    const { account, term, courses, todosAt, coursesAt } = state;
-    if (!account || !term || todosAt === null || coursesAt === null) {
+    const { account, courses, todosAt } = state;
+    if (!account || todosAt === null) {
       publish({ historyMessage: '请先刷新个人资料和当前学期课程' });
       return Promise.resolve(false);
     }
@@ -398,9 +408,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
         failure = '历史签到保存失败，已保留原数据';
         const saved = writing.then(async () => {
           if (!current(version)) return false;
-          const next: SavedLearning = { version: 1, account, term, courses, coursesAt,
-            todos: state.todos, todosAt, schedule: state.schedule, scheduleAt: state.scheduleAt, refreshSchedule: state.refreshSchedule, rollcalls: state.rollcalls, attendance: completed(), history, historyAt };
-          await device.save(JSON.stringify(next));
+          await saveLearning({ history, historyAt });
           if (!current(version)) return false;
           publish({ history, historyAt });
           return true;
@@ -427,7 +435,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     restore,
     refreshPendingRollcalls,
     canNotifyRollcall,
-    login: (onAuthorized?: () => void) => update(true, onAuthorized),
+    login: () => update(true),
     refresh: () => update(false),
     refreshHistory,
     async setRefreshSchedule(enabled: boolean): Promise<boolean> {
@@ -436,11 +444,8 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
       await restore();
       const saved = writing.then(async () => {
         if (version !== identity || clearing || cleanupFailed || restoreFailed) return false;
-        const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, rollcalls, history, historyAt } = state;
-        const data = account && term && todosAt !== null && coursesAt !== null
-          ? { version: 1, account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, history, historyAt, rollcalls, attendance: completed(), refreshSchedule: enabled }
-          : { version: 1, refreshSchedule: enabled };
-        await device.save(JSON.stringify(data));
+        if (state.todosAt !== null) await saveLearning({ refreshSchedule: enabled });
+        else await device.save(JSON.stringify({ version: 1, refreshSchedule: enabled }));
         if (version !== identity) return false;
         publish({ refreshSchedule: enabled, message: null });
         return true;

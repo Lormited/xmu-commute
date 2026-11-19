@@ -1,8 +1,8 @@
 import { requireOptionalNativeModule } from 'expo';
-import { randomUUID } from 'expo-crypto';
 import { File, Paths } from 'expo-file-system';
 import { moveAsync } from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
+import type { Rollcall } from './demo-data';
 import { createLearning, type Account } from './learning';
 import { nextReminderWindow } from './schedule';
 import { schoolDevice } from './school-device';
@@ -16,10 +16,9 @@ type NativeJob = {
   isCurrent(token: string): boolean;
   addListener(event: 'onStop', listener: (data: JobData) => void): { remove(): void };
 };
-type SavedNotice = { identifier: string; delivered: boolean };
-type SavedReminders = { accountId: number; enabled: boolean; issued: Record<string, SavedNotice> };
+type SavedReminders = { accountId: number; enabled: boolean; sent: string[] };
 const channelId = 'school-attendance';
-const developPollInterval = 30000;
+const pollInterval = 60_000;
 const job = Platform.OS === 'android' ? requireOptionalNativeModule<NativeJob>('SchoolReminderJob') : null;
 export const schoolRemindersAvailable = !!job;
 export const schoolLearning = createLearning(schoolDevice, Date.now, () => running?.scope?.valid() === true);
@@ -40,14 +39,13 @@ function currentAccount() {
   return ready && authenticated && !loggingIn ? account : null;
 }
 async function load(id: number): Promise<SavedReminders> {
-  const empty = { accountId: id, enabled: false, issued: {} };
+  const empty: SavedReminders = { accountId: id, enabled: false, sent: [] };
   const saved = file();
   if (!saved.exists) return empty;
   const value = JSON.parse(await saved.text()) as SavedReminders;
   if (!value || !Number.isSafeInteger(value.accountId) || value.accountId <= 0
-    || typeof value.enabled !== 'boolean' || !value.issued || typeof value.issued !== 'object' || Array.isArray(value.issued)
-    || !Object.values(value.issued).every(notice => typeof notice?.identifier === 'string' && notice.identifier.length === 36
-      && typeof notice.delivered === 'boolean')) throw Error('REMINDER_STORAGE');
+    || typeof value.enabled !== 'boolean' || !Array.isArray(value.sent)
+    || !value.sent.every(id => typeof id === 'string' && id.trim())) throw Error('REMINDER_STORAGE');
   return value.accountId === id ? value : empty;
 }
 async function save(value: SavedReminders) {
@@ -147,20 +145,21 @@ async function untilAborted<Result>(task: Promise<Result>, signal: AbortSignal) 
   finally { signal.removeEventListener('abort', abort); }
 }
 
-async function notify(job: NativeJob, token: string, account: Account, rollcallId: string, endAt: number, valid: () => boolean) {
-  await serialize(async () => {
+async function notifyRollcalls(job: NativeJob, token: string, account: Account, rollcalls: Rollcall[], endAt: number, valid: () => boolean) {
+  const saved = await serialize(async () => valid() ? load(account.lntId) : null);
+  if (!saved?.enabled) return;
+  for (const { id } of rollcalls) {
     if (!valid()) return;
-    const saved = await load(account.lntId);
-    const notice = Object.hasOwn(saved.issued, rollcallId) ? saved.issued[rollcallId] : undefined;
-    if (!saved.enabled || notice?.delivered || !valid() || !await permitted()) return;
-    if (!valid()) return;
-    const identifier = notice?.identifier ?? randomUUID();
-    if (!notice) await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: false } } });
-    if (!valid() || !schoolLearning.canNotifyRollcall(rollcallId)) return;
-    if (!await job.post(token, identifier, endAt, rollcallId)) return;
-    if (!valid()) { await (await notifications()).dismissNotificationAsync(identifier); return; }
-    await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: true } } });
-  });
+    if (saved.sent.includes(id)) continue;
+    await serialize(async () => {
+      if (!valid() || !await permitted() || !valid() || !schoolLearning.canNotifyRollcall(id)) return;
+      const identifier = `${channelId}:${account.lntId}:${id}`;
+      if (!await job.post(token, identifier, endAt, id)) return;
+      if (!valid()) { await (await notifications()).dismissNotificationAsync(identifier); return; }
+      saved.sent.push(id);
+      await save(saved);
+    });
+  }
 }
 
 export function runSchoolReminderJob(token: string): Promise<void> {
@@ -191,13 +190,10 @@ export function runSchoolReminderJob(token: string): Promise<void> {
       if (running?.token === token) running.scope = { ...window, valid };
       deadline = setTimeout(() => abort.abort(), window.end - now);
       while (valid()) {
-        let delay = developPollInterval;
+        let delay = pollInterval;
         try {
           const rollcalls = await untilAborted(schoolLearning.refreshPendingRollcalls(account, signal, valid), signal);
-          for (const { id } of rollcalls ?? []) {
-            if (!valid()) break;
-            await untilAborted(notify(job, token, account, id, window.end, valid), signal);
-          }
+          if (rollcalls?.length) await untilAborted(notifyRollcalls(job, token, account, rollcalls, window.end, valid), signal);
         } catch {
           delay *= 2;
         }

@@ -3,6 +3,7 @@ import { ScrollView, Text, View, useWindowDimensions, type ScrollViewInstance } 
 import { router } from 'expo-router';
 import { useDemo } from '@/demo-context';
 import { courseFor, methodLabel } from '@/demo-data';
+import { activeRollcalls } from '@/demo-state';
 import { currentCourseIndex, schoolScheduleView } from '@/schedule';
 import { TodayCourseCard } from '@/today-course-card';
 import { Glass, Icon, ResourceBlock, RowGroup, Screen, Section, StateCard, Tap, TodoRow, c, s } from '@/ui';
@@ -18,7 +19,7 @@ export default function Today() {
   const today = timetable.sessionsForWeek(timetable.currentWeek).filter(item => item.day === (real ? (courseAt.getDay() + 6) % 7 : 0))
     .sort((a, b) => a.start - b.start);
   const title = real ? todayDate.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).replace('星期', ' · 星期') : '10月26日 · 星期一';
-  const active = state.loggedIn && state.load === 'ready' ? state.rollcalls.filter(item => !state.attendance[item.id]) : [];
+  const active = activeRollcalls(state);
   const cardWidth = Math.min(Math.min(carouselWidth, 440) - 84, 300);
   const courseIndex = real ? currentCourseIndex(today, courseAt) : today.length ? 0 : -1;
   const courseId = today[courseIndex]?.id;

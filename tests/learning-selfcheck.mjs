@@ -56,11 +56,9 @@ test('login saves one account, preserves the school collection, and publishes on
   const f = fixture(), gate = deferred();
   const save = f.device.save;
   f.device.save = async value => { await gate.promise; await save(value); };
-  let authorized = 0;
-  const login = f.learning.login(() => authorized++);
+  const login = f.learning.login();
   assert.strictEqual(f.learning.login(), login);
   await tick();
-  assert.equal(authorized, 1);
   assert.equal(f.learning.getSnapshot().authenticated, true);
   assert.deepEqual(f.learning.getSnapshot().account, boundAccount);
   assert.equal(f.learning.getSnapshot().term, null);
