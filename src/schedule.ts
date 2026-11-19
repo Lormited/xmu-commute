@@ -94,8 +94,7 @@ export function nextReminderWindow(schedule: SchoolSchedule | null, now: number)
   if (!schedule) return null;
   const anchor = monday(new Date(schedule.weekAt));
   const view = schoolScheduleView({ schedule, courses: [] }, new Date(now));
-  let active: { start: number; end: number } | null = null;
-  let upcoming: { start: number; end: number } | null = null;
+  let next: { start: number; end: number } | null = null;
   for (const week of schedule.weeks) {
     if (week < view.currentWeek - 1) continue;
     for (const session of view.sessionsForWeek(week)) {
@@ -109,15 +108,10 @@ export function nextReminderWindow(schedule: SchoolSchedule | null, now: number)
       const start = timestamp(from) - 600000;
       const end = timestamp(to) + 600000;
       if (end <= now) continue;
-      if (start > now) {
-        if (!upcoming || start < upcoming.start || start === upcoming.start && end < upcoming.end) upcoming = { start, end };
-      } else if (!active || start > active.start || start === active.start && end < active.end) {
-        active = { start, end };
-      }
+      if (!next || start < next.start || start === next.start && end < next.end) next = { start, end };
     }
   }
-  if (!active) return upcoming;
-  return { start: active.start, end: upcoming ? Math.min(active.end, upcoming.start) : active.end };
+  return next;
 }
 export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'schedule'>, now = new Date()) {
   const schedule = data.schedule;

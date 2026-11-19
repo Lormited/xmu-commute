@@ -4,7 +4,7 @@ import { File, Paths } from 'expo-file-system';
 import { moveAsync } from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
 import { createLearning, type Account } from './learning';
-import { nextReminderWindow } from './schedule';
+import { nextReminderWindow, type SchoolSchedule } from './schedule';
 import { schoolDevice } from './school-device';
 
 type JobData = { token: string };
@@ -12,7 +12,7 @@ type NativeJob = {
   schedule(at: number): Promise<void>;
   cancel(): Promise<void>;
   finish(token: string, nextAt: number | null): Promise<void>;
-  post(token: string, identifier: string, endAt: number): Promise<boolean>;
+  post(token: string, identifier: string, endAt: number, rollcallId: string): Promise<boolean>;
   isCurrent(token: string): boolean;
   addListener(event: 'onStop', listener: (data: JobData) => void): { remove(): void };
 };
@@ -22,12 +22,13 @@ const channelId = 'school-attendance';
 const developPollInterval = 30000;
 const job = Platform.OS === 'android' ? requireOptionalNativeModule<NativeJob>('SchoolReminderJob') : null;
 export const schoolRemindersAvailable = !!job;
-export const schoolLearning = createLearning(schoolDevice);
+export const schoolLearning = createLearning(schoolDevice, Date.now, () => running?.scope?.valid() === true);
 const file = () => new File(Paths.document, 'school-reminders.json');
 const temporaryFile = () => new File(Paths.document, 'school-reminders.tmp');
 const notifications = () => import('expo-notifications');
 let pending = Promise.resolve();
-let running: { token: string; stop(): void; task: Promise<void> } | undefined;
+let running: { token: string; stop(): void; task: Promise<void>;
+  scope?: { schedule: SchoolSchedule | null; valid(): boolean } } | undefined;
 
 function serialize<Result>(work: () => Promise<Result>): Promise<Result> {
   const task = pending.then(work);
@@ -78,12 +79,15 @@ async function schedule(enabled: boolean) {
 
 export function syncSchoolReminders() {
   if (!schoolRemindersAvailable) return Promise.resolve(false);
-  running?.stop();
   return serialize(async () => {
     const { account } = schoolLearning.getSnapshot();
     const enabled = !!account && (await load(account.lntId)).enabled;
     const allowed = enabled && currentAccount()?.lntId === account?.lntId && await permitted();
-    await schedule(allowed && currentAccount()?.lntId === account?.lntId);
+    const accountId = currentAccount()?.lntId;
+    const scope = running?.scope;
+    if (allowed && scope?.valid() && scope.schedule === schoolLearning.getSnapshot().schedule) return enabled;
+    running?.stop();
+    await schedule(allowed && accountId === account?.lntId);
     return enabled;
   });
 }
@@ -122,17 +126,6 @@ export function clearSchoolReminders() {
   });
 }
 
-export async function openSchoolReminder(identifier: string, signal: AbortSignal) {
-  if (!schoolRemindersAvailable || typeof identifier !== 'string' || identifier.length !== 36 || signal.aborted) return null;
-  if (!await schoolLearning.restore()) return null;
-  const account = currentAccount();
-  if (!account || signal.aborted) return null;
-  const { issued } = await pending.then(() => load(account.lntId));
-  const id = Object.keys(issued).find(id => issued[id].identifier === identifier);
-  if (signal.aborted || currentAccount()?.lntId !== account.lntId || !id || id.startsWith('trial-')) return null;
-  return schoolLearning.openReminder(account, id, signal);
-}
-
 function wait(ms: number, signal: AbortSignal) {
   if (signal.aborted) return Promise.resolve();
   return new Promise<void>(resolve => {
@@ -153,7 +146,7 @@ async function untilAborted(task: Promise<void>, signal: AbortSignal) {
 
 async function notify(job: NativeJob, token: string, account: Account, rollcallId: string, endAt: number, valid: () => boolean) {
   await serialize(async () => {
-    if (!valid() || rollcallId.startsWith('trial-')) return;
+    if (!valid()) return;
     const saved = await load(account.lntId);
     const notice = Object.hasOwn(saved.issued, rollcallId) ? saved.issued[rollcallId] : undefined;
     if (!saved.enabled || notice?.delivered || !valid() || !await permitted()) return;
@@ -161,7 +154,7 @@ async function notify(job: NativeJob, token: string, account: Account, rollcallI
     const identifier = notice?.identifier ?? randomUUID();
     if (!notice) await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: false } } });
     if (!valid()) return;
-    if (!await job.post(token, identifier, endAt)) return;
+    if (!await job.post(token, identifier, endAt, rollcallId)) return;
     if (!valid()) { await (await notifications()).dismissNotificationAsync(identifier); return; }
     await save({ ...saved, issued: { ...saved.issued, [rollcallId]: { identifier, delivered: true } } });
   });
@@ -188,14 +181,16 @@ export function runSchoolReminderJob(token: string): Promise<void> {
       const account = currentAccount();
       if (!active() || !account || !(await load(account.lntId)).enabled || !await permitted() || !active()) return null;
       const now = Date.now();
-      const window = nextReminderWindow(schoolLearning.getSnapshot().schedule, now);
+      const { schedule } = schoolLearning.getSnapshot();
+      const window = nextReminderWindow(schedule, now);
       if (!window || window.start > now) return window?.start ?? null;
       const valid = () => active() && Date.now() < window.end && currentAccount()?.lntId === account.lntId;
+      if (running?.token === token) running.scope = { schedule, valid };
       deadline = setTimeout(() => abort.abort(), window.end - now);
       while (valid()) {
         let delay = developPollInterval;
         try {
-          const rollcalls = await schoolLearning.readPendingRollcalls(account, signal);
+          const rollcalls = await schoolLearning.refreshPendingRollcalls(account, signal, valid);
           for (const { id } of rollcalls) {
             if (!valid()) break;
             await untilAborted(notify(job, token, account, id, window.end, valid), signal);

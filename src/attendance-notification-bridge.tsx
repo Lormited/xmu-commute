@@ -1,35 +1,35 @@
 import { useEffect } from 'react';
 import { Platform } from 'react-native';
 import { router, useRootNavigationState } from 'expo-router';
+import type { NotificationResponse } from 'expo-notifications';
 import { useDemo } from './demo-context';
-import { attendanceDestination } from './attendance-reminders';
-import { watchAttendanceNotifications } from './attendance-trial-device';
-import { openSchoolReminder } from './school-reminder-device';
 
 export function AttendanceNotificationBridge() {
-  const { real, trial } = useDemo();
+  const { data: { ready } } = useDemo();
   const navigation = useRootNavigationState();
   useEffect(() => {
-    if (Platform.OS !== 'android' || !navigation?.key) return;
-    const scope = new AbortController();
-    let cleanup: (() => void) | undefined;
-    void watchAttendanceNotifications(async (value, identifier) => {
-      if ((value as { source?: string } | null)?.source === 'school') {
-        if (!real) return;
-        const id = await openSchoolReminder(identifier, scope.signal);
-        if (scope.signal.aborted) throw Error('NOTIFICATION_BRIDGE_CLOSED');
-        if (id) router.push({ pathname: '/attendance', params: { id } });
-        return;
+    if (Platform.OS !== 'android' || !ready || !navigation?.key) return;
+    let active = true;
+    let subscription: { remove(): void } | undefined;
+    void import('expo-notifications').then(api => {
+      if (!active) return;
+      const seen = new Set<string>();
+      async function handle(response: NotificationResponse | null) {
+        if (!active || response?.actionIdentifier !== api.DEFAULT_ACTION_IDENTIFIER) return;
+        const { identifier, content: { data } } = response.notification.request;
+        if (seen.has(identifier)) return;
+        seen.add(identifier);
+        const { source, rollcallId } = data ?? {};
+        if (source === 'school' && typeof rollcallId === 'string' && rollcallId.trim()) {
+          router.push({ pathname: '/attendance', params: { id: rollcallId } });
+        }
+        const last = await api.getLastNotificationResponseAsync();
+        if (active && last?.notification.request.identifier === identifier) await api.clearLastNotificationResponseAsync();
       }
-      const target = attendanceDestination(value);
-      if (!target) return;
-      await trial.restore();
-      if (scope.signal.aborted) throw Error('NOTIFICATION_BRIDGE_CLOSED');
-      if (!trial.isTrialRollcall(target.params.id)) return;
-      trial.opened();
-      router.push(target);
-    }).then(remove => { if (scope.signal.aborted) remove(); else cleanup = remove; }).catch(() => {});
-    return () => { scope.abort(); cleanup?.(); };
-  }, [real, trial, navigation?.key]);
+      subscription = api.addNotificationResponseReceivedListener(response => { void handle(response).catch(() => {}); });
+      void api.getLastNotificationResponseAsync().then(handle).catch(() => {});
+    }).catch(() => {});
+    return () => { active = false; subscription?.remove(); };
+  }, [ready, navigation?.key]);
   return null;
 }

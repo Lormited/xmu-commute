@@ -35,21 +35,21 @@ class SchoolReminderJobModule : Module() {
       SchoolReminderJobService.finish(token, nextAt)
     }.runOnQueue(Queues.MAIN)
 
-    (AsyncFunction("post") Coroutine { token: String, identifier: String, endAt: Double ->
-      post(token, identifier, endAt)
+    (AsyncFunction("post") Coroutine { token: String, identifier: String, endAt: Double, rollcallId: String ->
+      post(token, identifier, endAt, rollcallId)
     }).runOnQueue(Queues.MAIN)
 
     Function("isCurrent") { token: String -> SchoolReminderJobService.isCurrent(token) }
   }
 
-  private suspend fun post(token: String, identifier: String, endAt: Double): Boolean {
+  private suspend fun post(token: String, identifier: String, endAt: Double, rollcallId: String): Boolean {
     if (!endAt.isFinite() || !SchoolReminderJobService.isCurrent(token) || endAt <= System.currentTimeMillis()) return false
     val context = checkNotNull(appContext.reactContext)
     val manager = checkNotNull(context.getSystemService(NotificationManager::class.java))
     val content = NotificationContent.Builder()
       .setTitle("有新的签到活动")
       .setText("点按打开签到，由你确认提交")
-      .setBody(JSONObject().put("source", "school"))
+      .setBody(JSONObject().put("source", "school").put("rollcallId", rollcallId))
       .setAutoDismiss(true)
       .build()
     val request = NotificationRequest(identifier, content, ChannelAwareTrigger("school-attendance"))

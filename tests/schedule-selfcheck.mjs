@@ -8,6 +8,17 @@ const courses = [{ id: 3, course_code: '001-A', name: 'LNT 课程一' }, { id: 4
 const at = new Date(2026, 9, 26, 12).getTime();
 const makeData = (rows = [row]) => ({ courses, schedule: { ...term, weekAt: at, rows: scheduleModule.scheduleRowsFrom({ success: true, pkjgList: rows }) } });
 
+test('reminders use each lesson’s actual times with ten minutes on either side', () => {
+  const { schedule } = makeData([row, { ...row, WID: 'later', KSSJ: '1400', JSSJ: '1545' }]);
+  const local = (hour, minute) => new Date(2026, 9, 26, hour, minute).getTime();
+  const morning = { start: local(7, 50), end: local(9, 50) };
+  const afternoon = { start: local(13, 50), end: local(15, 55) };
+  assert.deepEqual(scheduleModule.nextReminderWindow(schedule, local(7, 0)), morning);
+  assert.deepEqual(scheduleModule.nextReminderWindow(schedule, local(8, 0)), morning);
+  assert.deepEqual(scheduleModule.nextReminderWindow(schedule, local(9, 50)), afternoon);
+  assert.equal(scheduleModule.nextReminderWindow({ ...schedule, weeks: [8] }, local(15, 55)), null);
+});
+
 test('schedule needs only arrangement rows, keeps late sections, and validates their bounds', () => {
   const view = scheduleModule.schoolScheduleView(makeData([{ ...row, KSJCDM: 11, JSJCDM: 12 }]), new Date(at));
   assert.deepEqual(view.periods, [...defaultPeriods, ['', '']]);
