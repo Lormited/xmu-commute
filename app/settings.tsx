@@ -5,13 +5,26 @@ import { useDemo } from '@/demo-context';
 import { conflictStyles, conflictStyleIcon, courseStyles, courseStyleIcon, listStyles, listStyleIcon } from '@/style-options';
 import { Button, DetailScreen, Note, RowGroup, SettingRow, s } from '@/ui';
 export default function Settings() {
-  const { state, dispatch, real, logout } = useDemo();
+  const { state, dispatch, real, data, schoolRemindersAvailable, changeSchoolReminders, logout } = useDemo();
   const [asking, setAsking] = useState(false);
   const [confirmLogout, setConfirmLogout] = useState(false);
+  const [changingReminder, setChangingReminder] = useState(false);
+  const [reminderError, setReminderError] = useState(false);
+  async function toggleReminder(enabled: boolean) {
+    if (changingReminder) return;
+    setChangingReminder(true);
+    setReminderError(!await changeSchoolReminders(enabled));
+    setChangingReminder(false);
+  }
   return <DetailScreen title="设置">
     <RowGroup>
-      <SettingRow icon="notifications-outline" title="签到提醒" last trailing={<Switch disabled={real} accessibilityLabel={real ? '签到提醒' : '签到提醒（模拟开关）'} value={state.reminders} onValueChange={enabled => { if (enabled && state.notificationPermission !== 'granted') setAsking(true); else dispatch({ type: 'reminders', enabled }); }} trackColor={{ false: '#ded6e4', true: '#b09cbf' }} />} />
+      <SettingRow icon="notifications-outline" title="签到提醒" last trailing={<Switch disabled={real && (!schoolRemindersAvailable || changingReminder || !data.account || data.loggingIn || !data.authenticated && !state.reminders)} accessibilityLabel={real ? '签到提醒' : '签到提醒（模拟开关）'} value={state.reminders} onValueChange={enabled => {
+        if (real) void toggleReminder(enabled);
+        else if (enabled && state.notificationPermission !== 'granted') setAsking(true);
+        else dispatch({ type: 'reminders', enabled });
+      }} trackColor={{ false: '#ded6e4', true: '#b09cbf' }} />} />
     </RowGroup>
+    {real && reminderError && <Note tone="warning">提醒设置未能更新。请检查系统通知权限后重试。</Note>}
     {asking && <View style={s.detailBox}><Text style={s.rowLabel}>允许提醒？</Text><Text style={s.body}>模拟权限，不开启真实通知。</Text><Button label="允许（演示）" onPress={() => { dispatch({ type: 'permission', value: 'granted' }); setAsking(false); }} /><Button secondary label="暂不允许" onPress={() => { dispatch({ type: 'permission', value: 'denied' }); setAsking(false); }} /></View>}
     {state.notificationPermission === 'denied' && !asking && <Note tone="warning" action="重新允许" onPress={() => setAsking(true)}>模拟通知权限未允许</Note>}
     <RowGroup>

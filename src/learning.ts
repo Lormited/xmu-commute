@@ -33,7 +33,7 @@ export type SchoolDevice = {
   save(value: string): Promise<void>;
   clear(): Promise<void>;
   authenticate(onAuthorized?: () => void): Promise<void>;
-  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account): Promise<unknown>;
+  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account, signal?: AbortSignal): Promise<unknown>;
   answerNumber(rollcallId: string, numberCode: string, account: Account): Promise<AttendanceReceipt>;
   submitLocation(rollcallId: string, position: Position, account: Account): Promise<AttendanceReceipt>;
   submitQr(rollcallId: string, data: unknown, account: Account): Promise<AttendanceReceipt>;
@@ -165,12 +165,19 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
   let writing = Promise.resolve();
   let operation: Promise<boolean> | null = null;
   let historyOperation: Promise<boolean> | null = null;
-  let restoring: Promise<void> | null = null;
+  let restoring: Promise<boolean> | null = null;
   let clearing: Promise<boolean> | null = null;
   let cleanupFailed = false;
   let restoreFailed = false;
   const current = (version: number) => generation === version;
   const completed = () => ({ ...state.attendance, ...state.pendingAttendance });
+  async function readPendingRollcalls(account: Account, signal: AbortSignal) {
+    const version = identity;
+    const valid = () => !signal.aborted && version === identity && state.authenticated && !state.loggingIn && state.account?.lntId === account.lntId;
+    if (!valid()) return [];
+    const activities = rollcallsFrom(await device.read('rollcalls', undefined, account, signal));
+    return valid() ? activities.filter(({ id }) => !Object.hasOwn(state.attendance, id) && !Object.hasOwn(state.pendingAttendance, id) && !submissions.has(id)) : [];
+  }
   function rememberAttendance() {
     const version = identity;
     writing = writing.then(async () => {
@@ -181,22 +188,33 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       if (version === identity) publish({ message: '签到结果已收到，但本机保存失败，请刷新核对' });
     });
   }
-  function restore(): Promise<void> {
-    if (state.ready) return Promise.resolve();
+  function restore(): Promise<boolean> {
+    if (clearing || cleanupFailed) return Promise.resolve(false);
     if (restoring) return restoring;
+    if (state.ready && !restoreFailed) return Promise.resolve(true);
+    if (state.loggingIn || state.refreshing) return Promise.resolve(false);
     const version = generation;
-    restoring = (async () => {
+    const attempt = (async () => {
       let authenticated = false;
       try {
         const { raw, account } = await device.load();
-        if (!current(version)) return;
+        if (!current(version)) return false;
         authenticated = !!account;
         const saved = raw ? cacheFrom(raw) : null;
-        publish({ ...saved, authenticated, needsLogin: !authenticated && !!saved && 'account' in saved });
-      } catch { if (current(version)) { restoreFailed = true; publish({ authenticated, message: '学校本机数据读取失败，请重试或退出清理' }); } }
-      if (current(version)) publish({ ready: true });
-    })();
-    return restoring;
+        const recovered = restoreFailed;
+        restoreFailed = false;
+        publish({ ...saved, ready: true, authenticated, needsLogin: !authenticated && !!saved && 'account' in saved,
+          ...(recovered ? { message: null } : {}) });
+        return true;
+      } catch {
+        if (current(version)) {
+          restoreFailed = true;
+          publish({ ready: true, authenticated, message: '学校本机数据读取失败，请重试或退出清理' });
+        }
+        return false;
+      }
+    })().finally(() => { if (restoring === attempt) restoring = null; });
+    return restoring = attempt;
   }
   async function readHistory(courses: SchoolCourse[], account: Account): Promise<SchoolHistory[]> {
     const studentId = account.lntId;
@@ -372,6 +390,21 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     getSnapshot: () => state,
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     restore,
+    readPendingRollcalls,
+    async openReminder(account: Account, id: string, signal: AbortSignal) {
+      const version = generation, accountVersion = identity;
+      const valid = () => !signal.aborted && current(version) && identity === accountVersion
+        && state.account?.lntId === account.lntId && state.authenticated && !state.loggingIn;
+      if (!valid()) return null;
+      if (operation) await operation;
+      if (!valid()) return null;
+      const pending = await readPendingRollcalls(account, signal);
+      const activity = pending.find(item => item.id === id);
+      if (!activity || !valid()
+        || Object.hasOwn(state.attendance, id) || Object.hasOwn(state.pendingAttendance, id) || submissions.has(id)) return null;
+      publish({ rollcalls: [...state.rollcalls.filter(item => item.id !== id), activity] });
+      return activity.id;
+    },
     login: (onAuthorized?: () => void) => update(true, onAuthorized),
     refresh: () => update(false),
     refreshHistory,

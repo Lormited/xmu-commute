@@ -58,7 +58,7 @@ export const attendanceTrialDevice: TrialDevice = {
   },
 };
 
-export async function watchAttendanceNotifications(open: (data: unknown) => Promise<void>) {
+export async function watchAttendanceNotifications(open: (data: unknown, identifier: string) => Promise<void>) {
   const api = await notifications();
   api.setNotificationHandler({ handleNotification: async () => ({ shouldShowBanner: true, shouldShowList: true,
     shouldPlaySound: true, shouldSetBadge: false }) });
@@ -69,7 +69,7 @@ export async function watchAttendanceNotifications(open: (data: unknown) => Prom
     if (seen.has(id)) return;
     seen.add(id);
     try {
-      await open(response.notification.request.content.data);
+      await open(response.notification.request.content.data, id);
       await api.clearLastNotificationResponseAsync();
     } catch { seen.delete(id); }
   }

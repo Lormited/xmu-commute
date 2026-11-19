@@ -1,3 +1,5 @@
 node_modules/
 .expo/
-android/
+/android/
+pnpm-lock.yaml
+pnpm-workspace.yaml

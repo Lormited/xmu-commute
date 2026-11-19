@@ -105,10 +105,10 @@ function screen(outcome = 'success', platform = 'android', learning = null, sele
       if (name === './demo-state') return { demoReducer, initialState };
       if (name === './demo-data') return data;
       if (name === './schedule') return schedule;
-      if (name === './learning') return { createLearning: learning ? () => learning : createLearning, historyView, todoView };
+      if (name === './learning') return { historyView, todoView };
       if (name === './qr.ts') return qrModule;
       if (name === './location-attendance.ts') return locationModule;
-      if (name === './school-device') return { schoolDevice: {} };
+      if (name === './school-reminder-device') return { schoolLearning: learning ?? createLearning({}), schoolRemindersAvailable: false };
       if (name === './attendance-trial') return { createAttendanceTrial: trialController ? () => trialController : createAttendanceTrial };
       if (name === './attendance-trial-device') return { attendanceTrialDevice: { now: Date.now,
         load: async () => trialCache, save: async () => {}, stop: async () => {}, wake() {}, ...trialDevice } };
@@ -304,7 +304,7 @@ async function realScreen(reply = async () => ({ result: 'success', message: 'хн
 async function notificationScreen(app, learning, id) {
   let click, opened;
   const bridge = {};
-  runInNewContext(bridgeSource, { exports: bridge, __DEV__: true, require(name) {
+  runInNewContext(bridgeSource, { exports: bridge, __DEV__: true, AbortController, require(name) {
     if (name === 'react') return { useEffect: effect => effect() };
     if (name === 'react-native') return { Platform: { OS: 'android' } };
     if (name === 'expo-router') return { useRootNavigationState: () => ({ key: 'root' }), router: { push: route => {
@@ -314,10 +314,13 @@ async function notificationScreen(app, learning, id) {
     if (name === './demo-context') return { useDemo: () => app.context };
     if (name === './attendance-reminders') return { attendanceDestination };
     if (name === './attendance-trial-device') return { watchAttendanceNotifications: async listener => { click = listener; return () => {}; } };
+    if (name === './school-reminder-device') return { openSchoolReminder: (identifier, signal) => identifier === 'issued-notice'
+      ? learning.openReminder(learning.getSnapshot().account, id, signal) : null };
     return require(name);
   } });
   bridge.AttendanceNotificationBridge();
-  await click({ source: id.startsWith('trial-') ? 'trial' : 'school', rollcallId: id });
+  if (id.startsWith('trial-')) await click({ source: 'trial', rollcallId: id });
+  else await click({ source: 'school' }, 'issued-notice');
   assert.ok(opened, 'the real notification bridge pushes the requested activity');
   await opened.flush();
   return opened;

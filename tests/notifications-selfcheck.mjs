@@ -2,6 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createRollcallReminder, attendanceDestination } from '../src/attendance-reminders.ts';
 import { createAttendanceTrial } from '../src/attendance-trial.ts';
+import * as schedule from '../src/schedule.ts';
+import * as learning from '../src/learning.ts';
+import * as reminders from '../src/attendance-reminders.ts';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { runInNewContext } from 'node:vm';
@@ -11,6 +15,26 @@ import ts from 'typescript';
 
 const require = createRequire(import.meta.url);
 const flush = () => new Promise(resolve => setImmediate(resolve));
+const monday = (hour, minute = 0) => new Date(2026, 10, 16, hour, minute).getTime();
+const lesson = (id, start, end) => ({ WID: id, BJDM: id, KCMC: id, XQ: 1, KSJCDM: 1, JSJCDM: 2,
+  KSSJ: start, JSSJ: end, ZCMC: '9周', JCFADM: '1', JASMC: '', JSXM: '' });
+const calendar = rows => ({ weekAt: monday(12), currentWeek: 9, weeks: [9, 10], rows });
+
+test('overlapping courses keep separate reminder windows and expired windows are skipped', () => {
+  const cached = calendar([lesson('later', '10:55', '11:40'), lesson('first', '10:00', '10:50')]);
+  assert.deepEqual(schedule.nextReminderWindow(cached, monday(9)), { start: monday(9, 50), end: monday(11) });
+  assert.deepEqual(schedule.nextReminderWindow(cached, monday(10)), { start: monday(9, 50), end: monday(10, 45) });
+  assert.deepEqual(schedule.nextReminderWindow(cached, monday(10, 49)), { start: monday(10, 45), end: monday(11, 50) });
+  assert.deepEqual(schedule.nextReminderWindow(cached, monday(11)), { start: monday(10, 45), end: monday(11, 50) });
+  assert.equal(schedule.nextReminderWindow(cached, monday(11, 50)), null);
+  const nextWeek = schedule.nextReminderWindow({ ...cached, rows: [{ ...cached.rows[0], ZCMC: '10周' }] }, monday(23));
+  assert.equal(nextWeek.start, new Date(2026, 10, 23, 10, 45).getTime());
+  const nested = calendar([lesson('outer', '10:00', '12:00'), lesson('inner', '10:20', '11:00')]);
+  assert.deepEqual(schedule.nextReminderWindow(nested, monday(10)), { start: monday(9, 50), end: monday(10, 10) });
+  assert.deepEqual(schedule.nextReminderWindow(nested, monday(10, 10)), { start: monday(10, 10), end: monday(11, 10) });
+  assert.deepEqual(schedule.nextReminderWindow(nested, monday(11, 10)), { start: monday(9, 50), end: monday(12, 10) });
+});
+
 function load(path, dependencies, globals = {}) {
   const source = ts.transpileModule(readFileSync(new URL(path, import.meta.url), 'utf8'), {
     compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -20,6 +44,362 @@ function load(path, dependencies, globals = {}) {
     require: name => name in dependencies ? dependencies[name] : require(name), ...globals });
   return exports;
 }
+
+function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course', '10:00', '10:50')]) {
+  let now = monday(9), current = 'job-1', onStop;
+  const scheduled = [], finished = [], notices = [], dismissed = [], calls = [], timers = new Map();
+  const account = { lntId: accountId, studentNumber: '0041', name: '个人信息' };
+  const cached = { version: 1, account, term: { id: 1, name: '本学期' }, courses: [], coursesAt: now,
+    todos: [], todosAt: now, rollcalls: [], attendance: { '83': 'success' }, history: [], historyAt: null, refreshSchedule: false,
+    scheduleAt: now, schedule: { ...calendar(rows), jwTermCode: '20261', name: '秋季' } };
+  class File {
+    constructor(_root, name) { this.uri = name; }
+    get exists() { return files.has(this.uri); }
+    async text() { return fixture.readFile(this.uri); }
+    write(value) { files.set(this.uri, value); }
+    delete() { fixture.deleteFile(this.uri); }
+  }
+  const pending = { rollcall_id: 81, course_id: 1, is_number: true, course_title: '隐私课程' };
+  const job = { async schedule(at) { scheduled.push(at); }, async cancel() { current = null; },
+    async finish(token, at) { finished.push([token, at]); }, isCurrent: token => token === current,
+    post: (...args) => fixture.post(...args),
+    addListener(_event, listener) { onStop = listener; return { remove() { onStop = undefined; } }; } };
+  const fixture = { files, scheduled, finished, notices, dismissed, calls, account, permission: true, isCurrent: job.isCurrent,
+    readFile: uri => files.get(uri),
+    deleteFile: uri => files.delete(uri),
+    getPermissions: async () => ({ granted: fixture.permission }),
+    loadLearning: async () => ({ raw: JSON.stringify(cached), account }),
+    async advance(at) { now = at; for (const [timer, time] of timers) if (time <= now) { timers.delete(timer); timer(); } await flush(); },
+    stop(token = current) { if (current === token) current = null; onStop?.({ token }); },
+    read: async () => ({ rollcalls: [pending, { ...pending, rollcall_id: 82, status: 'on_call_fine' }, { ...pending, rollcall_id: 83 }] }),
+    async post(token, identifier, endAt) {
+      if (!job.isCurrent(token) || now >= endAt) return false;
+      notices.push(identifier);
+      return true;
+    },
+  };
+  const device = { load: () => fixture.loadLearning(),
+    async save() {},
+    async clear() {},
+    async read(action, _params, expected, signal) {
+      calls.push([action, expected, signal]);
+      if (action === 'rollcalls') return fixture.read(signal);
+      if (action === 'profile') return { id: account.lntId, user_no: account.studentNumber, name: account.name };
+      if (action === 'todos') return { todo_list: [] };
+      if (action === 'lntTerms') return { semesters: [{ id: 1, name: '本学期', is_active: true }] };
+      if (action === 'courses') return { courses: [] };
+      throw Error('UNEXPECTED_READ');
+    } };
+  Object.assign(fixture, load('../src/school-reminder-device.ts', {
+    'react-native': { Platform: { OS: 'android' } }, expo: { requireOptionalNativeModule: () => job },
+    'expo-crypto': { randomUUID }, 'expo-file-system': { File, Paths: { document: '' } },
+    'expo-file-system/legacy': { moveAsync: async ({ from, to }) => { files.set(to, files.get(from)); files.delete(from); } },
+    'expo-notifications': { AndroidImportance: { HIGH: 4, NONE: 0 }, AndroidNotificationVisibility: { PRIVATE: 0 },
+      setNotificationChannelAsync: async () => ({ importance: 4 }), getNotificationChannelAsync: async () => ({ importance: 4 }),
+      getPermissionsAsync: () => fixture.getPermissions(), requestPermissionsAsync: async () => ({ granted: fixture.permission }),
+      dismissNotificationAsync: async identifier => { dismissed.push(identifier); } },
+    './learning': learning, './school-device': { schoolDevice: device }, './schedule': schedule,
+  }, { AbortController, Date: { now: () => now },
+    setTimeout: (callback, ms) => { timers.set(callback, now + ms); return callback; }, clearTimeout: callback => timers.delete(callback) }));
+  return fixture;
+}
+
+test('the persisted enabled Job reads only pending LNT activities and dedupes after process restart', async () => {
+  const foreground = schoolFixture();
+  await foreground.schoolLearning.restore();
+  assert.equal(await foreground.setSchoolReminders(true), true);
+  assert.deepEqual(foreground.scheduled, [monday(9, 50)]);
+  const headless = schoolFixture(foreground.files);
+  await headless.advance(monday(10));
+  const running = headless.runSchoolReminderJob('job-1');
+  await flush();
+  assert.equal(headless.calls.length, 1);
+  assert.equal(headless.calls[0][0], 'rollcalls');
+  assert.equal(headless.calls[0][1].lntId, 41);
+  assert.equal(headless.notices.length, 1);
+  assert.match(headless.notices[0], /^[\da-f-]{36}$/);
+  headless.stop();
+  await running;
+  assert.deepEqual(headless.finished, []);
+  const restarted = schoolFixture(foreground.files);
+  await restarted.advance(monday(10, 2));
+  const resumed = restarted.runSchoolReminderJob('job-1');
+  await flush();
+  assert.equal(restarted.notices.length, 0);
+  await restarted.advance(monday(11));
+  await resumed;
+  assert.deepEqual(restarted.finished, [['job-1', null]]);
+});
+
+test('an unacknowledged notice remains tappable and retries with the same identifier after restart', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  const post = fixture.post;
+  fixture.post = async (...args) => {
+    assert.equal(await post(...args), true);
+    return new Promise(() => {});
+  };
+  void fixture.runSchoolReminderJob('job-1');
+  await flush();
+  assert.equal(fixture.notices.length, 1);
+  const [identifier] = fixture.notices;
+  const restarted = schoolFixture(new Map(fixture.files));
+  assert.equal(await restarted.openSchoolReminder(identifier, new AbortController().signal), '81');
+  await restarted.advance(monday(10, 1));
+  const running = restarted.runSchoolReminderJob('job-1');
+  await flush();
+  restarted.stop();
+  await running;
+  assert.deepEqual(restarted.notices, [identifier]);
+});
+
+test('failed notification dispatch retries the same identifier within its window', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  assert.equal(await fixture.setSchoolReminders(true), true);
+  const post = fixture.post;
+  const attempts = [];
+  fixture.post = async (token, identifier, endAt) => {
+    attempts.push(identifier);
+    if (attempts.length === 1) throw Error('UNAVAILABLE');
+    return post(token, identifier, endAt);
+  };
+  await fixture.advance(monday(10));
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  assert.equal(attempts.length, 1);
+  assert.equal(fixture.notices.length, 0);
+  assert.deepEqual(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'], { identifier: attempts[0], delivered: false });
+  assert.deepEqual(fixture.dismissed, []);
+  await fixture.advance(monday(10) + 30000);
+  assert.equal(fixture.calls.length, 1);
+  await fixture.advance(monday(10, 1));
+  assert.equal(fixture.notices.length, 1);
+  assert.deepEqual(attempts, [fixture.notices[0], fixture.notices[0]]);
+  fixture.stop();
+  await running;
+});
+
+test('Job preflight leaves transient permission and storage errors to native retry', async () => {
+  const foreground = schoolFixture();
+  await foreground.schoolLearning.restore();
+  await foreground.setSchoolReminders(true);
+  for (const failure of ['getPermissions', 'readFile']) {
+    const headless = schoolFixture(foreground.files);
+    await headless.advance(monday(10));
+    headless[failure] = () => { throw Error('TEMPORARILY_UNAVAILABLE'); };
+    await headless.runSchoolReminderJob('job-1');
+    assert.deepEqual(headless.calls, []);
+    assert.deepEqual(headless.finished, [], failure);
+  }
+  const denied = schoolFixture(foreground.files);
+  denied.permission = false;
+  await denied.runSchoolReminderJob('job-1');
+  assert.deepEqual(denied.finished, [['job-1', null]]);
+});
+
+test('a failed learning load leaves the Job retryable in the same process', async () => {
+  const foreground = schoolFixture();
+  await foreground.schoolLearning.restore();
+  await foreground.setSchoolReminders(true);
+  const headless = schoolFixture(foreground.files);
+  await headless.advance(monday(10));
+  const loadLearning = headless.loadLearning;
+  let loads = 0;
+  headless.loadLearning = async () => {
+    if (++loads === 1) throw Error('TEMPORARILY_UNAVAILABLE');
+    return loadLearning();
+  };
+  const failed = headless.runSchoolReminderJob('job-1');
+  await failed;
+  assert.equal(loads, 1);
+  assert.equal(headless.schoolLearning.getSnapshot().ready, true);
+  assert.match(headless.schoolLearning.getSnapshot().message, /读取失败/);
+  assert.deepEqual(headless.calls, []);
+  assert.deepEqual(headless.finished, []);
+  const retry = headless.runSchoolReminderJob('job-1');
+  await flush();
+  assert.equal(loads, 2);
+  assert.equal(headless.schoolLearning.getSnapshot().message, null);
+  assert.equal(headless.notices.length, 1);
+  await headless.advance(monday(11));
+  await retry;
+  assert.deepEqual(headless.finished, [['job-1', null]]);
+  const signedOut = schoolFixture();
+  signedOut.loadLearning = async () => ({ raw: null, account: null });
+  await signedOut.runSchoolReminderJob('job-1');
+  assert.deepEqual(signedOut.finished, [['job-1', null]]);
+});
+
+test('the window deadline aborts a slow query and hands off once to the overlapping course', async () => {
+  const fixture = schoolFixture(new Map(), 41, [lesson('first', '10:00', '10:50'), lesson('later', '10:55', '11:40')]);
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10, 43));
+  fixture.read = signal => new Promise((_, reject) => signal.addEventListener('abort', () => reject(Error('ABORT')), { once: true }));
+  const running = fixture.runSchoolReminderJob('job-1');
+  assert.equal(fixture.runSchoolReminderJob('job-1'), running);
+  await flush();
+  await fixture.advance(monday(10, 44));
+  assert.equal(fixture.calls.length, 1);
+  await fixture.advance(monday(10, 45));
+  await running;
+  assert.equal(fixture.calls[0][2].aborted, true);
+  assert.equal(fixture.notices.length, 0);
+  assert.deepEqual(fixture.finished, [['job-1', monday(10, 45)]]);
+});
+
+test('permission refusal prevents jobs and disabling stops an in-flight read and survives restart', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  fixture.permission = false;
+  assert.equal(await fixture.setSchoolReminders(true), false);
+  assert.deepEqual(fixture.scheduled, []);
+  fixture.permission = true;
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  let respond;
+  fixture.read = () => new Promise(resolve => { respond = resolve; });
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  assert.equal(await fixture.setSchoolReminders(false), true);
+  assert.equal(fixture.calls[0][2].aborted, true);
+  respond({ rollcalls: [{ id: 81, course_id: 1 }] });
+  await running;
+  assert.deepEqual(fixture.notices, []);
+  assert.deepEqual(fixture.finished, []);
+  const restarted = schoolFixture(fixture.files);
+  await restarted.advance(monday(10, 1));
+  await restarted.runSchoolReminderJob('job-1');
+  assert.deepEqual(restarted.calls, []);
+  assert.deepEqual(restarted.finished, [['job-1', null]]);
+});
+
+test('logout cleanup retries failed reminder deletion with no current account', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  const [saved] = fixture.files.keys();
+  fixture.files.set(saved.replace(/\.json$/, '.tmp'), fixture.files.get(saved));
+  const remove = fixture.deleteFile;
+  fixture.deleteFile = () => { throw Error('TEMPORARILY_UNAVAILABLE'); };
+  const clearing = fixture.clearSchoolReminders();
+  assert.equal(await fixture.schoolLearning.logout(), true);
+  await assert.rejects(clearing, /TEMPORARILY_UNAVAILABLE/);
+  fixture.deleteFile = remove;
+  assert.equal(fixture.schoolLearning.getSnapshot().account, null);
+  await fixture.clearSchoolReminders();
+  assert.equal(fixture.files.size, 0);
+});
+
+for (const [action, stop] of [
+  ['system stop', fixture => fixture.stop()],
+  ['disable', fixture => fixture.setSchoolReminders(false)],
+  ['logout', fixture => fixture.clearSchoolReminders()],
+  ['window expiry', fixture => fixture.advance(monday(11))],
+]) {
+  test(`${action} drops a queued native post without marking it delivered`, async () => {
+    const fixture = schoolFixture();
+    await fixture.schoolLearning.restore();
+    await fixture.setSchoolReminders(true);
+    await fixture.advance(monday(10));
+    let deliver, identifier, stopped = false;
+    const post = fixture.post;
+    fixture.post = (token, id, endAt) => new Promise(resolve => {
+      assert.equal(token, 'job-1');
+      assert.equal(endAt, monday(11));
+      identifier = id;
+      deliver = async () => resolve(await post(token, id, endAt));
+    });
+    const running = fixture.runSchoolReminderJob('job-1').then(() => { stopped = true; });
+    await flush();
+    assert.ok(deliver);
+    assert.equal(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'].identifier, identifier);
+    const cancellation = stop(fixture);
+    await flush();
+    const wasCurrent = fixture.isCurrent('job-1'), hadStopped = stopped;
+    await deliver();
+    await cancellation;
+    await running;
+    await flush();
+    assert.equal(wasCurrent, action === 'window expiry');
+    assert.equal(hadStopped, true, 'headless task returns while the native post is pending');
+    assert.deepEqual(fixture.notices, []);
+    assert.deepEqual(fixture.dismissed, []);
+    assert.deepEqual(fixture.finished, action === 'window expiry' ? [['job-1', null]] : []);
+    if (action !== 'logout') assert.equal(JSON.parse(fixture.files.get('school-reminders.json')).issued['81'].delivered, false);
+    if (action === 'window expiry') return;
+    const restarted = schoolFixture(fixture.files);
+    await restarted.advance(monday(10, 1));
+    const retry = restarted.runSchoolReminderJob('job-1');
+    await flush();
+    restarted.stop();
+    await retry;
+    assert.deepEqual(restarted.notices, action === 'system stop' ? [identifier] : []);
+  });
+}
+
+test('school taps resolve an issued notice through a fresh pending read across process and account refresh', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  fixture.stop();
+  await running;
+  const [identifier] = fixture.notices;
+  const restarted = schoolFixture(fixture.files);
+  const other = schoolFixture(fixture.files, 42);
+  const scope = new AbortController();
+  assert.equal(await other.openSchoolReminder(identifier, scope.signal), null);
+  assert.equal(await restarted.openSchoolReminder(randomUUID(), scope.signal), null);
+  assert.equal(other.calls.length + restarted.calls.length, 0);
+
+  const read = restarted.read;
+  let deliver, finishRefresh;
+  restarted.read = signal => new Promise(resolve => {
+    if (signal) deliver = resolve;
+    else finishRefresh = resolve;
+  });
+  const coldAccount = restarted.schoolLearning.getSnapshot().account;
+  const refreshing = restarted.schoolLearning.refresh();
+  await flush();
+  let responseListener, cleanup;
+  const routes = [];
+  const response = (id, data) => ({ actionIdentifier: 'default', notification: { request: { identifier: id, content: { data } } } });
+  const api = { DEFAULT_ACTION_IDENTIFIER: 'default', setNotificationHandler() {},
+    addNotificationResponseReceivedListener(listener) { responseListener = listener; return { remove() {} }; },
+    getLastNotificationResponseAsync: async () => response(identifier, { source: 'school', rollcallId: 'forged' }),
+    clearLastNotificationResponseAsync: async () => {},
+  };
+  const bridge = load('../src/attendance-notification-bridge.tsx', {
+    react: { useEffect: effect => { cleanup = effect(); } }, 'react-native': { Platform: { OS: 'android' } },
+    'expo-router': { router: { push: value => routes.push(value.params.id) }, useRootNavigationState: () => ({ key: 'root' }) },
+    './demo-context': { useDemo: () => ({ real: true }) }, './attendance-reminders': reminders,
+    './school-reminder-device': restarted,
+    './attendance-trial-device': load('../src/attendance-trial-device.ts', { 'expo-notifications': api }),
+  }, { AbortController });
+  bridge.AttendanceNotificationBridge();
+  await flush();
+  assert.equal(deliver, undefined, 'the tap read waits for the ordinary batch');
+  finishRefresh({ rollcalls: [] });
+  assert.equal(await refreshing, true);
+  assert.notEqual(restarted.schoolLearning.getSnapshot().account, coldAccount);
+  await flush();
+  deliver(await read());
+  await flush();
+  assert.deepEqual(routes, ['81']);
+  responseListener(response(randomUUID(), { source: 'school', rollcallId: '81' }));
+  await flush();
+  assert.deepEqual(routes, ['81']);
+  assert.equal(restarted.schoolLearning.getSnapshot().rollcalls.find(item => item.id === '81').method, 'number');
+  restarted.read = async () => ({ rollcalls: [] });
+  assert.equal(await restarted.openSchoolReminder(identifier, scope.signal), null);
+  cleanup();
+});
 
 test('activity discovery sends one notification carrying only its source and id', async () => {
   const sent = [];
@@ -213,8 +593,9 @@ test('cold and warm notification clicks wait for navigation and restore the exac
   const bridge = load('../src/attendance-notification-bridge.tsx', {
     react: { useEffect: effect => { cleanup = effect(); } }, 'react-native': { Platform: { OS: 'android' } },
     'expo-router': { router: { push: route => routes.push(route) }, useRootNavigationState: () => ready ? { key: 'root' } : undefined },
-    './demo-context': { useDemo: () => ({ trial }) }, './attendance-reminders': { attendanceDestination }, './attendance-trial-device': adapter,
-  });
+    './demo-context': { useDemo: () => ({ real: true, trial }) }, './attendance-reminders': { attendanceDestination }, './attendance-trial-device': adapter,
+    './school-reminder-device': { openSchoolReminder: async () => null },
+    }, { AbortController });
   bridge.AttendanceNotificationBridge(); await flush();
   assert.equal(registered, 0);
   ready = true; bridge.AttendanceNotificationBridge(); await flush();
@@ -226,7 +607,7 @@ test('cold and warm notification clicks wait for navigation and restore the exac
   assert.equal(routes.length, 1, 'duplicate delivery of the cold-start response is ignored');
   listener({ ...response, notification: { request: { identifier: 'notice2', content: { data: { source: 'school', rollcallId: '82' } } } } });
   await flush();
-  assert.deepEqual(routes.at(-1), { pathname: '/attendance', params: { id: '82' } });
+  assert.equal(routes.length, 1, 'an unissued school payload does not navigate');
   assert.equal(cleared, 2);
   cleanup();
 });
@@ -276,7 +657,8 @@ test('release debug settings run the trial controller and keep notification hand
     react: { useEffect: effect => effect() }, 'react-native': { Platform: { OS: 'android' } },
     'expo-router': { useRootNavigationState: () => ({ key: 'root' }) }, './demo-context': { useDemo: () => ({ trial }) },
     './attendance-reminders': { attendanceDestination }, './attendance-trial-device': { watchAttendanceNotifications: async () => { subscriptions++; return () => {}; } },
-  }, { __DEV__: false });
+    './school-reminder-device': { openSchoolReminder: async () => null },
+  }, { __DEV__: false, AbortController });
   bridge.AttendanceNotificationBridge();
   assert.equal(subscriptions, 1);
 });

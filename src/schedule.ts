@@ -90,6 +90,35 @@ function monday(date: Date) {
   result.setDate(result.getDate() - (result.getDay() + 6) % 7);
   return result;
 }
+export function nextReminderWindow(schedule: SchoolSchedule | null, now: number) {
+  if (!schedule) return null;
+  const anchor = monday(new Date(schedule.weekAt));
+  const view = schoolScheduleView({ schedule, courses: [] }, new Date(now));
+  let active: { start: number; end: number } | null = null;
+  let upcoming: { start: number; end: number } | null = null;
+  for (const week of schedule.weeks) {
+    if (week < view.currentWeek - 1) continue;
+    for (const session of view.sessionsForWeek(week)) {
+      const date = new Date(anchor);
+      date.setDate(date.getDate() + (week - schedule.currentWeek) * 7 + session.day);
+      const [from, to] = sessionTime(session).split(' — ');
+      const timestamp = (time: string) => {
+        const [hour, minute] = time.split(':').map(Number);
+        return date.setHours(hour, minute, 0, 0);
+      };
+      const start = timestamp(from) - 600000;
+      const end = timestamp(to) + 600000;
+      if (end <= now) continue;
+      if (start > now) {
+        if (!upcoming || start < upcoming.start || start === upcoming.start && end < upcoming.end) upcoming = { start, end };
+      } else if (!active || start > active.start || start === active.start && end < active.end) {
+        active = { start, end };
+      }
+    }
+  }
+  if (!active) return upcoming;
+  return { start: active.start, end: upcoming ? Math.min(active.end, upcoming.start) : active.end };
+}
 export function schoolScheduleView(data: Pick<LearningSnapshot, 'courses' | 'schedule'>, now = new Date()) {
   const schedule = data.schedule;
   const grouped = new Map<string, SchoolScheduleRow[]>();

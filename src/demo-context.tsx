@@ -3,7 +3,7 @@ import { AccessibilityInfo, AppState, Platform } from 'react-native';
 import { demoReducer, initialState, type DemoEvent, type DemoState } from './demo-state';
 import { TERM, courseFor, periods, sessionsForWeek, weekDays, todoFixtures, type Todo } from './demo-data';
 import { createLearning, historyView, todoView, type LearningSnapshot } from './learning';
-import { schoolDevice } from './school-device';
+import { clearSchoolReminders, schoolLearning, schoolRemindersAvailable, setSchoolReminders, syncSchoolReminders } from './school-reminder-device';
 import { schoolScheduleView } from './schedule';
 import { qrData } from './qr.ts';
 import { isPosition, type Position } from './location-attendance.ts';
@@ -12,6 +12,7 @@ import { attendanceTrialDevice } from './attendance-trial-device';
 
 type Demo = { state: DemoState; dispatch: Dispatch<DemoEvent>; refresh: () => void; refreshHistory: () => void; refreshing: boolean; homeRefreshAt: Date | null; syncResult: 'success' | 'offline' | null; reducedMotion: boolean;
   timetable: ReturnType<typeof schoolScheduleView>; real: boolean; data: LearningSnapshot; todayDate: Date; todos: Todo[]; login: () => Promise<boolean>; logout: () => Promise<boolean>;
+  schoolRemindersAvailable: boolean; changeSchoolReminders: (enabled: boolean) => Promise<boolean>;
   submitNumber: ReturnType<typeof createLearning>['submitNumber']; submitLocation: ReturnType<typeof createLearning>['submitLocation']; submitQr: ReturnType<typeof createLearning>['submitQr'];
 
   trial: ReturnType<typeof createAttendanceTrial>; trialData: TrialSnapshot; isTrialRollcall: (id: string) => boolean };
@@ -39,10 +40,22 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     });
     return () => { clearTimeout(timer); listener.remove(); };
   }, [real]);
-  const [learning] = useState(() => createLearning(schoolDevice));
+  const learning = schoolLearning;
   const trial = deviceTrial;
   const trialData = useSyncExternalStore(trial.subscribe, trial.getSnapshot, trial.getSnapshot);
   const data = useSyncExternalStore(learning.subscribe, learning.getSnapshot, learning.getSnapshot);
+  const [schoolReminders, setSchoolRemindersValue] = useState(false);
+  useEffect(() => {
+    if (!real || !schoolRemindersAvailable || !data.ready) return;
+    let active = true;
+    void syncSchoolReminders().then(enabled => { if (active) setSchoolRemindersValue(enabled); }).catch(() => {});
+    return () => { active = false; };
+  }, [real, data.ready, data.account?.lntId, data.authenticated, data.loggingIn, data.schedule]);
+  async function changeSchoolReminders(enabled: boolean) {
+    const changed = await setSchoolReminders(enabled).catch(() => false);
+    if (changed) setSchoolRemindersValue(enabled);
+    return changed;
+  }
   const [selectedWeek, setSelectedWeek] = useState<{ term: string; week: number } | null>(null);
   const timetable: ReturnType<typeof schoolScheduleView> = real ? schoolScheduleView(data) : {
     ...TERM, sessions: preview.load === 'empty' ? [] : sessionsForWeek(TERM.currentWeek), minWeek: 1, periods: periods.map(period => [period[0], period[1]]),
@@ -50,7 +63,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
     courseFor: id => courseFor(id, preview.longText), weekDays,
   };
   const schoolWeek = selectedWeek && selectedWeek.term === data.schedule?.jwTermCode ? selectedWeek.week : timetable.currentWeek;
-  const base: DemoState = real ? { ...preview, week: Math.max(timetable.minWeek, Math.min(timetable.weeks, schoolWeek)), loggedIn: data.authenticated || !!data.account, load: data.todos.length || data.rollcalls.length ? 'ready' : 'empty', history: data.history.map(historyView), refreshSchedule: data.refreshSchedule, rollcalls: data.rollcalls, attendance: data.attendance, pendingAttendance: data.pendingAttendance } : preview;
+  const base: DemoState = real ? { ...preview, week: Math.max(timetable.minWeek, Math.min(timetable.weeks, schoolWeek)), loggedIn: data.authenticated || !!data.account, load: data.todos.length || data.rollcalls.length ? 'ready' : 'empty', history: data.history.map(historyView), refreshSchedule: data.refreshSchedule, reminders: !!data.account && schoolReminders, rollcalls: data.rollcalls, attendance: data.attendance, pendingAttendance: data.pendingAttendance } : preview;
   const state: DemoState = trialData.rollcalls.length ? { ...base, rollcalls: [...base.rollcalls, ...trialData.rollcalls],
     attendance: { ...base.attendance, ...trialData.attendance }, pendingAttendance: { ...base.pendingAttendance, ...trialData.pendingAttendance } } : base;
   const dispatch = useCallback<Dispatch<DemoEvent>>(event => {
@@ -125,8 +138,14 @@ export function DemoProvider({ children }: { children: ReactNode }) {
   async function logout() {
     setSyncResult(null);
     setSelectedWeek(null);
+    if (real) {
+      const reminders = clearSchoolReminders().then(() => true, () => false);
+      const cleared = learning.logout();
+      await trial.stop();
+      const [remindersCleared, learningCleared] = await Promise.all([reminders, cleared]);
+      return remindersCleared && learningCleared;
+    }
     await trial.stop();
-    if (real) return learning.logout();
     previewDispatch({ type: 'logout' });
     return true;
   }
@@ -146,7 +165,7 @@ export function DemoProvider({ children }: { children: ReactNode }) {
   const todos = useMemo(() => real ? data.todos.map(item => todoView(item, now)) : todoFixtures(preview.longText), [real, data.todos, preview.longText, now]);
   return <Context.Provider value={{ state, dispatch, refresh, refreshHistory, refreshing: real ? data.refreshing : refreshing, homeRefreshAt,
     syncResult: real && data.message ? 'offline' : syncResult, reducedMotion, timetable, real, data, todayDate: now, todos, login, logout,
-    trial, trialData, isTrialRollcall: trial.isTrialRollcall,
+    schoolRemindersAvailable, changeSchoolReminders, trial, trialData, isTrialRollcall: trial.isTrialRollcall,
     submitNumber: (id, code) => id.startsWith('trial-') ? trial.submitNumber(id, code) : learning.submitNumber(id, code), submitQr, submitLocation }}>{children}</Context.Provider>;
 }
 export function useDemo() {

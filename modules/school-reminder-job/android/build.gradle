@@ -1,0 +1,19 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+android {
+  namespace 'expo.modules.schoolreminderjob'
+}
+
+dependencies {
+  implementation 'com.facebook.react:react-android'
+  def notifications = findProject(':expo-notifications')
+  if (notifications != null) {
+    implementation notifications
+  } else {
+    def manifest = new groovy.json.JsonSlurper().parse(file('../../../node_modules/expo-notifications/package.json'))
+    implementation "host.exp.exponent:expo.modules.notifications:${manifest.version}"
+  }
+}
