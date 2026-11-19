@@ -1303,12 +1303,7 @@ function pages(f, previewMode = false, development = true, remindersEnabled = nu
     } } }, './demo-state': demoState, './demo-data': demoData,
     './schedule': scheduleModule, './learning': { historyView, todoView }, './school-device': f,
     './school-reminder-device': { schoolLearning: f.learning, schoolRemindersAvailable: remindersEnabled !== null,
-      clearSchoolReminders: async () => {}, syncSchoolReminders: async () => remindersEnabled,
-      async readSchoolRemindersEnabled() {
-        assert.notEqual(remindersEnabled, null);
-        assert.equal(f.learning.getSnapshot().authenticated, true);
-        return remindersEnabled;
-      } },
+      clearSchoolReminders: async () => {}, syncSchoolReminders: async () => remindersEnabled },
   }, { Date: TodoDate,
     setTimeout(callback, delay) { todoClock.timer = { callback, delay }; return todoClock.timer; },
     clearTimeout(timer) { if (todoClock.timer === timer) todoClock.timer = null; },
@@ -1954,7 +1949,8 @@ test('every ordinary page header and pull callback uses the same setting-control
 
 test('provider startup shows cache and refreshes once using the restored settings', async () => {
   for (const [enabled, reminders] of [[false, null], [true, false], [true, true]]) {
-    const learning = learningFixture({ account: { ...recoveryAccount, name: '缓存账号' }, refreshSchedule: enabled });
+    const learning = learningFixture({ account: { ...recoveryAccount, name: '缓存账号' }, refreshSchedule: enabled,
+      rollcalls: [{ id: '81', courseId: '3', method: 'number', title: '旧签到', time: '' }] });
     const f = await boundFixture(learning), gate = deferred(), app = pages(f, false, true, reminders);
     f.handler = async url => { if (url.includes('/my-courses')) { await gate.promise; return response(url, { courses: [{ ...course, name: '启动刷新课程' }], pages: 1, total: 1 }); } };
     app.render(); app.runStartupEffects(); await tick();
@@ -1962,18 +1958,33 @@ test('provider startup shows cache and refreshes once using the restored setting
     assert.equal(cached.data.account.name, recoveryAccount.name);
     assert.equal(cached.data.todosAt, 1000);
     assert.equal(cached.refreshing, true);
+    assert.deepEqual(cached.data.rollcalls.map(item => item.id), ['81']);
     gate.resolve(); assert.equal(await f.learning.refresh(), true);
     assert.equal(app.render().data.courses[0].name, '启动刷新课程');
-    const rollcallsPath = new URL(rollcallsUrl).pathname;
-    const startupPaths = reminders ? ordinaryPaths.filter(path => path !== rollcallsPath) : ordinaryPaths;
-    assert.deepEqual(f.calls.map(call => new URL(call.url).pathname).sort(), [...startupPaths, ...(enabled ? timetablePaths : [])].sort());
-    if (reminders) {
-      f.calls.length = 0;
-      app.render().refresh();
-      assert.equal(await f.learning.refresh(), true);
-      assert.equal(f.calls.filter(call => call.url === rollcallsUrl).length, 1);
-    }
+    assert.deepEqual(app.render().data.rollcalls, []);
+    assert.deepEqual(f.calls.map(call => new URL(call.url).pathname).sort(), [...ordinaryPaths, ...(enabled ? timetablePaths : [])].sort());
   }
+});
+
+test('failed reminder renewal shows the homepage status and profile login without losing cached data', async () => {
+  const f = await boundFixture(), app = pages(f);
+  await f.learning.restore();
+  const before = f.learning.getSnapshot();
+  const cached = f.files.get(cacheName);
+  f.handler = async url => {
+    if (url === rollcallsUrl) return response(url, {}, 401);
+    if (url === lntRoot) return redirect(url, casLogin);
+    if (url === casLogin) return response(url, '<html>login</html>', 200, 'text/html');
+  };
+  await f.learning.refreshPendingRollcalls(before.account, new AbortController().signal, () => true);
+  const { data } = app.render();
+  assert.equal(data.needsLogin, true);
+  assert.equal(data.authenticated, false);
+  assert.strictEqual(data.todos, before.todos);
+  assert.equal(f.files.get(cacheName), cached);
+  assert.deepEqual(f.calls.map(({ url }) => url), [rollcallsUrl, lntRoot, casLogin]);
+  assert.ok(app.find(app.pageTree(app.today()), props => props?.children === '学校登录失效，请重新登录'));
+  assert.ok(app.loginButton('profile'));
 });
 
 

@@ -36,6 +36,22 @@ function fixture(raw = null, account = raw ? boundAccount : null) {
   };
   return { device, calls, loginAs: next => { loginAccount = next; }, stored: () => raw, learning: createLearning(device, () => 2000) };
 }
+test('a late reminder failure cannot invalidate a newly authenticated session for the same account', async () => {
+  const f = fixture(previous);
+  await f.learning.restore();
+  const read = f.device.read;
+  const delayed = Promise.withResolvers();
+  f.device.read = () => delayed.promise;
+  const polling = f.learning.refreshPendingRollcalls(boundAccount, new AbortController().signal, () => true);
+  f.device.read = read;
+  assert.equal(await f.learning.login(), true);
+  const snapshot = f.learning.getSnapshot();
+  delayed.reject(Object.assign(Error('renewal failed'), { needsLogin: true }));
+  await assert.rejects(polling, { needsLogin: true });
+  assert.strictEqual(f.learning.getSnapshot(), snapshot);
+  assert.equal(snapshot.authenticated, true);
+});
+
 test('login saves one account, preserves the school collection, and publishes only after saving', async () => {
   const f = fixture(), gate = deferred();
   const save = f.device.save;
@@ -140,7 +156,7 @@ test('restore exposes the bound account and refresh fills its missing first batc
     assert.deepEqual(account, action.startsWith('jw') ? undefined : boundAccount);
     return read(action, params);
   };
-  assert.equal(await f.learning.refresh({ keepRollcalls: true }), true);
+  assert.equal(await f.learning.refresh(), true);
   assert.deepEqual(f.calls, ['load', 'todos', 'rollcalls', 'lntTerms', 'courses', 'jwTerms', 'jwWeek', 'jwSchedule', 'history', 'save']);
   const { todosAt, coursesAt, scheduleAt, historyAt } = f.learning.getSnapshot();
   assert.deepEqual([todosAt, coursesAt, scheduleAt, historyAt], [2000, 2000, 2000, 2000]);

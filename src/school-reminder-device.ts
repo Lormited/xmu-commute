@@ -4,7 +4,7 @@ import { File, Paths } from 'expo-file-system';
 import { moveAsync } from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
 import { createLearning, type Account } from './learning';
-import { nextReminderWindow, type SchoolSchedule } from './schedule';
+import { nextReminderWindow } from './schedule';
 import { schoolDevice } from './school-device';
 
 type JobData = { token: string };
@@ -28,7 +28,7 @@ const temporaryFile = () => new File(Paths.document, 'school-reminders.tmp');
 const notifications = () => import('expo-notifications');
 let pending = Promise.resolve();
 let running: { token: string; stop(): void; task: Promise<void>;
-  scope?: { schedule: SchoolSchedule | null; valid(): boolean } } | undefined;
+  scope?: { start: number; end: number; valid(): boolean } } | undefined;
 
 function serialize<Result>(work: () => Promise<Result>): Promise<Result> {
   const task = pending.then(work);
@@ -49,12 +49,6 @@ async function load(id: number): Promise<SavedReminders> {
     || !Object.values(value.issued).every(notice => typeof notice?.identifier === 'string' && notice.identifier.length === 36
       && typeof notice.delivered === 'boolean')) throw Error('REMINDER_STORAGE');
   return value.accountId === id ? value : empty;
-}
-export async function readSchoolRemindersEnabled() {
-  const account = currentAccount();
-  if (!schoolRemindersAvailable || !account) return false;
-  const saved = await load(account.lntId).catch(() => null);
-  return saved?.enabled === true && currentAccount()?.lntId === account.lntId;
 }
 async function save(value: SavedReminders) {
   const temporary = temporaryFile();
@@ -91,7 +85,10 @@ export function syncSchoolReminders() {
     const allowed = enabled && currentAccount()?.lntId === account?.lntId && await permitted();
     const accountId = currentAccount()?.lntId;
     const scope = running?.scope;
-    if (allowed && scope?.valid() && scope.schedule === schoolLearning.getSnapshot().schedule) return enabled;
+    if (allowed && scope?.valid()) {
+      const window = nextReminderWindow(schoolLearning.getSnapshot().schedule, Date.now());
+      if (window?.start === scope.start && window.end === scope.end) return enabled;
+    }
     running?.stop();
     await schedule(allowed && accountId === account?.lntId);
     return enabled;
@@ -141,12 +138,12 @@ function wait(ms: number, signal: AbortSignal) {
   });
 }
 
-async function untilAborted(task: Promise<void>, signal: AbortSignal) {
+async function untilAborted<Result>(task: Promise<Result>, signal: AbortSignal) {
   let abort!: () => void;
-  const aborted = new Promise<void>(resolve => { abort = resolve; });
+  const aborted = new Promise<undefined>(resolve => { abort = () => resolve(undefined); });
   if (signal.aborted) abort();
   else signal.addEventListener('abort', abort, { once: true });
-  try { await Promise.race([task, aborted]); }
+  try { return await Promise.race([task, aborted]); }
   finally { signal.removeEventListener('abort', abort); }
 }
 
@@ -191,19 +188,17 @@ export function runSchoolReminderJob(token: string): Promise<void> {
       const window = nextReminderWindow(schedule, now);
       if (!window || window.start > now) return window?.start ?? null;
       const valid = () => active() && Date.now() < window.end && currentAccount()?.lntId === account.lntId;
-      if (running?.token === token) running.scope = { schedule, valid };
+      if (running?.token === token) running.scope = { ...window, valid };
       deadline = setTimeout(() => abort.abort(), window.end - now);
       while (valid()) {
         let delay = developPollInterval;
         try {
-          const rollcalls = await schoolLearning.refreshPendingRollcalls(account, signal, valid);
-          for (const { id } of rollcalls) {
+          const rollcalls = await untilAborted(schoolLearning.refreshPendingRollcalls(account, signal, valid), signal);
+          for (const { id } of rollcalls ?? []) {
             if (!valid()) break;
             await untilAborted(notify(job, token, account, id, window.end, valid), signal);
           }
-        } catch (error) {
-          const { code, needsLogin } = (error as { code?: string; needsLogin?: boolean }) ?? {};
-          if (needsLogin || code === 'AUTH_REQUIRED' || code === 'COOKIE_STORAGE') return null;
+        } catch {
           delay *= 2;
         }
         if (valid()) await wait(Math.min(delay, window.end - Date.now()), signal);

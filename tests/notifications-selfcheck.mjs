@@ -71,9 +71,10 @@ function schoolFixture(files = new Map(), accountId = 41, rows = [lesson('course
       if (action === 'rollcalls') return fixture.read(signal);
       if (action === 'profile') return { id: account.lntId, user_no: account.studentNumber, name: account.name };
       if (action === 'todos') return { todo_list: [] };
-      if (action === 'lntTerms') return { semesters: [{ id: 1, name: '本学期', is_active: true }] };
+      if (action === 'lntTerms') return fixture.readTerms?.() ?? { semesters: [{ id: 1, name: '本学期', is_active: true }] };
       if (action === 'courses') return { courses };
       if (action === 'history') return fixture.readHistory();
+      if (action === 'jwSchedule') return { success: true, pkjgList: fixture.scheduleRows };
       throw Error('UNEXPECTED_READ');
     } };
   Object.assign(fixture, load('../src/school-reminder-device.ts', {
@@ -162,37 +163,27 @@ for (const stage of ['submitting', 'receipt open', 'receipt dismissed']) {
   });
 }
 
-test('cold-start refresh queries activities unless reminders are enabled for the restored account', async () => {
-  const fixture = schoolFixture();
-  await fixture.schoolLearning.restore();
-  const reopen = async (accountId = 41) => {
-    const reopened = schoolFixture(new Map(fixture.files), accountId);
-    await reopened.schoolLearning.restore();
-    const keepRollcalls = await reopened.readSchoolRemindersEnabled();
-    assert.equal(await reopened.schoolLearning.refresh({ keepRollcalls }), true);
-    return reopened.calls.filter(([action]) => action === 'rollcalls').length;
-  };
-  assert.equal(await reopen(), 1);
-  assert.equal(await fixture.setSchoolReminders(true), true);
-  assert.equal(await reopen(), 0);
-  assert.equal(await reopen(42), 1);
-  fixture.files.set('school-reminders.json', '{');
-  assert.equal(await reopen(), 1);
-});
-
-test('an ordinary batch cannot overwrite a newer Job result and reads activities again when the Job stops', async () => {
+test('a starting Job shares the foreground activity read and a newer poll still wins the batch', async () => {
   const fixture = schoolFixture();
   await fixture.schoolLearning.restore();
   await fixture.setSchoolReminders(true);
   await fixture.advance(monday(10));
-  let finishRead;
-  fixture.read = signal => signal ? Promise.resolve({ rollcalls: [] }) : new Promise(resolve => { finishRead = resolve; });
+  const activities = Promise.withResolvers(), terms = Promise.withResolvers();
+  const read = fixture.read;
+  fixture.read = () => activities.promise;
+  fixture.readTerms = () => terms.promise;
   const refreshing = fixture.schoolLearning.refresh();
   await flush();
-  assert.ok(finishRead, 'ordinary refresh queries when the Job has not started');
   const running = fixture.runSchoolReminderJob('job-1');
   await flush();
-  finishRead({ rollcalls: [{ id: 81, course_id: 1, is_number: true }] });
+  assert.equal(fixture.calls.filter(([action]) => action === 'rollcalls').length, 1);
+  activities.resolve(await read());
+  await flush();
+  assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id), ['81']);
+  assert.equal(fixture.notices.length, 1);
+  fixture.read = async () => ({ rollcalls: [] });
+  await fixture.advance(monday(10) + 30000);
+  terms.resolve({ semesters: [{ id: 1, name: '本学期', is_active: true }] });
   assert.equal(await refreshing, true);
   assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
   assert.deepEqual(JSON.parse(fixture.files.get('learning')).rollcalls, []);
@@ -203,10 +194,56 @@ test('an ordinary batch cannot overwrite a newer Job result and reads activities
   fixture.stop();
   await running;
   fixture.read = async () => ({ rollcalls: [{ id: 81, course_id: 1, is_number: true }] });
-  assert.equal(await fixture.schoolLearning.refresh({ keepRollcalls: true }), true);
-  assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls, []);
   assert.equal(await fixture.schoolLearning.refresh(), true);
   assert.deepEqual(fixture.schoolLearning.getSnapshot().rollcalls.map(item => item.id), ['81']);
+});
+
+test('stopping a starting Job releases its shared wait while foreground keeps its batch result', async () => {
+  for (const failed of [false, true]) {
+    const fixture = schoolFixture();
+    await fixture.schoolLearning.restore();
+    await fixture.setSchoolReminders(true);
+    await fixture.advance(monday(10));
+    const previous = fixture.schoolLearning.getSnapshot();
+    const activities = Promise.withResolvers();
+    const read = fixture.read;
+    fixture.read = signal => signal ? Promise.resolve({ rollcalls: [] }) : activities.promise;
+    const refreshing = fixture.schoolLearning.refresh();
+    await flush();
+    let stopped = false;
+    const running = fixture.runSchoolReminderJob('job-1').then(() => { stopped = true; });
+    await flush();
+    fixture.stop();
+    await flush();
+    assert.equal(stopped, true);
+    assert.equal(fixture.schoolLearning.getSnapshot().refreshing, true);
+    assert.equal(fixture.calls.filter(([action]) => action === 'rollcalls').length, 1);
+    if (failed) activities.reject(Error('NETWORK'));
+    else activities.resolve(await read());
+    assert.equal(await refreshing, !failed);
+    await running;
+    assert.deepEqual(fixture.notices, []);
+    const snapshot = fixture.schoolLearning.getSnapshot();
+    if (failed) {
+      assert.strictEqual(snapshot.todos, previous.todos);
+      assert.strictEqual(snapshot.rollcalls, previous.rollcalls);
+      assert.equal(fixture.files.has('learning'), false);
+    } else assert.equal(snapshot.rollcalls[0].id, '81');
+  }
+});
+
+test('a reminder renewal failure stops the Job without scheduling the next lesson', async () => {
+  const fixture = schoolFixture(new Map(), 41, [lesson('first', '10:00', '10:50'), lesson('later', '14:00', '15:00')]);
+  await fixture.schoolLearning.restore();
+  await fixture.setSchoolReminders(true);
+  await fixture.advance(monday(10));
+  fixture.read = async () => { throw Object.assign(Error('renewal failed'), { needsLogin: true }); };
+  const running = fixture.runSchoolReminderJob('job-1');
+  await flush();
+  assert.deepEqual(fixture.finished, [['job-1', null]]);
+  assert.equal(fixture.schoolLearning.getSnapshot().needsLogin, true);
+  assert.deepEqual(fixture.notices, []);
+  await running;
 });
 
 test('history and a live receipt preserve an empty Job result when saving', async () => {
@@ -384,6 +421,26 @@ test('the window deadline aborts a slow query and schedules the next lesson', as
   assert.equal(fixture.calls[0][2].aborted, true);
   assert.equal(fixture.notices.length, 0);
   assert.deepEqual(fixture.finished, [['job-1', monday(13, 50)]]);
+});
+
+test('a timetable refresh replaces the Job only if the current window changes', async () => {
+  for (const changed of [false, true]) {
+    const fixture = schoolFixture(new Map(), 41, [lesson('first', '10:00', '10:50'), lesson('later', '14:00', '15:00')]);
+    await fixture.schoolLearning.restore();
+    await fixture.schoolLearning.setRefreshSchedule(true);
+    await fixture.setSchoolReminders(true);
+    await fixture.advance(monday(10));
+    const running = fixture.runSchoolReminderJob('job-1');
+    await flush();
+    fixture.scheduleRows = [lesson('first', '10:00', changed ? '10:40' : '10:50'), lesson('later', '15:00', '16:00')];
+    assert.equal(await fixture.schoolLearning.refresh(), true);
+    assert.equal(await fixture.syncSchoolReminders(), true);
+    assert.deepEqual(fixture.scheduled, changed ? [monday(9, 50), monday(10)] : [monday(9, 50)]);
+    assert.equal(fixture.calls.filter(([action]) => action === 'rollcalls').length, 1);
+    if (!changed) await fixture.advance(monday(11));
+    await running;
+    assert.deepEqual(fixture.finished, changed ? [] : [['job-1', monday(14, 50)]]);
+  }
 });
 
 test('permission refusal prevents jobs and disabling stops an in-flight read and survives restart', async () => {

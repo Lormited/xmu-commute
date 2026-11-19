@@ -155,6 +155,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
   const publish = (patch: Partial<LearningSnapshot>) => { state = { ...state, ...patch }; listeners.forEach(listener => listener()); };
   let generation = 0;
   let identity = 0;
+  let foregroundRollcalls: { identity: number; accountId: number; result: Promise<Rollcall[]> } | undefined;
   const submissions = new Map<string, { dismissed: boolean; task: Promise<AttendanceReceipt> }>();
   let writing = Promise.resolve();
   let operation: Promise<boolean> | null = null;
@@ -164,6 +165,10 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
   let cleanupFailed = false;
   let restoreFailed = false;
   const current = (version: number) => generation === version;
+  function invalidateSession(message: string) {
+    generation++; operation = null; historyOperation = null;
+    publish({ authenticated: false, needsLogin: true, refreshing: false, historyRefreshing: false, message });
+  }
   const completed = () => ({ ...state.attendance, ...state.pendingAttendance });
   function saveAttendance(rollcalls = state.rollcalls) {
     const { account, todos, todosAt, term, courses, coursesAt, schedule, scheduleAt, refreshSchedule, history, historyAt } = state;
@@ -177,7 +182,18 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     const sameIdentity = () => version === identity && state.account?.lntId === account.lntId;
     const sameSession = () => sameIdentity() && state.authenticated && !state.loggingIn;
     if (!valid() || !sameSession()) return [];
-    const activities = rollcallsFrom(await device.read('rollcalls', undefined, account, signal));
+    let activities: Rollcall[];
+    try {
+      const reading = foregroundRollcalls;
+      activities = reading?.identity === version && reading.accountId === account.lntId
+        ? await reading.result : rollcallsFrom(await device.read('rollcalls', undefined, account, signal));
+    } catch (error) {
+      const { code, needsLogin } = (error as SchoolFailure) ?? {};
+      const retry = loginRetryMessage(code, needsLogin);
+      if (!retry || signal.aborted || !valid() || !sameSession()) throw error;
+      invalidateSession(retry);
+      return [];
+    }
     const saved = writing.then(async () => {
       if (!valid() || !sameSession() || state.todosAt === null) return [];
       const rollcalls = activities.filter(({ id }) => !Object.hasOwn(state.attendance, id));
@@ -236,11 +252,11 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     if (failure) throw failure.reason;
     return sortHistory(responses.flatMap(result => result.status === 'fulfilled' ? result.value : []));
   }
-  function update(login: boolean, onAuthorized?: () => void, keepRollcalls = false): Promise<boolean> {
+  function update(login: boolean, onAuthorized?: () => void): Promise<boolean> {
     if (clearing || cleanupFailed) return Promise.resolve(false);
     if (operation && (!login || state.loggingIn)) return operation;
     if (!login && !state.authenticated) return Promise.resolve(false);
-    if (!login && historyOperation) return historyOperation.then(() => update(false, undefined, keepRollcalls));
+    if (!login && historyOperation) return historyOperation.then(() => update(false));
     if (login) { identity++; submissions.clear(); historyOperation = null; publish({ historyRefreshing: false, historyMessage: null }); }
     const version = ++generation;
     const fullBatch = login || state.todosAt === null;
@@ -272,8 +288,13 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
         if (!current(version)) return false;
         failure = 'LNT 进行中签到更新失败，已保留原数据';
         const rollcallsAtReadStart = state.rollcalls;
-        const rollcalls = !fullBatch && (keepRollcalls || pollingRollcalls())
-          ? null : rollcallsFrom(await device.read('rollcalls', undefined, account));
+        let rollcalls: Rollcall[] | null = null;
+        if (fullBatch || !pollingRollcalls()) {
+          const reading = { identity, accountId: account.lntId, result: device.read('rollcalls', undefined, account).then(rollcallsFrom) };
+          foregroundRollcalls = reading;
+          try { rollcalls = await reading.result; }
+          finally { if (foregroundRollcalls === reading) foregroundRollcalls = undefined; }
+        }
         if (!current(version)) return false;
         failure = 'LNT 当前学期读取失败，已保留原数据';
         const term = lntTermFrom(await device.read('lntTerms', undefined, account));
@@ -342,10 +363,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
           receipt = { result: 'failed', message: retry ?? '未收到有效回执，提交结果未知，请核实本人记录' };
           if (identity === version && (retry || needsLogin)) {
             if (needsLogin) publish({ authenticated: false, needsLogin: true });
-            else {
-              generation++; operation = null; historyOperation = null;
-              publish({ authenticated: false, needsLogin: true, refreshing: false, historyRefreshing: false, message: receipt.message });
-            }
+            else invalidateSession(receipt.message);
           }
         }
         if (identity !== version) return { result: 'failed', message: '登录状态已改变，请刷新核对签到结果' } as AttendanceReceipt;
@@ -410,7 +428,7 @@ export function createLearning(device: SchoolDevice, now = Date.now, pollingRoll
     refreshPendingRollcalls,
     canNotifyRollcall,
     login: (onAuthorized?: () => void) => update(true, onAuthorized),
-    refresh: (options?: { keepRollcalls?: boolean }) => update(false, undefined, options?.keepRollcalls),
+    refresh: () => update(false),
     refreshHistory,
     async setRefreshSchedule(enabled: boolean): Promise<boolean> {
       if (typeof enabled !== 'boolean' || clearing || cleanupFailed || state.loggingIn) return false;
