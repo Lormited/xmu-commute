@@ -8,7 +8,7 @@ import { TodayCourseCard } from '@/today-course-card';
 import { Glass, Icon, ResourceBlock, RowGroup, Screen, Section, StateCard, Tap, TodoRow, c, s } from '@/ui';
 
 export default function Today() {
-  const { state, real, data, todayDate, todos: list, login, timetable: savedTimetable, isTrialRollcall, homeRefreshAt } = useDemo();
+  const { state, real, data, todayDate, todos: list, login, timetable: savedTimetable, homeRefreshAt } = useDemo();
   const { width } = useWindowDimensions();
   const [{ firstShownAt, previousRefreshAt }] = useState(() => ({ firstShownAt: new Date(), previousRefreshAt: homeRefreshAt }));
   const courseAt = homeRefreshAt && homeRefreshAt !== previousRefreshAt ? homeRefreshAt : firstShownAt;
@@ -18,8 +18,7 @@ export default function Today() {
   const today = timetable.sessionsForWeek(timetable.currentWeek).filter(item => item.day === (real ? (courseAt.getDay() + 6) % 7 : 0))
     .sort((a, b) => a.start - b.start);
   const title = real ? todayDate.toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).replace('星期', ' · 星期') : '10月26日 · 星期一';
-  const active = state.rollcalls.filter(item => !state.attendance[item.id]
-    && (isTrialRollcall(item.id) || state.loggedIn && state.load === 'ready'));
+  const active = state.loggedIn && state.load === 'ready' ? state.rollcalls.filter(item => !state.attendance[item.id]) : [];
   const cardWidth = Math.min(Math.min(carouselWidth, 440) - 84, 300);
   const courseIndex = real ? currentCourseIndex(today, courseAt) : today.length ? 0 : -1;
   const courseId = today[courseIndex]?.id;
@@ -40,7 +39,6 @@ export default function Today() {
   })}</View>;
   if (!state.loggedIn) return <Screen tab title={title}>
     <StateCard icon="school-outline" title="登录后查看学习数据" action="学校统一登录" busy={real && data.loggingIn} onPress={login} />
-    {attendanceCards}
   </Screen>;
   return <Screen tab resource="jw" title={title}>
     <Section title="今日课程" action="全部课表" onPress={() => router.navigate('/schedule')} />

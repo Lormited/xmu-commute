@@ -12,13 +12,12 @@ import { QrAttendance } from '@/qr-attendance';
 
 type Phase = 'input' | 'locating' | 'submitting' | AttendanceResult;
 export default function Attendance() {
-  const { state, dispatch, real, data, submitNumber, submitQr, submitLocation, isTrialRollcall } = useDemo();
+  const { state, dispatch, real, data, submitNumber, submitQr, submitLocation } = useDemo();
   const { id } = useLocalSearchParams<{ id?: string }>();
   const navigation = useNavigation();
   const focused = useIsFocused();
   const rollcall = id ? state.rollcalls.find(item => item.id === id) : state.rollcalls.at(-1);
   const rollcallId = rollcall?.id ?? '';
-  const simulated = isTrialRollcall(rollcallId);
   const insets = useSafeAreaInsets();
   const [code, setCode] = useState('');
   const [phase, setPhase] = useState<Phase>(state.pendingAttendance[rollcallId] ?? state.attendance[rollcallId] ?? 'input');
@@ -32,8 +31,7 @@ export default function Attendance() {
   const locationRequest = useRef<{ cancelled: boolean } | null>(null);
   const overlay = Platform.OS === 'web';
   const busy = phase === 'submitting' || phase === 'locating';
-  const eligible = simulated ? !state.attendance[rollcallId] && !state.pendingAttendance[rollcallId]
-    : canAttend(state, rollcallId) && (!real || (data.authenticated && !data.loggingIn));
+  const eligible = canAttend(state, rollcallId) && (!real || (data.authenticated && !data.loggingIn));
   const method = rollcall?.method ?? 'number';
   const panelHeight = method === 'number' ? phase === 'failed' ? 316 : 256 : 408;
   useEffect(() => {
@@ -142,14 +140,13 @@ export default function Attendance() {
         : !eligible ? <View style={a.result}><Icon name="close-circle-outline" size={38} color={c.red} /><Text style={s.rowLabel}>{real && data.needsLogin ? '学校登录失效，请重新登录' : '签到不可用，请刷新后重试'}</Text><Button secondary label="返回" onPress={close} /></View>
         : method === 'number' ? <>
           <TextInput ref={field} value={code} onChangeText={enterCode} accessibilityLabel={real ? '四位签到码' : '四位演示签到码'} testID="attendance-code" inputMode="numeric" keyboardType="number-pad" maxLength={4} autoFocus={Platform.OS !== 'web'} selectTextOnFocus autoComplete="off" placeholder="····" placeholderTextColor="#888888" selectionColor={c.accent} style={a.code} />
-          <Text style={a.hint}>{!real ? `演示码 ${DEMO_CODE}` : simulated ? `模拟码 ${DEMO_CODE}` : '输入四位签到码后自动提交'}</Text>
+          <Text style={a.hint}>{real ? '输入四位签到码后自动提交' : `演示码 ${DEMO_CODE}`}</Text>
         </> : real && method === 'radar' ? <>
           <View style={a.scanner}><Icon name="locate-outline" size={76} color="#a08bad" /></View>
           <Button label="获取位置并签到" onPress={() => void locate()} />
           <Text accessibilityRole={message ? 'alert' : undefined} style={a.hint}>{message || '获取设备当前位置后提交到本次签到'}</Text>
         </> : real && method === 'qr' ? <>
           {focused && <QrAttendance onScan={submit} />}
-          {simulated && <Button secondary label="模拟识别二维码" onPress={() => submit(JSON.stringify({ rollcallId, data: 'trial' }))} />}
         </> : <>
           <View style={a.scanner}><Icon name={method === 'qr' ? 'scan-outline' : 'locate-outline'} size={76} color="#a08bad" /></View>
           {permission === 'granted' ? <Button label={method === 'qr' ? '读取演示二维码' : '确认模拟位置'} onPress={() => submit()} />

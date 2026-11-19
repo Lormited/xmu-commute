@@ -12,12 +12,12 @@ import * as learningModule from '../src/learning.ts';
 import * as demoData from '../src/demo-data.ts';
 import * as demoState from '../src/demo-state.ts';
 import * as styleOptions from '../src/style-options.ts';
+import * as debugOptions from '../src/debug-options.ts';
 import * as browserModule from '../src/school-browser.ts';
 import * as scheduleModule from '../src/schedule.ts';
 import * as attendanceModule from '../src/attendance.ts';
 import * as locationModule from '../src/location-attendance.ts';
 import * as qrModule from '../src/qr.ts';
-import { createAttendanceTrial } from '../src/attendance-trial.ts';
 
 const { CALLBACK, IDENTITY, JW_APP, createSchoolBrowser, schoolUrl } = browserModule;
 const { createLearning, historyView, todoView } = learningModule;
@@ -1232,7 +1232,7 @@ test('logout drains late requests before removing both sessions; pending logout 
   }
 });
 // Execute the Provider and page callbacks with native rendering/effects replaced.
-function pages(f, previewMode = false, trialCache = null, development = true) {
+function pages(f, previewMode = false, development = true) {
   let context, cursor = 0;
   let preview = demoState.demoReducer(demoState.initialState(), { type: 'scenario', scenario: 'signed-out' });
   const slots = [], navigations = [], focusEffects = [], effects = [];
@@ -1269,10 +1269,6 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
     } } }, './demo-state': demoState, './demo-data': demoData,
     './schedule': scheduleModule, './learning': { historyView, todoView }, './school-device': f,
     './school-reminder-device': { schoolLearning: f.learning, schoolRemindersAvailable: false, clearSchoolReminders: async () => {} },
-    './qr.ts': qrModule, './location-attendance.ts': locationModule,
-    './attendance-trial': { createAttendanceTrial }, './attendance-trial-device': { attendanceTrialDevice: {
-      now: Date.now, load: async () => trialCache, save: async () => {}, stop: async () => {},
-    } },
   }, { Date: TodoDate,
     setTimeout(callback, delay) { todoClock.timer = { callback, delay }; return todoClock.timer; },
     clearTimeout(timer) { if (todoClock.timer === timer) todoClock.timer = null; },
@@ -1326,6 +1322,7 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
     return page;
   }
   const profilePage = loadModule('../app/(tabs)/profile.tsx', pageMocks);
+  const labPage = loadModule('../app/lab.tsx', { ...pageMocks, '@/debug-options': debugOptions });
   const historyPage = loadModule('../app/history.tsx', { ...pageMocks, '@/swipe-pages': { SwipePages: 'SwipePages' } });
   const settingsPage = loadModule('../app/settings.tsx', { ...pageMocks, react, '@/style-options': styleOptions });
   const learningMocks = { 'react-native': native, 'expo-router': { router }, './demo-context': demo,
@@ -1369,6 +1366,7 @@ function pages(f, previewMode = false, trialCache = null, development = true) {
     pullToRefresh(page) { this.pull(find(screen(page), props => props?.value?.pull && props.value.rotation).props.value); },
     learningPage: () => learningPage.LearningScreen(),
     settings: () => settingsPage.default(),
+    lab: () => labPage.default(),
     courseList: (preview = false) => courseList.CourseList({ preview }),
     courseDetail: (id, session, week) => { Object.assign(params, { id, session, week }); return courseDetail.default(); },
     today: () => renderToday(),
@@ -1415,52 +1413,6 @@ test('every login button opens the WebView directly; cancellation stays on the c
   }
   assert.equal(existsSync(new URL('../app/login.tsx', import.meta.url)), false);
   assert.doesNotMatch(readFileSync(new URL('../app/_layout.tsx', import.meta.url), 'utf8'), /name="login"/);
-});
-
-test('signed-out home shows only local trial activities and removes one after its simulated receipt sheet closes', async () => {
-  const f = fixture(), id = 'trial-100-1';
-  const app = pages(f, false, JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'number', outcome: 'success', availableAt: 100, discoveredAt: 101, notifiedAt: 101 },
-  ] }));
-  await app.render().trial.restore();
-  let context = app.render();
-  assert.equal(context.state.loggedIn, false);
-  assert.equal(context.data.account, null);
-  assert.ok(app.loginButton('today'), 'school data remains behind login');
-  const entry = app.attendanceEntry('模拟签到活动');
-  assert.ok(entry, 'a local trial remains visible without a school session');
-  assert.equal(app.find(app.today(), props => props?.style?.marginBottom === 22).props.style.marginTop, 22);
-  entry.props.onPress();
-  assert.equal(app.navigations[0][0], 'push');
-  assert.equal(app.navigations[0][1].pathname, '/attendance');
-  assert.equal(app.navigations[0][1].params.id, id);
-  assert.equal((await context.submitNumber(id, '0206')).result, 'success');
-  context = app.render();
-  assert.ok(app.attendanceEntry('模拟签到活动'));
-  context.dispatch({ type: 'attendance-dismissed', ids: [id] }); app.render();
-  assert.equal(app.attendanceEntry('模拟签到活动'), undefined);
-  assert.equal(f.calls.length, 0, 'the home/receipt flow never calls a school API');
-});
-
-test('local trial entries preserve the logged-in homepage empty-data state before and after completion', async () => {
-  const id = 'trial-100-1';
-  const f = fixture(new Map([[cacheName, cacheEnvelope(learningFixture({ todos: [] }))]]));
-  const app = pages(f, false, JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'number', outcome: 'success', availableAt: 100, discoveredAt: 101, notifiedAt: 101 },
-  ] }));
-  await f.learning.restore();
-  assert.equal(app.render().state.load, 'empty');
-  await app.render().trial.restore();
-  const context = app.render();
-  assert.equal(context.state.loggedIn, true);
-  assert.equal(context.state.load, 'empty', 'local activities cannot change the school-data layout state');
-  assert.equal(app.find(app.today(), props => props?.style?.marginBottom === 22).props.style.marginTop, 22);
-  assert.ok(app.attendanceEntry('模拟签到活动'));
-  await context.submitNumber(id, '0206');
-  context.dispatch({ type: 'attendance-dismissed', ids: [id] });
-  assert.equal(app.render().state.load, 'empty');
-  assert.equal(app.attendanceEntry('模拟签到活动'), undefined);
-  assert.equal(f.calls.length, 0);
 });
 
 test('direct preview login restores demo data without school requests or route changes', async () => {
@@ -1780,9 +1732,7 @@ test('timetable requests send the current term and own student number without a 
 });
 
 test('school timetable reaches today, selected weeks and conflict details through the provider', async () => {
-  const f = fixture(), app = pages(f, false, JSON.stringify({ version: 1, logs: [], events: [
-    { id: 'trial-100-1', method: 'number', outcome: 'success', availableAt: 100, discoveredAt: 101, notifiedAt: 101 },
-  ] })); app.render();
+  const f = fixture(), app = pages(f); app.render();
   const morning = new Date(); morning.setHours(7, 30, 0, 0);
   const previousDay = new Date(morning); previousDay.setDate(previousDay.getDate() - 1); previousDay.setHours(23, 55);
   app.todayClock.now = previousDay.getTime();
@@ -1793,9 +1743,8 @@ test('school timetable reaches today, selected weeks and conflict details throug
   const login = app.loginButton('today').props.onPress();
   app.todoClock.now = app.todayClock.now = morning.getTime();
   await authorize(f); await initialize(f); assert.equal(await login, true);
-  await app.render().trial.restore();
   let context = app.render();
-  assert.equal(context.state.load, 'empty', 'the timetable and local trial do not fabricate school todos');
+  assert.equal(context.state.load, 'empty');
   assert.equal(context.timetable.currentWeek, 8);
   assert.equal(context.state.week, 8);
   assert.equal(context.state.showWeekends, false);
@@ -1804,12 +1753,8 @@ test('school timetable reaches today, selected weeks and conflict details throug
   assert.doesNotMatch(JSON.stringify(app.courseList()), /001-A|教学班代码/);
   assert.doesNotMatch(JSON.stringify(app.schedulePage()), /测试学期|节次方案/);
   const today = app.today();
-  assert.ok(app.attendanceEntry('模拟签到活动'));
-  const attendanceGap = app.find(today, props => props?.style?.marginBottom === 22).props.style.marginTop;
   const carousel = app.find(today, props => props?.horizontal);
   assert.ok(carousel, 'the first timetable after login uses the new day');
-  const courseGap = carousel.props.contentContainerStyle.paddingBottom;
-  assert.equal(attendanceGap + courseGap, 22, 'real school courses retain their original separation even when ordinary load is empty');
   const card = app.find(today, props => props?.label === '查看学校课程课程详情');
   assert.ok(card, 'today displays school lessons even when there are no todos');
   const schoolBlock = app.find(today, props => props?.resource === 'jw' && props?.emptyTitle);
@@ -1984,23 +1929,16 @@ test('provider startup shows cache and makes exactly one ordinary refresh using 
 });
 
 
-test('release provider keeps school mode and debug selections with isolated trial receipts', async () => {
-  const f = fixture(), id = 'trial-100-1';
-  const app = pages(f, true, JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'number', outcome: 'success', availableAt: 100, discoveredAt: 101, notifiedAt: 101 },
-  ] }), false);
-  let context = app.render();
+test('release debug settings show the account card choice without attendance controls', () => {
+  const f = fixture(), app = pages(f, true, false);
+  const context = app.render();
   assert.equal(context.real, true, 'a release APK cannot switch to mock school data through preview configuration');
-  await context.trial.restore();
-  context.dispatch({ type: 'method', method: 'qr' });
-  context.dispatch({ type: 'outcome', outcome: 'ended' });
-  context = app.render();
-  assert.equal(context.state.method, 'qr');
-  assert.equal(context.state.outcome, 'ended');
   assert.equal(context.state.loggedIn, false);
-  assert.ok(context.isTrialRollcall(id));
-  assert.equal((await context.submitNumber(id, '0206')).result, 'success');
-  assert.equal(f.calls.length, 0, 'release trial submissions remain local');
+  assert.deepEqual(context.state.rollcalls, []);
+  const lab = app.lab();
+  assert.ok(app.find(lab, props => props?.title === '账号卡片'));
+  assert.equal(app.find(lab, props => props?.title === '签到方式'), undefined);
+  assert.equal(app.find(lab, props => props?.label === '体验所选签到'), undefined);
 });
 
 

@@ -10,10 +10,6 @@ import * as data from '../src/demo-data.ts';
 import * as schedule from '../src/schedule.ts';
 import { createLearning, historyView, todoView } from '../src/learning.ts';
 import { activeRollcalls, canAttend, demoReducer, initialState } from '../src/demo-state.ts';
-import { createAttendanceTrial } from '../src/attendance-trial.ts';
-import * as qrModule from '../src/qr.ts';
-import * as locationModule from '../src/location-attendance.ts';
-import { attendanceDestination } from '../src/attendance-reminders.ts';
 
 const require = createRequire(import.meta.url);
 const source = ts.transpileModule(readFileSync(new URL('../app/attendance.tsx', import.meta.url), 'utf8'), {
@@ -57,7 +53,7 @@ runInNewContext(readFileSync(new URL('react-navigation/native-stack/views/Native
 });
 
 // Drive the real screen callbacks; native dismissal is represented separately from requesting back.
-function screen(outcome = 'success', platform = 'android', learning = null, selectedId = null, location = {}, method = 'number', trialCache = null, trialDevice = {}, trialController = null, underlyingIds = []) {
+function screen(outcome = 'success', platform = 'android', learning = null, selectedId = null, location = {}, method = 'number', underlyingIds = []) {
   let state = demoReducer(demoReducer(demoReducer(initialState(), { type: 'method', method }), { type: 'outcome', outcome }), { type: 'start-rollcall' });
   const id = selectedId ?? state.rollcalls[0].id;
   const dispatch = event => { state = demoReducer(state, event); };
@@ -106,12 +102,7 @@ function screen(outcome = 'success', platform = 'android', learning = null, sele
       if (name === './demo-data') return data;
       if (name === './schedule') return schedule;
       if (name === './learning') return { historyView, todoView };
-      if (name === './qr.ts') return qrModule;
-      if (name === './location-attendance.ts') return locationModule;
       if (name === './school-reminder-device') return { schoolLearning: learning ?? createLearning({}), schoolRemindersAvailable: false };
-      if (name === './attendance-trial') return { createAttendanceTrial: trialController ? () => trialController : createAttendanceTrial };
-      if (name === './attendance-trial-device') return { attendanceTrialDevice: { now: Date.now,
-        load: async () => trialCache, save: async () => {}, stop: async () => {}, wake() {}, ...trialDevice } };
       return require(name);
     }
   });
@@ -282,7 +273,8 @@ async function realScreen(reply = async () => ({ result: 'success', message: '�
     { rollcall_id: 82, course_id: 301, course_title: '同课另一个活动', is_number: true },
   ];
   const device = {
-    load: async () => ({ raw: null, account: null }), save: async () => {}, clear: async () => {}, authenticate: async callback => callback?.(),
+    load: async () => ({ raw: null, account: null }), save: async () => {}, clear: async () => {},
+    authenticate: async () => ({ raw: null, account: { lntId: 42, studentNumber: '001234', name: '' } }),
     read: async action => ({
       profile: { id: 42, user_no: '001234' }, todos: { todo_list: [] }, rollcalls: { rollcalls: activities },
       lntTerms: { semesters: [{ id: 9, name: 'LNT 当前学期', is_active: true }] },
@@ -304,54 +296,46 @@ async function realScreen(reply = async () => ({ result: 'success', message: '�
 async function notificationScreen(app, learning, id) {
   let click, opened;
   const bridge = {};
-  runInNewContext(bridgeSource, { exports: bridge, __DEV__: true, AbortController, require(name) {
+  runInNewContext(bridgeSource, { exports: bridge, require(name) {
     if (name === 'react') return { useEffect: effect => effect() };
     if (name === 'react-native') return { Platform: { OS: 'android' } };
     if (name === 'expo-router') return { useRootNavigationState: () => ({ key: 'root' }), router: { push: route => {
       app.blur();
-      opened = screen('success', 'android', learning, route.params.id, {}, 'number', null, {}, app.context.trial, [app.id]);
+      opened = screen('success', 'android', learning, route.params.id, {}, 'number', [app.id]);
     } } };
     if (name === './demo-context') return { useDemo: () => app.context };
-    if (name === './attendance-reminders') return { attendanceDestination };
-    if (name === './attendance-trial-device') return { watchAttendanceNotifications: async listener => { click = listener; return () => {}; } };
-    if (name === './school-reminder-device') return { openSchoolReminder: (identifier, signal) => identifier === 'issued-notice'
-      ? learning.openReminder(learning.getSnapshot().account, id, signal) : null };
+    if (name === 'expo-notifications') return { DEFAULT_ACTION_IDENTIFIER: 'default',
+      addNotificationResponseReceivedListener: listener => { click = listener; return { remove() {} }; },
+      getLastNotificationResponseAsync: async () => null, clearLastNotificationResponseAsync: async () => {} };
     return require(name);
   } });
   bridge.AttendanceNotificationBridge();
-  if (id.startsWith('trial-')) await click({ source: 'trial', rollcallId: id });
-  else await click({ source: 'school' }, 'issued-notice');
+  await app.flush();
+  click({ actionIdentifier: 'default', notification: { request: { identifier: 'issued-notice', content: { data: { source: 'school', rollcallId: id } } } } });
+  await app.flush();
   assert.ok(opened, 'the real notification bridge pushes the requested activity');
   await opened.flush();
   return opened;
 }
 
 test('stacked notification sheets submit independently and remove only the card whose exit finished', async () => {
-  for (const source of ['trial', 'school', 'mixed']) for (const outcome of ['success', 'ended', 'failed']) {
-    const simulated = source !== 'school';
+  for (const outcome of ['success', 'ended', 'failed']) {
     let count = 0;
-    const live = await realScreen(async () => ({ result: ++count === 1 ? 'success' : outcome, message: count === 1 ? 'A confirmed' : 'B ' + outcome }));
-    const ids = source === 'trial' ? ['trial-7000000-1', 'trial-7000000-2'] : source === 'mixed' ? ['81', 'trial-7000000-2'] : ['81', '82'];
-    const a = simulated ? screen('success', 'android', live.learning, ids[0], {}, 'number', JSON.stringify({ version: 1, logs: [], events:
-      ids.map((id, index) => ({ id, method: 'number', outcome: index ? outcome : 'success', availableAt: 1, discoveredAt: 2, notifiedAt: 2 })).filter(item => item.id.startsWith('trial-')),
-    })) : live.app;
+    const { app: a, learning } = await realScreen(async () => ({ result: ++count === 1 ? 'success' : outcome, message: count === 1 ? 'A confirmed' : 'B ' + outcome }));
     await a.flush(); a.enter('0206'); await a.flush();
-    const b = await notificationScreen(a, live.learning, ids[1]);
+    const b = await notificationScreen(a, learning, '82');
     a.advance(2000); assert.equal(a.backRequests, 0, 'covered A cannot close B');
     b.enter('0206'); await b.flush();
-    const feedback = simulated ? { success: '签到成功（模拟）', ended: '签到已结束（模拟）', failed: '签到失败（模拟）' }[outcome] : 'B ' + outcome;
-    assert.ok(b.find(node => node.type === 'Text' && node.props.children === feedback), 'B shows its own receipt: ' + simulated + ' ' + outcome);
-    assert.equal(b.state.attendance[ids[0]], undefined);
-    assert.equal(b.state.attendance[ids[1]], undefined, 'B card remains until native exit ends');
+    assert.ok(b.find(node => node.type === 'Text' && node.props.children === 'B ' + outcome));
+    assert.equal(b.state.attendance['81'], undefined);
+    assert.equal(b.state.attendance['82'], undefined, 'B card remains until native exit ends');
     b.nativeDismiss(); a.focus();
-    assert.equal(a.state.attendance[ids[1]], outcome === 'failed' ? undefined : outcome, 'B exit settles B while A remains on the stack');
-    assert.equal(a.state.attendance[ids[0]], undefined, 'A card remains until A exits');
-    assert.ok(a.find(node => node.type === 'Text' && node.props.children === (source === 'trial' ? '签到成功（模拟）' : 'A confirmed')));
+    assert.equal(a.state.attendance['82'], outcome === 'failed' ? undefined : outcome, 'B exit settles B while A remains on the stack');
+    assert.equal(a.state.attendance['81'], undefined, 'A card remains until A exits');
+    assert.ok(a.find(node => node.type === 'Text' && node.props.children === 'A confirmed'));
     a.nativeDismiss();
-    assert.equal(a.state.attendance[ids[0]], 'success');
-    assert.equal(a.state.attendance[ids[1]], outcome === 'failed' ? undefined : outcome);
-    if (source === 'trial') assert.equal(live.answers.length, 0);
-    if (source === 'mixed') assert.equal(live.answers.length, 1);
+    assert.equal(a.state.attendance['81'], 'success');
+    assert.equal(a.state.attendance['82'], outcome === 'failed' ? undefined : outcome);
   }
 });
 
@@ -428,27 +412,6 @@ test('real number screen submits only at four digits, preserves zeros, shows sch
   app.dismiss(); app.transitionEnd(true);
   assert.deepEqual(activeRollcalls(app.state).map(item => item.id), ['82']);
   assert.equal(app.state.history.length, 0, 'real receipts never fabricate demo history');
-});
-
-test('restored trial id opens the real number sheet and uses a persisted simulated receipt without any school write', async () => {
-  const { learning, answers } = await realScreen();
-  const id = 'trial-1000000-1';
-  const app = screen('success', 'android', learning, id, {}, 'number', JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'number', outcome: 'success', availableAt: 1000000, discoveredAt: 1000010, notifiedAt: 1000010 },
-  ] }));
-  await app.flush();
-  assert.ok(app.find(node => node.type === 'TextInput'));
-  assert.equal(app.context.isTrialRollcall(id), true);
-  app.enter('0206'); await app.flush();
-  assert.ok(app.find(node => node.type === 'Text' && node.props.children === '签到成功（模拟）'));
-  assert.equal(answers.length, 0);
-  assert.equal(app.state.pendingAttendance[id], 'success');
-  assert.equal(app.state.attendance[id], undefined);
-  app.dismiss(); app.transitionEnd(true);
-  assert.equal(app.state.attendance[id], 'success');
-  assert.equal(learning.getSnapshot().rollcalls.some(item => item.id === id), false);
-  assert.equal((await app.context.submitNumber('trial-unknown', '0206')).result, 'failed');
-  assert.equal(answers.length, 0);
 });
 
 test('real network errors show an uncertain result; explicit re-entry and manual success closing share native dismissal', async () => {
@@ -614,62 +577,6 @@ test('a QR receipt during dismissal records the result without scheduling anothe
 });
 
 
-test('trial QR keeps the real camera and demo scan connected to local receipts without school writes', async () => {
-  for (const input of ['camera', 'demo']) {
-    const { learning, answers } = await realScreen();
-    const id = 'trial-2000000-1';
-    const saved = JSON.stringify({ version: 1, logs: [], events: [
-      { id, method: 'qr', outcome: 'success', availableAt: 1, discoveredAt: 2, notifiedAt: 2 },
-    ] });
-    const app = screen('success', 'android', learning, id, {}, 'qr', saved);
-    await app.flush();
-    const camera = app.find(node => node.type === 'QrAttendance');
-    assert.ok(camera, 'trial retains the actual camera component');
-    camera.props.onScan(JSON.stringify({ rollcallId: '81', data: 'wrong activity' }));
-    await app.flush();
-    assert.equal(answers.length, 0);
-    assert.ok(app.find(node => node.type === 'Text' && node.props.children === '模拟二维码与当前活动不符'));
-    app.find(node => node.props?.label === '重新签到').props.onPress(); app.rerender();
-    if (input === 'camera') app.find(node => node.type === 'QrAttendance').props.onScan(JSON.stringify({ rollcallId: id, data: ' opaque ' }));
-    else app.find(node => node.props?.label === '模拟识别二维码').props.onPress();
-    await app.flush();
-    assert.equal(answers.length, 0);
-    assert.ok(app.find(node => node.type === 'Text' && node.props.children === '签到成功（模拟）'));
-    assert.equal(app.state.pendingAttendance[id], 'success');
-    app.advance(1000); app.dismiss(); app.transitionEnd(true);
-    assert.equal(app.state.attendance[id], 'success');
-    assert.equal(activeRollcalls(app.state).some(item => item.id === id), false);
-    assert.equal((await app.context.submitQr('trial-unknown', '{}')).result, 'failed');
-    assert.equal(answers.length, 0);
-  }
-});
-
-test('trial location uses actual location callbacks but isolates the simulated receipt from school writes', async () => {
-  const { learning, answers } = await realScreen();
-  const id = 'trial-3000000-1';
-  const position = { latitude: 24.441, longitude: 118.103, accuracy: 7, altitude: null, altitudeAccuracy: null, heading: null, speed: null };
-  const calls = [];
-  const saved = JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'radar', outcome: 'success', availableAt: 1, discoveredAt: 2, notifiedAt: 2 },
-  ] });
-  const app = screen('success', 'android', learning, id, {
-    requestForegroundPermissionsAsync: async () => { calls.push('permission'); return { granted: true }; },
-    getCurrentPositionAsync: async () => { calls.push('position'); return { coords: position }; },
-  }, 'radar', saved);
-  await app.flush();
-  assert.equal((await app.context.submitLocation(id, { ...position, latitude: NaN })).result, 'failed');
-  app.find(node => node.props?.label === '获取位置并签到').props.onPress(); await app.flush();
-  assert.deepEqual(calls, ['permission', 'position']);
-  assert.equal(answers.length, 0);
-  assert.ok(app.find(node => node.type === 'Text' && node.props.children === '签到成功（模拟）'));
-  assert.equal(app.state.pendingAttendance[id], 'success');
-  app.advance(1000); app.dismiss(); app.transitionEnd(true);
-  assert.equal(app.state.attendance[id], 'success');
-  assert.equal(activeRollcalls(app.state).some(item => item.id === id), false);
-  assert.equal((await app.context.submitLocation('trial-unknown', position)).result, 'failed');
-  assert.equal(answers.length, 0);
-});
-
 
 test('a covered QR sheet releases the camera and accepts a fresh scan when focused again', async () => {
   const { app, answers } = await realScreen(undefined, 'qr');
@@ -754,31 +661,12 @@ test('a result timer pauses while covered and manual closing cannot navigate a s
   }
 });
 
-test('covered trial receipts keep the simulated result and never write to school', async () => {
-  const { learning, answers } = await realScreen();
-  const id = 'trial-4000000-1';
-  const app = screen('success', 'android', learning, id, {}, 'number', JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'number', outcome: 'success', availableAt: 1, discoveredAt: 2, notifiedAt: 2 },
-  ] }));
-  await app.flush(); app.enter('0206'); app.blur(); await app.flush();
-  app.advance(2000); assert.equal(app.backRequests, 0);
-  app.transitionEnd(true); app.focus();
-  assert.ok(app.find(node => node.type === 'Text' && node.props.children === '签到成功（模拟）'));
-  assert.equal(app.state.pendingAttendance[id], 'success', 'the underlying trial sheet is still open');
-  app.advance(1000); assert.equal(app.backRequests, 1);
-  app.nativeDismiss(); assert.equal(app.state.attendance[id], 'success');
-  assert.equal(answers.length, 0);
-});
-
-test('installed native-stack dismissal consumes school and trial receipts for each method and close action', async () => {
+test('installed native-stack dismissal consumes school receipts for each method and close action', async () => {
   const position = { latitude: 24.441, longitude: 118.103, accuracy: 7, altitude: null, altitudeAccuracy: null, heading: null, speed: null };
   const location = { requestForegroundPermissionsAsync: async () => ({ granted: true }), getCurrentPositionAsync: async () => ({ coords: position }) };
-  for (const trial of [false, true]) for (const method of ['number', 'qr', 'radar']) for (const close of ['auto', 'manual', 'gesture', 'system-back']) {
-    const live = await realScreen(undefined, method, '81', location);
-    const id = trial ? 'trial-5000000-1' : '81';
-    const app = trial ? screen('success', 'android', live.learning, id, location, method, JSON.stringify({ version: 1, logs: [], events: [
-      { id, method, outcome: 'success', availableAt: 1, discoveredAt: 2, notifiedAt: 2 },
-    ] })) : live.app;
+  for (const method of ['number', 'qr', 'radar']) for (const close of ['auto', 'manual', 'gesture', 'system-back']) {
+    const id = '81';
+    const { app } = await realScreen(undefined, method, id, location);
     await app.flush();
     if (method === 'number') app.enter('0206');
     else if (method === 'qr') app.find(node => node.type === 'QrAttendance').props.onScan(JSON.stringify({ rollcallId: id, data: 'valid' }));
@@ -789,29 +677,10 @@ test('installed native-stack dismissal consumes school and trial receipts for ea
     if (close === 'auto') app.advance(1000);
     if (close === 'manual') app.close();
     app.nativeDismiss(close === 'gesture');
-    assert.equal(app.state.attendance[id], 'success', [trial, method, close].join(' '));
+    assert.equal(app.state.attendance[id], 'success', [method, close].join(' '));
     assert.deepEqual(Object.keys(app.state.pendingAttendance), []);
     assert.equal(activeRollcalls(app.state).some(item => item.id === id), false, 'closed successful sheet must not leave an unavailable card');
     app.advance(2000);
     assert.equal(app.backRequests, close === 'auto' || close === 'manual' ? 1 : 0, 'native dismissal cannot schedule a second back');
-    if (trial) assert.equal(live.answers.length, 0);
   }
-});
-
-test('a trial receipt saved after native dismissal updates its card without reopening the sheet', async () => {
-  const { learning, answers } = await realScreen();
-  const id = 'trial-6000000-1';
-  let finishSave;
-  const saved = new Promise(resolve => { finishSave = resolve; });
-  const app = screen('success', 'android', learning, id, {}, 'number', JSON.stringify({ version: 1, logs: [], events: [
-    { id, method: 'number', outcome: 'success', availableAt: 1, discoveredAt: 2, notifiedAt: 2 },
-  ] }), { save: () => saved });
-  await app.flush(); app.enter('0206'); await app.flush();
-  app.nativeDismiss(true);
-  assert.equal(app.state.attendance[id], undefined);
-  finishSave(); await app.flush();
-  assert.equal(app.state.attendance[id], 'success');
-  assert.deepEqual(Object.keys(app.state.pendingAttendance), []);
-  app.advance(2000); assert.equal(app.backRequests, 0);
-  assert.equal(answers.length, 0);
 });

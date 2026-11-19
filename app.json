@@ -29,8 +29,7 @@
           "locationFullAccuracyPermission": false
         }
       ],
-      "expo-notifications",
-      "./plugins/with-background-trial.cjs"
+      "expo-notifications"
     ],
     "web": {
       "bundler": "metro",

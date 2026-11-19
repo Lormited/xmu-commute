@@ -12,8 +12,8 @@ function Options<T extends string>({ title, options, value, select, preview }: {
 }
 export default function DebugChoice() {
   const { kind } = useLocalSearchParams<{ kind?: string }>();
-  const { state, dispatch } = useDemo();
-  switch (kind) {
+  const { state, dispatch, real } = useDemo();
+  switch (!real || kind === 'account-card' ? kind : undefined) {
     case 'account-card': return <Options title="账号卡片" options={accountCardStyles} value={state.accountCardStyle} select={value => dispatch({ type: 'account-card-style', value })} preview={() => router.dismissTo('/profile')} />;
     case 'scenario': return <Options title="演示场景" options={scenarios} value={state.scenario} select={scenario => dispatch({ type: 'scenario', scenario })} />;
     case 'method': return <Options title="签到方式" options={methods} value={state.method} select={method => dispatch({ type: 'method', method })} />;
