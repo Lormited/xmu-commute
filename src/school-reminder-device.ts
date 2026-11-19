@@ -50,6 +50,12 @@ async function load(id: number): Promise<SavedReminders> {
       && typeof notice.delivered === 'boolean')) throw Error('REMINDER_STORAGE');
   return value.accountId === id ? value : empty;
 }
+export async function readSchoolRemindersEnabled() {
+  const account = currentAccount();
+  if (!schoolRemindersAvailable || !account) return false;
+  const saved = await load(account.lntId).catch(() => null);
+  return saved?.enabled === true && currentAccount()?.lntId === account.lntId;
+}
 async function save(value: SavedReminders) {
   const temporary = temporaryFile();
   try {

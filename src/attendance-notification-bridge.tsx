@@ -14,20 +14,23 @@ export function AttendanceNotificationBridge() {
     void import('expo-notifications').then(api => {
       if (!active) return;
       const seen = new Set<string>();
-      async function handle(response: NotificationResponse | null) {
+      function handle(response: NotificationResponse | null) {
         if (!active || response?.actionIdentifier !== api.DEFAULT_ACTION_IDENTIFIER) return;
         const { identifier, content: { data } } = response.notification.request;
         if (seen.has(identifier)) return;
         seen.add(identifier);
         const { source, rollcallId } = data ?? {};
-        if (source === 'school' && typeof rollcallId === 'string' && rollcallId.trim()) {
-          router.push({ pathname: '/attendance', params: { id: rollcallId } });
-        }
-        const last = await api.getLastNotificationResponseAsync();
-        if (active && last?.notification.request.identifier === identifier) await api.clearLastNotificationResponseAsync();
+        try {
+          if (source === 'school' && typeof rollcallId === 'string' && rollcallId.trim()) {
+            router.push({ pathname: '/attendance', params: { id: rollcallId } });
+          }
+          if (active && api.getLastNotificationResponse()?.notification.request.identifier === identifier) {
+            api.clearLastNotificationResponse();
+          }
+        } catch {}
       }
-      subscription = api.addNotificationResponseReceivedListener(response => { void handle(response).catch(() => {}); });
-      void api.getLastNotificationResponseAsync().then(handle).catch(() => {});
+      subscription = api.addNotificationResponseReceivedListener(handle);
+      handle(api.getLastNotificationResponse());
     }).catch(() => {});
     return () => { active = false; subscription?.remove(); };
   }, [ready, navigation?.key]);

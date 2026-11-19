@@ -120,6 +120,24 @@ test('the Job saves and publishes pending activities before posting, then saves 
   await running;
 });
 
+test('cold-start refresh queries activities unless reminders are enabled for the restored account', async () => {
+  const fixture = schoolFixture();
+  await fixture.schoolLearning.restore();
+  const reopen = async (accountId = 41) => {
+    const reopened = schoolFixture(new Map(fixture.files), accountId);
+    await reopened.schoolLearning.restore();
+    const keepRollcalls = await reopened.readSchoolRemindersEnabled();
+    assert.equal(await reopened.schoolLearning.refresh({ keepRollcalls }), true);
+    return reopened.calls.filter(([action]) => action === 'rollcalls').length;
+  };
+  assert.equal(await reopen(), 1);
+  assert.equal(await fixture.setSchoolReminders(true), true);
+  assert.equal(await reopen(), 0);
+  assert.equal(await reopen(42), 1);
+  fixture.files.set('school-reminders.json', '{');
+  assert.equal(await reopen(), 1);
+});
+
 test('an ordinary batch cannot overwrite a newer Job result and reads activities again when the Job stops', async () => {
   const fixture = schoolFixture();
   await fixture.schoolLearning.restore();
@@ -424,8 +442,8 @@ test('cold and warm taps wait for local readiness and open the given ID even whe
   const routes = [];
   const api = { DEFAULT_ACTION_IDENTIFIER: 'default',
     addNotificationResponseReceivedListener(callback) { listener = callback; return { remove() { removed++; } }; },
-    getLastNotificationResponseAsync: async () => last,
-    clearLastNotificationResponseAsync: async () => { last = null; cleared++; },
+    getLastNotificationResponse: () => last,
+    clearLastNotificationResponse: () => { last = null; cleared++; },
   };
   const bridge = load('../src/attendance-notification-bridge.tsx', {
     react: { useEffect: effect => { cleanup = effect(); } }, 'react-native': { Platform: { OS: 'android' } },
@@ -444,7 +462,8 @@ test('cold and warm taps wait for local readiness and open the given ID even whe
   assert.equal(cleared, 1);
   listener(last = makeResponse('foreign', { source: 'other', rollcallId: '82' })); await flush();
   listener(last = makeResponse('legacy', { source: 'school' })); await flush();
-  listener(last = makeResponse('ended', { source: 'school', rollcallId: '99' })); await flush();
+  listener(last = makeResponse('ended', { source: 'school', rollcallId: '99' }));
+  assert.equal(last, null, 'the handled response is cleared before the next event can arrive');
   assert.deepEqual(routes.map(route => [route.pathname, route.params.id]), [['/attendance', '81'], ['/attendance', '99']]);
   assert.equal(cleared, 4);
   cleanup();
