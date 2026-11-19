@@ -33,7 +33,7 @@ export type SchoolDevice = {
   save(value: string): Promise<void>;
   clear(): Promise<void>;
   authenticate(): Promise<{ raw: string | null; account: Account }>;
-  read(action: 'profile' | 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account, signal?: AbortSignal): Promise<unknown>;
+  read(action: 'todos' | 'rollcalls' | 'lntTerms' | 'jwTerms' | 'jwWeek' | 'courses' | 'history' | 'jwSchedule', params?: { semesterId?: number; jwTermCode?: string; courseId?: number; studentId?: number; studentNumber?: string }, account?: Account, signal?: AbortSignal): Promise<unknown>;
   answerNumber(rollcallId: string, numberCode: string, account: Account): Promise<AttendanceReceipt>;
   submitLocation(rollcallId: string, position: Position, account: Account): Promise<AttendanceReceipt>;
   submitQr(rollcallId: string, data: unknown, account: Account): Promise<AttendanceReceipt>;
@@ -59,12 +59,6 @@ export function historyView(item: SchoolHistory): HistoryItem {
   return { id: item.course_id + ':' + item.rollcall_id, course: item.course_name, date: time.slice(0, 10),
     time: time.slice(11, 16), at,
     type, status: item.status === 'absent' ? 'absent' : 'success', detail: item.student_status_detail };
-}
-function accountFrom(value: unknown): Account {
-  const profile = value as { id?: unknown; user_no?: unknown; name?: unknown; success?: unknown } | null;
-  if (profile?.success === false || typeof profile?.id !== 'number' || !Number.isSafeInteger(profile.id) || profile.id <= 0
-    || typeof profile.user_no !== 'string' || !profile.user_no.trim()) throw Error('INVALID_PROFILE');
-  return { lntId: profile.id, studentNumber: profile.user_no, name: typeof profile.name === 'string' ? profile.name : '' };
 }
 const loginRetryMessage = (code?: string, needsLogin?: boolean) => code === 'COOKIE_STORAGE' ? '学校登录状态保存失败，请重新登录'
   : code === 'SESSION_DRAINING' ? '学校登录状态仍在处理，请稍后重试'
@@ -120,7 +114,7 @@ const loginFailures: Record<string, string> = {
   lnt: 'LNT 登录失败，请重试',
   flush: '登录状态保存失败，请重新登录',
 };
-function cacheFrom(raw: string): SavedLearning | Pick<SavedLearning, 'refreshSchedule'> {
+function cacheFrom(raw: string): SavedLearning | { refreshSchedule: boolean; account?: never } {
   const data = JSON.parse(raw) as SavedLearning;
   if (data?.version !== 1 || typeof data.refreshSchedule !== 'boolean') throw Error('INVALID_CACHE');
   const { account, term, schedule: cachedSchedule, scheduleAt, historyAt, rollcalls, attendance, refreshSchedule } = data;
@@ -195,21 +189,22 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     if (state.loggingIn || state.refreshing) return Promise.resolve(false);
     const version = generation;
     const attempt = (async () => {
-      let authenticated = false;
+      let boundAccount: Account | null = null;
       try {
         const { raw, account } = await device.load();
         if (!current(version)) return false;
-        authenticated = !!account;
+        boundAccount = account;
         const saved = raw ? cacheFrom(raw) : null;
+        const cachedAccount = saved?.account ?? null;
         const recovered = restoreFailed;
         restoreFailed = false;
-        publish({ ...saved, ready: true, authenticated, needsLogin: !authenticated && !!saved && 'account' in saved,
+        publish({ ...saved, account: account ?? cachedAccount, ready: true, authenticated: !!account, needsLogin: !account && !!cachedAccount,
           ...(recovered ? { message: null } : {}) });
         return true;
       } catch {
         if (current(version)) {
           restoreFailed = true;
-          publish({ ready: true, authenticated, message: '学校本机数据读取失败，请重试或退出清理' });
+          publish({ account: boundAccount, ready: true, authenticated: !!boundAccount, message: '学校本机数据读取失败，请重试或退出清理' });
         }
         return false;
       }
@@ -232,7 +227,8 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
     if (!login && historyOperation) return historyOperation.then(() => update(false));
     if (login) { identity++; submissions.clear(); historyOperation = null; publish({ historyRefreshing: false, historyMessage: null }); }
     const version = ++generation;
-    const includeSchedule = login || state.refreshSchedule;
+    const fullBatch = login || state.todosAt === null;
+    const includeSchedule = fullBatch || state.refreshSchedule;
     publish({ loggingIn: login, refreshing: !login, message: null, ...(login ? { attendance: completed(), pendingAttendance: {} } : {}) });
     const task = (async () => {
       let failure = '学校登录失败，请重试';
@@ -240,32 +236,27 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
       try {
         await writing;
         if (!current(version)) return false;
-        let account: Account;
         if (login) {
-          const binding = await device.authenticate();
+          const { account, raw } = await device.authenticate();
           if (!current(version)) return false;
-          account = binding.account;
           let saved: ReturnType<typeof cacheFrom> | null = null;
           try {
-            saved = binding.raw ? cacheFrom(binding.raw) : null;
+            saved = raw ? cacheFrom(raw) : null;
             restoreFailed = false;
           } catch { restoreFailed = true; }
           authorized = true;
           publish({ ...empty, ...saved, account, loggingIn: true, refreshing: true, authenticated: true });
           onAuthorized?.();
-        } else {
-          publish({ refreshing: true });
-          failure = 'LNT 个人资料读取失败，已保留原数据';
-          account = accountFrom(await device.read('profile'));
         }
         if (!current(version)) return false;
+        const { account } = state;
+        if (!account) return false;
         failure = 'LNT 待办更新失败，已保留原数据';
         const todos = todosFrom(await device.read('todos', undefined, account));
         if (!current(version)) return false;
         failure = 'LNT 进行中签到更新失败，已保留原数据';
         const rollcalls = rollcallsFrom(await device.read('rollcalls', undefined, account));
         if (!current(version)) return false;
-        const sameAccount = login || (state.account?.lntId === account.lntId && state.account.studentNumber === account.studentNumber);
         failure = 'LNT 当前学期读取失败，已保留原数据';
         const term = lntTermFrom(await device.read('lntTerms', undefined, account));
         if (!current(version)) return false;
@@ -273,26 +264,24 @@ export function createLearning(device: SchoolDevice, now = Date.now) {
         const courses = coursesFrom(await device.read('courses', { semesterId: term.id }, account), term);
         if (!current(version)) return false;
         failure = '教务课表更新失败，已保留原数据';
-        const cachedSchedule = sameAccount ? state.schedule : null;
-        const schedule = includeSchedule ? await readSchedule(device, account.studentNumber, now, login ? null : cachedSchedule) : cachedSchedule;
+        const schedule = includeSchedule ? await readSchedule(device, account.studentNumber, now, fullBatch ? null : state.schedule) : state.schedule;
         if (!current(version)) return false;
-        const keepHistory = sameAccount && state.term?.id === term.id;
-        if (login) failure = '历史签到读取失败，已保留原数据';
-        const history = login ? await readHistory(courses, account)
+        const keepHistory = state.term?.id === term.id;
+        if (fullBatch) failure = '历史签到读取失败，已保留原数据';
+        const history = fullBatch ? await readHistory(courses, account)
           : keepHistory ? state.history.filter(item => courses.some(course => course.id === item.course_id)) : [];
         if (!current(version)) return false;
         const updatedAt = now();
         const scheduleAt = includeSchedule ? updatedAt : schedule ? state.scheduleAt : null;
-        const historyAt = login ? updatedAt : keepHistory ? state.historyAt : null;
+        const historyAt = fullBatch ? updatedAt : keepHistory ? state.historyAt : null;
         failure = '学校本机数据保存失败，已保留原数据';
         const saved = writing.then(async () => {
           if (!current(version)) return false;
-          const next: SavedLearning = { version: 1, account, todos, todosAt: updatedAt, term, courses, coursesAt: updatedAt, schedule, scheduleAt, refreshSchedule: state.refreshSchedule, rollcalls, attendance: sameAccount ? completed() : {}, history, historyAt };
+          const next: SavedLearning = { version: 1, account, todos, todosAt: updatedAt, term, courses, coursesAt: updatedAt, schedule, scheduleAt, refreshSchedule: state.refreshSchedule, rollcalls, attendance: completed(), history, historyAt };
           await device.save(JSON.stringify(next));
           if (!current(version)) return false;
           restoreFailed = false;
-          publish({ account, todos, rollcalls, todosAt: next.todosAt, term, courses, coursesAt: next.coursesAt, schedule, scheduleAt, history, historyAt, ready: true, needsLogin: false,
-            ...(!sameAccount ? { attendance: {}, pendingAttendance: {} } : {}) });
+          publish({ todos, rollcalls, todosAt: next.todosAt, term, courses, coursesAt: next.coursesAt, schedule, scheduleAt, history, historyAt, ready: true, needsLogin: false });
           return true;
         });
         writing = saved.then(() => {}, () => {});

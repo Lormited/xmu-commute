@@ -950,13 +950,15 @@ test('authentication, cookie snapshot or cache storage failure preserves cached 
   }
 });
 
-test('manual login replaces the session and keeps a failed business batch only for the same cached LNT id', async () => {
+test('manual login replaces the session and keeps learning or preferences only for their LNT id', async () => {
   const oldLearning = learningFixture({ refreshSchedule: true, attendance: { 81: 'success' } });
-  for (const [cachedLearning, lntId, keep] of [
-    [oldLearning, 43, false],
-    [oldLearning, 42, true],
-    [{ version: 1, refreshSchedule: true }, 43, false],
-    [null, 43, false],
+  const preferences = { version: 1, refreshSchedule: true };
+  for (const [cachedLearning, lntId, keepBatch, keepPreference] of [
+    [oldLearning, 43, false, false],
+    [oldLearning, 42, true, true],
+    [preferences, 43, false, false],
+    [preferences, 42, false, true],
+    [null, 43, false, false],
   ]) {
     const f = await boundFixture(cachedLearning);
     await f.learning.restore();
@@ -974,22 +976,33 @@ test('manual login replaces the session and keeps a failed business batch only f
       assert.equal(await Promise.race([reading.promise.then(() => true), login]), true, 'login starts business reads');
       assert.equal(authorized.authenticated, true);
       assert.deepEqual({ ...authorized.account }, account);
-      assert.deepEqual(authorized.todos, keep ? [todo] : []);
-      assert.deepEqual(authorized.courses, keep ? [course] : []);
-      assert.deepEqual(authorized.attendance, keep ? { 81: 'success' } : {});
-      assert.equal(authorized.refreshSchedule, keep);
-      assert.equal(await f.learning.setRefreshSchedule(!keep), false);
+      assert.deepEqual(authorized.todos, keepBatch ? [todo] : []);
+      assert.deepEqual(authorized.courses, keepBatch ? [course] : []);
+      assert.deepEqual(authorized.attendance, keepBatch ? { 81: 'success' } : {});
+      assert.equal(authorized.refreshSchedule, keepPreference);
+      assert.equal(await f.learning.setRefreshSchedule(!keepPreference), false);
       assert.deepEqual(f.cacheMoves, [cacheName]);
     } finally { business.resolve(); }
     assert.equal(await login, false);
     assert.equal(f.learning.getSnapshot().authenticated, true);
-    assert.deepEqual(f.learning.getSnapshot().todos, keep ? [todo] : []);
+    assert.deepEqual(f.learning.getSnapshot().todos, keepBatch ? [todo] : []);
     assert.deepEqual(f.cacheMoves, [cacheName]);
-    const reopened = await fixture(f.files).schoolDevice.load();
-    assert.deepEqual({ ...reopened.account }, account);
-    assert.deepEqual(JSON.parse(reopened.raw), keep ? { ...oldLearning, account } : null);
+    const reopened = fixture(f.files);
+    const expected = keepBatch ? { ...oldLearning, account } : keepPreference ? preferences : null;
+    assert.deepEqual(JSON.parse(f.files.get(cacheName)).learning, expected);
     assert.equal(CookieJar.deserializeSync(savedSession(f).cookies).getCookieStringSync(lntRoot), 'lnt_session=manual-lnt');
-    if (!keep) await assert.rejects(f.schoolDevice.save(JSON.stringify(oldLearning)), { code: 'AUTH_REQUIRED' });
+    if (lntId !== recoveryAccount.lntId) await assert.rejects(f.schoolDevice.save(JSON.stringify(oldLearning)), { code: 'AUTH_REQUIRED' });
+    await reopened.learning.restore();
+    assert.deepEqual({ ...reopened.learning.getSnapshot().account }, account);
+    if (!keepBatch) {
+      assert.equal(await reopened.learning.refresh(), true);
+      const batch = reopened.learning.getSnapshot();
+      assert.ok(batch.scheduleAt !== null && batch.historyAt !== null);
+      assert.ok(reopened.calls.some(({ url }) => url.includes(`/student/${lntId}/rollcalls`)));
+      assert.ok(reopened.calls.some(({ url }) => url.endsWith('/queryXspkjg.do')));
+      assert.equal(reopened.calls.some(({ url }) => url.endsWith('/profile')), false);
+      assert.deepEqual(JSON.parse(f.files.get(cacheName)).learning.account, account);
+    }
   }
 });
 

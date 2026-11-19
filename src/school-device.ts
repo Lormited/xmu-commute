@@ -115,11 +115,13 @@ function schoolResult(url: string, response: SchoolResponse, write = false) {
 async function persistSession(session: BoundSession, version: number,
   { signal, beforeCommit, login = false }: { signal?: AbortSignal; beforeCommit?: () => void; login?: boolean } = {}) {
   try {
-    return await persistCache(({ learning }) => {
+    return await persistCache(({ learning, session: previous }) => {
       const owner = learningAccount(learning);
       const { account, jar } = session;
-      if (login) learning = owner?.lntId === account.lntId ? { ...learning!, account } : null;
-      else if (owner) assertLntAccount(owner, account);
+      if (login) {
+        if ((owner ?? previous?.account)?.lntId !== account.lntId) learning = null;
+        else if (learning && owner) learning = { ...learning, account };
+      } else if (owner) assertLntAccount(owner, account);
       return { learning, session: { account, cookies: jar.serializeSync() } };
     }, version, signal, beforeCommit);
   } catch (error) {
@@ -244,12 +246,6 @@ async function query(url: string, version: number, init: RequestInit, account?: 
 async function read(action: Parameters<SchoolDevice['read']>[0], params?: Parameters<SchoolDevice['read']>[1], account?: Account, signal?: AbortSignal): Promise<unknown> {
   const version = generation;
   check(version, signal);
-  if (action === 'profile') {
-    const pending = recovering?.result;
-    if (pending) await waitForRecovery(pending, version, signal);
-    const { lntId, studentNumber, name } = boundSession(version, account).account;
-    return { id: lntId, user_no: studentNumber, name };
-  }
   if (action === 'courses') {
     if (!Number.isSafeInteger(params?.semesterId) || params!.semesterId! <= 0) throw fail('INVALID_SEMESTER');
     const courses: unknown[] = [];

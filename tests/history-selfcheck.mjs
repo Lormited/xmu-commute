@@ -27,7 +27,6 @@ function fixture(raw = JSON.stringify(saved), account = JSON.parse(raw)?.account
     read: async (action, params) => {
       calls.push([action, params]);
       if (action === 'history') return { rollcalls: params.courseId === 3 ? [record] : [{ ...record, rollcall_id: 12, student_rollcall_id: 112, rollcall_time: '2026-11-08T01:00:00Z', student_status: 'absent', status: 'absent', student_status_detail: '未到课堂', is_number: false, type: 'qr_rollcall' }] };
-      if (action === 'profile') return { id: account?.lntId, user_no: account?.studentNumber, name: account?.name };
       return { todos: { todo_list: [] }, rollcalls: { rollcalls: [] }, courses: { courses: [course, otherCourse] },
         lntTerms: { semesters: [{ id: 9, name: 'LNT 秋季', is_active: true }] },
         jwTerms: { datas: { kfdxnxqcx: { rows: [{ DM: '20261', MC: '秋季学期' }] } } }, jwWeek: { success: true, currentZc: 8, zcList: [{ ZC: 8 }] },
@@ -108,20 +107,20 @@ test('login reads every course history and caches the complete batch before publ
   } finally { for (const gate of gates.values()) gate.resolve(); saving.resolve(); await pending; }
 });
 
-test('an invalid bound profile during refresh keeps the saved batch and does not start history queries', async () => {
-  for (const profile of [{ user_no: '001234' }, { id: 42 }]) {
-    const f = fixture(); await f.learning.restore();
-    const previous = f.stored(), before = f.learning.getSnapshot(), read = f.device.read;
-    f.device.read = async (action, params) => action === 'profile' ? profile : read(action, params);
-    assert.equal(await f.learning.refresh(), false);
-    assert.equal(f.learning.getSnapshot().authenticated, true);
-    assert.equal(f.learning.getSnapshot().needsLogin, false);
-    assert.equal(f.stored(), previous);
-    assert.deepEqual(f.learning.getSnapshot().account, before.account);
-    assert.deepEqual(f.learning.getSnapshot().courses, before.courses);
-    assert.equal(f.calls.some(([action]) => action === 'history'), false);
-    assert.match(f.learning.getSnapshot().message, /个人资料读取失败/);
-  }
+test('session rejection during refresh keeps the saved batch and does not start history queries', async () => {
+  const f = fixture(); await f.learning.restore();
+  const previous = f.stored(), before = f.learning.getSnapshot(), read = f.device.read;
+  f.device.read = async (action, params) => {
+    if (action === 'todos') throw Object.assign(Error('AUTH_REQUIRED'), { code: 'AUTH_REQUIRED' });
+    return read(action, params);
+  };
+  assert.equal(await f.learning.refresh(), false);
+  assert.equal(f.learning.getSnapshot().authenticated, false);
+  assert.equal(f.learning.getSnapshot().needsLogin, true);
+  assert.equal(f.stored(), previous);
+  assert.strictEqual(f.learning.getSnapshot().account, before.account);
+  assert.strictEqual(f.learning.getSnapshot().courses, before.courses);
+  assert.equal(f.calls.some(([action]) => action === 'history'), false);
 });
 
 test('login history and save failures retain the batch only for the same account, including late responses', async () => {
@@ -364,7 +363,7 @@ test('ordinary and history refresh preserve both collections in either order and
     const before = f.learning.getSnapshot(); f.calls.length = 0;
     const first = f.learning[order[0]](), second = f.learning[order[1]]();
     assert.equal(await first, true); assert.equal(await second, true);
-    const ordinary = ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses'], history = ['history', 'history'];
+    const ordinary = ['todos', 'rollcalls', 'lntTerms', 'courses'], history = ['history', 'history'];
     assert.deepEqual(f.calls.map(([action]) => action), order[0] === 'refreshHistory' ? [...history, ...ordinary] : [...ordinary, ...history]);
     const stored = JSON.parse(f.stored()); assert.equal(stored.history.length, 2);
     assert.deepEqual(stored.schedule, before.schedule); assert.equal(stored.scheduleAt, before.scheduleAt);
@@ -401,7 +400,7 @@ test('both ordinary/history orders preserve all collections, accepted receipts a
     const before = f.learning.getSnapshot(); f.calls.length = 0;
     const first = f.learning[order[0]](), second = f.learning[order[1]]();
     assert.equal(await first, true); assert.equal(await second, true);
-    const ordinary = ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : [])];
+    const ordinary = ['todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : [])];
     const history = ['history', 'history'];
     assert.deepEqual(f.calls.map(([action]) => action), order[0] === 'refreshHistory' ? [...history, ...ordinary] : [...ordinary, ...history]);
     const stored = JSON.parse(f.stored());
@@ -442,13 +441,12 @@ test('every failed ordinary request or save keeps the complete combined cache an
     const setup = await combinedFixture(enabled);
     await setup.learning.submitNumber('81', '0007'); await tick();
     const saved = setup.stored();
-    for (const failure of ['profile', 'todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : []), 'save']) {
+    for (const failure of ['todos', 'rollcalls', 'lntTerms', 'courses', ...(enabled ? ['jwSchedule'] : []), 'save']) {
       const f = fixture(saved); await f.learning.restore();
       const before = f.learning.getSnapshot(), seen = [], read = f.device.read;
       f.learning.subscribe(() => seen.push(f.learning.getSnapshot()));
       f.device.read = async (action, params) => {
         if (action === failure) throw Error('NETWORK');
-        if (action === 'profile') return { id: 42, user_no: '001234', name: '本批新资料' };
         if (action === 'courses') return { courses: [{ ...course, name: '本批新课程' }] };
         if (action === 'jwSchedule') return { success: true, pkjgList: [] };
         return read(action, params);
